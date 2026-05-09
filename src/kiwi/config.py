@@ -31,10 +31,12 @@ class Settings:
 
     channels_config_path: str
     scripts_dir: str
+    gaurd_scripts_dir: str
     storage_dir: str
     state_path: str
     default_max_message_mb: int
     script_timeout_sec: int
+    gaurd_script_timeout_sec: int
     poll_idle_sleep_sec: float
     poll_error_sleep_sec: float
 
@@ -108,10 +110,12 @@ def load_settings(env_file: str = ".env") -> Settings:
         http_trust_env=_bool("HTTP_TRUST_ENV", False),
         channels_config_path=_str("CHANNELS_CONFIG_PATH", "./config/channels.json").strip(),
         scripts_dir=_str("SCRIPTS_DIR", "./scripts/channel_scripts").strip(),
+        gaurd_scripts_dir=_str("GAURD_SCRIPTS_DIR", "./scripts/gaurd_scrpts").strip(),
         storage_dir=_str("STORAGE_DIR", "./app_data").strip(),
         state_path=_str("STATE_PATH", "./app_data/state.json").strip(),
         default_max_message_mb=max(1, _int("DEFAULT_MAX_MESSAGE_MB", 50)),
         script_timeout_sec=max(5, _int("SCRIPT_TIMEOUT_SEC", 120)),
+        gaurd_script_timeout_sec=max(5, _int("GAURD_SCRIPT_TIMEOUT_SEC", 60)),
         poll_idle_sleep_sec=max(0.1, _float("POLL_IDLE_SLEEP_SEC", 1.0)),
         poll_error_sleep_sec=max(0.5, _float("POLL_ERROR_SLEEP_SEC", 5.0)),
     )
@@ -123,6 +127,7 @@ def load_settings(env_file: str = ".env") -> Settings:
 
     Path(settings.storage_dir).mkdir(parents=True, exist_ok=True)
     Path(settings.scripts_dir).mkdir(parents=True, exist_ok=True)
+    Path(settings.gaurd_scripts_dir).mkdir(parents=True, exist_ok=True)
     Path(settings.channels_config_path).parent.mkdir(parents=True, exist_ok=True)
     Path(settings.state_path).parent.mkdir(parents=True, exist_ok=True)
 
@@ -143,6 +148,13 @@ def _default_script_name(route_obj: dict) -> str:
         return f"{source_id}.py"
 
     raise ValueError("Route must define either source_channel_id or source_channel_username")
+
+
+def _default_gaurd_script_name(route_obj: dict) -> str:
+    script = str(route_obj.get("gaurd_script") or "").strip()
+    if script:
+        return safe_script_name(script)
+    return "default_guard.py"
 
 
 def load_routes(config_path: str) -> RouteRegistry:
@@ -174,6 +186,7 @@ def load_routes(config_path: str) -> RouteRegistry:
             raise ValueError(f"Route at index {idx} has no destination channel id/username")
 
         script = _default_script_name(obj)
+        gaurd_script = _default_gaurd_script_name(obj)
 
         max_message_mb_raw = obj.get("max_message_mb")
         max_message_mb: int | None
@@ -191,6 +204,7 @@ def load_routes(config_path: str) -> RouteRegistry:
             destination_channel_username=destination_channel_username,
             script=script,
             max_message_mb=max_message_mb,
+            gaurd_script=gaurd_script,
         )
         routes.append(route)
 

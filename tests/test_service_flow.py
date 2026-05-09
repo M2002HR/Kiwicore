@@ -6,6 +6,7 @@ from pathlib import Path
 
 from kiwi.config import RouteRegistry, Settings
 from kiwi.errors import MessageTooLargeError, PlatformApiError
+from kiwi.guard_runner import GuardRunner
 from kiwi.script_runner import ScriptRunner
 from kiwi.service import KiwiService
 from kiwi.state import StateStore
@@ -73,6 +74,10 @@ class FakeBaleClient:
 
 
 def _settings(tmp_path: Path, default_max_mb: int = 50) -> Settings:
+    gaurd_dir = tmp_path / "gaurds"
+    gaurd_dir.mkdir(parents=True, exist_ok=True)
+    (gaurd_dir / "default_guard.py").write_text("print('true')", encoding="utf-8")
+
     return Settings(
         app_env="test",
         log_level="INFO",
@@ -89,10 +94,12 @@ def _settings(tmp_path: Path, default_max_mb: int = 50) -> Settings:
         http_trust_env=False,
         channels_config_path=str(tmp_path / "channels.json"),
         scripts_dir=str(tmp_path / "scripts"),
+        gaurd_scripts_dir=str(gaurd_dir),
         storage_dir=str(tmp_path / "storage"),
         state_path=str(tmp_path / "storage" / "state.json"),
         default_max_message_mb=default_max_mb,
         script_timeout_sec=5,
+        gaurd_script_timeout_sec=5,
         poll_idle_sleep_sec=0.01,
         poll_error_sleep_sec=0.01,
     )
@@ -162,6 +169,7 @@ print(json.dumps({'messages': [{'type': 'text', 'text': 'OUT:' + text}]}))
         telegram_client=tg,
         bale_client=bale,
         storage=StorageManager(settings.storage_dir),
+        guard_runner=GuardRunner(settings.gaurd_scripts_dir, timeout_sec=5),
         script_runner=ScriptRunner(settings.scripts_dir, timeout_sec=5),
         state_store=StateStore(settings.state_path),
     )
@@ -210,6 +218,7 @@ def test_service_flow_skips_large_message(tmp_path: Path) -> None:
         telegram_client=tg,
         bale_client=bale,
         storage=StorageManager(settings.storage_dir),
+        guard_runner=GuardRunner(settings.gaurd_scripts_dir, timeout_sec=5),
         script_runner=ScriptRunner(settings.scripts_dir, timeout_sec=5),
         state_store=StateStore(settings.state_path),
     )
@@ -252,6 +261,7 @@ def test_service_flow_skips_sticker_media(tmp_path: Path) -> None:
         telegram_client=tg,
         bale_client=bale,
         storage=StorageManager(settings.storage_dir),
+        guard_runner=GuardRunner(settings.gaurd_scripts_dir, timeout_sec=5),
         script_runner=ScriptRunner(settings.scripts_dir, timeout_sec=5),
         state_store=StateStore(settings.state_path),
     )
@@ -259,6 +269,52 @@ def test_service_flow_skips_sticker_media(tmp_path: Path) -> None:
     processed = asyncio.run(service.run_once())
     assert processed == 1
     assert tg.get_file_calls == 0
+    assert bale.sent == []
+
+
+def test_service_flow_blocks_message_when_guard_denies(tmp_path: Path) -> None:
+    scripts_dir = tmp_path / "scripts"
+    scripts_dir.mkdir()
+    (scripts_dir / "-1001.py").write_text("print('{\"messages\": [{\"type\":\"text\",\"text\":\"ok\"}]}')", encoding="utf-8")
+
+    update = {
+        "update_id": 401,
+        "channel_post": {
+            "message_id": 31,
+            "chat": {"id": -1001, "type": "channel"},
+            "text": "hello",
+        },
+    }
+
+    settings = _settings(tmp_path)
+    guard_path = Path(settings.gaurd_scripts_dir) / "deny.py"
+    guard_path.write_text("print('false')", encoding="utf-8")
+    route = ChannelRoute(
+        name="r",
+        enabled=True,
+        source_channel_id="-1001",
+        source_channel_username=None,
+        destination_channel_id="-2001",
+        destination_channel_username=None,
+        script="-1001.py",
+        max_message_mb=10,
+        gaurd_script="deny.py",
+    )
+    tg = FakeTelegramClient([update], b"")
+    bale = FakeBaleClient()
+    service = KiwiService(
+        settings=settings,
+        routes=_route_registry(route),
+        telegram_client=tg,
+        bale_client=bale,
+        storage=StorageManager(settings.storage_dir),
+        guard_runner=GuardRunner(settings.gaurd_scripts_dir, timeout_sec=5),
+        script_runner=ScriptRunner(settings.scripts_dir, timeout_sec=5),
+        state_store=StateStore(settings.state_path),
+    )
+
+    processed = asyncio.run(service.run_once())
+    assert processed == 1
     assert bale.sent == []
 
 
@@ -300,6 +356,7 @@ def test_service_run_retries_after_poll_error(tmp_path: Path) -> None:
         telegram_client=tg,
         bale_client=bale,
         storage=StorageManager(settings.storage_dir),
+        guard_runner=GuardRunner(settings.gaurd_scripts_dir, timeout_sec=5),
         script_runner=ScriptRunner(settings.scripts_dir, timeout_sec=5),
         state_store=StateStore(settings.state_path),
     )

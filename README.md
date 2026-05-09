@@ -4,8 +4,9 @@ Kiwi Bridge is a channel-to-channel relay service:
 
 1. Watches selected **Telegram channels**.
 2. Downloads message media with a configurable per-message size limit.
-3. Runs a per-channel Python script.
-4. Publishes script outputs to mapped **Bale channels**.
+3. Runs a per-route **guard script** (AI moderation).
+4. Runs a per-channel Python script (only if guard allows).
+5. Publishes script outputs to mapped **Bale channels**.
 
 The project is designed for production use with Docker Compose and for local development with auto-reload watch mode.
 
@@ -16,8 +17,10 @@ The project is designed for production use with Docker Compose and for local dev
 - Username-first matching and routing (with ID fallback)
 - Per-route and global media size limits
 - Local storage of raw updates, payloads, and downloaded media
+- AI guard stage per route (`gaurd_script`) before main script execution
 - Script-based processing pipeline per route
 - Default passthrough script for near 1:1 forwarding behavior
+- Docker Compose integration with `gemini_server` (Gemini proxy submodule)
 - Delivery to Bale as text/photo/video/voice/audio/document/animation/video_note
 - Global sticker-block policy (stickers are never sent)
 - Resilient polling loop with retry/backoff on network/API errors
@@ -29,12 +32,15 @@ The project is designed for production use with Docker Compose and for local dev
 - `src/kiwi/config.py`: Environment and route loading
 - `src/kiwi/platforms/client.py`: Telegram/Bale Bot API client wrapper
 - `src/kiwi/platforms/parser.py`: Telegram channel update parser
+- `src/kiwi/guard_runner.py`: Guard script execution + boolean parsing
 - `src/kiwi/script_runner.py`: Channel script execution + output parsing
 - `src/kiwi/dispatcher.py`: Bale message dispatching
 - `src/kiwi/storage.py`: Local message/media storage
 - `config/channels.json`: Runtime route configuration (ignored from git)
 - `config/channels.example.json`: Versioned route template
 - `scripts/channel_scripts/`: Channel scripts directory
+- `scripts/gaurd_scrpts/`: Guard scripts directory
+- `gemini_server/`: Git submodule (Gemini API proxy service)
 
 ## Route Configuration
 
@@ -52,6 +58,7 @@ Route fields (per item):
 - `source_channel_id`: Source Telegram channel ID (fallback)
 - `destination_channel_username`: Destination Bale channel username (preferred)
 - `destination_channel_id`: Destination Bale channel ID (fallback)
+- `gaurd_script`: Guard script filename under `scripts/gaurd_scrpts/` (default: `default_guard.py`)
 - `script`: Script filename under `scripts/channel_scripts/`
 - `max_message_mb`: Optional per-route message media limit
 
@@ -99,6 +106,23 @@ A script must return JSON via `stdout` (or `output.json` in `output-dir`) in thi
 
 For file-based outputs, `path` may be relative to `output-dir` or `input-dir`, or absolute.
 
+## Guard Scripts
+
+All guard scripts must be under:
+
+- `scripts/gaurd_scrpts/`
+
+Default guard included:
+
+- `scripts/gaurd_scrpts/default_guard.py`
+
+Guard contract:
+
+- Receives `--payload`, `--input-dir`, `--output-dir`
+- Must print `true`/`false` (or `1`/`0`) to stdout
+- `true` means continue to main `script`
+- `false` means block forwarding for that message
+
 ## Default Passthrough Script
 
 `default_scripts.py` forwards incoming content with minimal transformation:
@@ -123,10 +147,19 @@ Important variables:
 - `BALE_BOT_TOKEN`: Required
 - `CHANNELS_CONFIG_PATH`: Default `./config/channels.json`
 - `SCRIPTS_DIR`: Default `./scripts/channel_scripts`
+- `GAURD_SCRIPTS_DIR`: Default `./scripts/gaurd_scrpts`
 - `DEFAULT_MAX_MESSAGE_MB`: Global per-message media limit
 - `SCRIPT_TIMEOUT_SEC`: Max script runtime
+- `GAURD_SCRIPT_TIMEOUT_SEC`: Max guard script runtime
 - `POLL_IDLE_SLEEP_SEC`: Delay when no updates
 - `POLL_ERROR_SLEEP_SEC`: Base retry delay on polling errors
+
+Guard AI (used by `default_guard.py`):
+
+- `GUARD_AI_ENABLED`
+- `GUARD_AI_ENDPOINT` (inside Compose: `http://gemini_server:8000/proxy/gemini`)
+- `GUARD_AI_MODEL` (optional; if empty, Gemini proxy default model is used)
+- `GUARD_AI_TIMEOUT_SEC`
 
 ### Proxy / Nekoray
 
@@ -160,6 +193,12 @@ Watch mode restarts automatically on changes in `src`, `scripts`, `config`, `.en
 
 ## Production (Docker Compose)
 
+Initialize submodules first:
+
+```bash
+git submodule update --init --recursive
+```
+
 ```bash
 docker compose up --build -d
 ```
@@ -189,6 +228,7 @@ pytest -q
 - `config/channels.json` is ignored (runtime/local config)
 - `config/channels.example.json` is versioned
 - Under `scripts/channel_scripts/`, only `default_scripts.py` is tracked by default; other channel-specific scripts are ignored
+- Under `scripts/gaurd_scrpts/`, only `default_guard.py` is tracked by default; other guard scripts are ignored
 
 ## Troubleshooting
 

@@ -6,7 +6,8 @@ from pathlib import Path
 
 from kiwi.config import RouteRegistry, Settings
 from kiwi.dispatcher import BaleDispatcher
-from kiwi.errors import MessageTooLargeError, PlatformApiError, ScriptExecutionError
+from kiwi.errors import GuardExecutionError, MessageTooLargeError, PlatformApiError, ScriptExecutionError
+from kiwi.guard_runner import GuardRunner
 from kiwi.platforms.parser import parse_telegram_channel_update
 from kiwi.script_runner import ScriptRunner
 from kiwi.state import StateStore
@@ -25,6 +26,7 @@ class KiwiService:
         telegram_client,
         bale_client,
         storage: StorageManager,
+        guard_runner: GuardRunner,
         script_runner: ScriptRunner,
         state_store: StateStore,
     ) -> None:
@@ -33,6 +35,7 @@ class KiwiService:
         self.telegram_client = telegram_client
         self.bale_client = bale_client
         self.storage = storage
+        self.guard_runner = guard_runner
         self.script_runner = script_runner
         self.state_store = state_store
         self.dispatcher = BaleDispatcher(self.bale_client)
@@ -200,6 +203,26 @@ class KiwiService:
             payload["max_total_bytes"] = max_total_bytes
             self.storage.write_payload(paths, payload)
 
+            is_allowed = await self.guard_runner.run(
+                route,
+                payload_path=Path(paths.payload_path),
+                input_dir=input_dir,
+                output_dir=output_dir,
+            )
+            if not is_allowed:
+                logger.info(
+                    "Message blocked by guard script",
+                    extra={
+                        "details": {
+                            "route": route.name,
+                            "source_channel_id": incoming.source_channel_id,
+                            "update_id": incoming.update_id,
+                            "gaurd_script": route.gaurd_script,
+                        }
+                    },
+                )
+                return
+
             run_result = await self.script_runner.run(
                 route,
                 payload_path=Path(paths.payload_path),
@@ -248,6 +271,18 @@ class KiwiService:
                         "route": route.name,
                         "source_channel_id": incoming.source_channel_id,
                         "update_id": incoming.update_id,
+                    }
+                },
+            )
+        except GuardExecutionError:
+            logger.exception(
+                "Guard script execution failed",
+                extra={
+                    "details": {
+                        "route": route.name,
+                        "source_channel_id": incoming.source_channel_id,
+                        "update_id": incoming.update_id,
+                        "gaurd_script": route.gaurd_script,
                     }
                 },
             )

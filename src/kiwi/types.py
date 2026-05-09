@@ -60,6 +60,7 @@ class ChannelRoute:
     destination_channel_username: str | None
     script: str
     max_message_mb: int | None
+    gaurd_script: str = "default_guard.py"
 
     def destination_target(self) -> str:
         if self.destination_channel_username:

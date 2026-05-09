@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from kiwi.config import load_routes, load_settings
+from kiwi.guard_runner import GuardRunner
 from kiwi.platforms.client import BotApiClient
 from kiwi.script_runner import ScriptRunner
 from kiwi.service import KiwiService
@@ -33,6 +34,7 @@ async def build_service(env_file: str = ".env") -> KiwiService:
         telegram_client=telegram_client,
         bale_client=bale_client,
         storage=StorageManager(settings.storage_dir),
+        guard_runner=GuardRunner(settings.gaurd_scripts_dir, settings.gaurd_script_timeout_sec),
         script_runner=ScriptRunner(settings.scripts_dir, settings.script_timeout_sec),
         state_store=StateStore(settings.state_path),
     )

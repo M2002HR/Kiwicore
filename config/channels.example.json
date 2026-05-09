@@ -6,6 +6,7 @@
     "source_channel_id": "-1001111111111",
     "destination_channel_username": "@destination_channel",
     "destination_channel_id": "-1002222222222",
+    "gaurd_script": "default_guard.py",
     "script": "default_scripts.py",
     "max_message_mb": 50
   }

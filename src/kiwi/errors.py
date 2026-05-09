@@ -15,3 +15,7 @@ class MessageTooLargeError(KiwiError):
 
 class ScriptExecutionError(KiwiError):
     pass
+
+
+class GuardExecutionError(KiwiError):
+    pass

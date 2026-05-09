@@ -72,6 +72,7 @@ def test_load_routes_default_script_name(tmp_path: Path) -> None:
     route = registry.match("-100777", None)
     assert route is not None
     assert route.script == "-100777.py"
+    assert route.gaurd_script == "default_guard.py"
 
 
 def test_load_routes_default_script_name_prefers_username(tmp_path: Path) -> None:
@@ -120,3 +121,25 @@ def test_match_prefers_username_over_id(tmp_path: Path) -> None:
     matched = registry.match("-100123", "@usd_iran")
     assert matched is not None
     assert matched.name == "by-username"
+
+
+def test_load_routes_custom_gaurd_script(tmp_path: Path) -> None:
+    config_path = tmp_path / "channels.json"
+    config_path.write_text(
+        json.dumps(
+            [
+                {
+                    "source_channel_id": "-1001",
+                    "destination_channel_id": "-2001",
+                    "script": "my.py",
+                    "gaurd_script": "my_guard.py",
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    registry = load_routes(str(config_path))
+    route = registry.match("-1001", None)
+    assert route is not None
+    assert route.gaurd_script == "my_guard.py"

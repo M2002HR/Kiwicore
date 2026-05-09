@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 
@@ -120,12 +121,41 @@ class BotApiClient:
         data: dict[str, str] = {"chat_id": chat_id}
         if caption:
             data["caption"] = caption
-        with file_path.open("rb") as fh:
-            files = {field_name: (file_path.name, fh, "application/octet-stream")}
-            response = await self._post(method, data=data, files=files)
+        # Bale occasionally returns transient 5xx upload errors.
+        # Re-open the file for each attempt and retry a few times.
+        retries = 3
+        backoff_sec = 0.6
+        response: object | None = None
+        last_error: PlatformApiError | None = None
+        for attempt in range(1, retries + 1):
+            try:
+                with file_path.open("rb") as fh:
+                    files = {field_name: (file_path.name, fh, "application/octet-stream")}
+                    response = await self._post(method, data=data, files=files)
+                break
+            except PlatformApiError as exc:
+                last_error = exc
+                if attempt >= retries or not self._is_transient_upload_error(exc):
+                    raise
+                await asyncio.sleep(backoff_sec * attempt)
+        if response is None:
+            assert last_error is not None
+            raise last_error
         if not isinstance(response, dict):
             raise PlatformApiError(f"{method} response is not an object")
         return response
+
+    @staticmethod
+    def _is_transient_upload_error(exc: PlatformApiError) -> bool:
+        text = str(exc).lower()
+        return (
+            "network error" in text
+            or "http 500" in text
+            or "http 502" in text
+            or "http 503" in text
+            or "http 504" in text
+            or "failed to upload file bytes" in text
+        )
 
     async def download_file(self, file_path: str, output_path: Path, max_bytes: int) -> int:
         output_path.parent.mkdir(parents=True, exist_ok=True)

@@ -1,0 +1,3 @@
+[submodule "gemini_server"]
+	path = gemini_server
+	url = https://github.com/M2002HR/Gemini_API_Proxy_Service.git

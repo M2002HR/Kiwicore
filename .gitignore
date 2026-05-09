@@ -8,3 +8,5 @@ app_tmp/
 config/channels.json
 scripts/channel_scripts/*
 !scripts/channel_scripts/default_scripts.py
+scripts/gaurd_scrpts/*
+!scripts/gaurd_scrpts/default_guard.py

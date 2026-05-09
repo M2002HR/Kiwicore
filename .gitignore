@@ -1,0 +1,10 @@
+.venv/
+.pytest_cache/
+__pycache__/
+*.pyc
+.env
+app_data/
+app_tmp/
+config/channels.json
+scripts/channel_scripts/*
+!scripts/channel_scripts/default_scripts.py

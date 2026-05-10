@@ -48,6 +48,7 @@ class IncomingChannelMessage:
     caption: str | None
     medias: list[IncomingMedia]
     raw: dict
+    media_group_id: str | None = None
 
 
 @dataclass(slots=True)

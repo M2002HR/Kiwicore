@@ -73,17 +73,20 @@ def _build_request(payload: dict, input_dir: Path, model: str | None) -> dict:
     caption = str(message.get("caption") or "").strip()
 
     user_text = (
-        "Task: Safety moderation for channel forwarding.\n"
-        "Decide whether this message is safe to forward.\n"
-        "Block if it contains: explicit sexual/pornographic content, sexual exploitation, "
-        "severe profanity/abuse/hate, criminal instructions, clearly illegal content, OR any "
-        "advertising/sponsored/promotional/affiliate/referral content.\n"
-        "Also block VPN/proxy bypass distribution content: v2ray/xray/sing-box/clash configs, "
-        "subscription links, connection strings (vmess/vless/trojan/ss/hysteria/tuic/wireguard), "
-        "or instructions for bypassing filters.\n"
-        "Advertising block includes: sponsor mentions, promo/discount codes, sales pitch, buy/join/follow CTA, "
-        "or external marketing links.\n"
-        "Output strictly one character only: 1 (allow) or 0 (block).\n\n"
+        "Task: safety moderation for forwarding.\n"
+        "Return 0 (block) ONLY for high-confidence unsafe content:\n"
+        "1) explicit sexual/pornographic content,\n"
+        "2) sexual exploitation,\n"
+        "3) severe targeted hate/abuse/slurs,\n"
+        "4) direct criminal instructions (hacking, weapon/drug making, fraud steps),\n"
+        "5) clearly illegal actionable content.\n"
+        "Return 1 (allow) for normal safe content.\n\n"
+        "Important allow rules:\n"
+        "- News/political/religious discussion is usually ALLOW.\n"
+        "- Mentioning channels/usernames/hashtags/links alone is ALLOW.\n"
+        "- Non-graphic reports about crime, war, courts, or punishment are ALLOW.\n"
+        "- Do not block unless you are highly confident it is unsafe.\n\n"
+        "Output strictly one character only: 1 or 0.\n\n"
         f"Message text:\n{text or '<empty>'}\n\n"
         f"Message caption:\n{caption or '<empty>'}\n"
     )
@@ -127,7 +130,7 @@ def _extract_text_from_response(data: dict) -> str:
     return ""
 
 
-def _call_guard_api(endpoint: str, body: dict, timeout_sec: float) -> bool:
+def _call_guard_api(endpoint: str, body: dict, timeout_sec: float, *, fail_open: bool) -> bool:
     # Do not use process proxy env vars for container-local guard endpoint calls.
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     req = urllib.request.Request(
@@ -140,21 +143,21 @@ def _call_guard_api(endpoint: str, body: dict, timeout_sec: float) -> bool:
         with opener.open(req, timeout=timeout_sec) as resp:
             raw = resp.read().decode("utf-8", errors="replace")
     except urllib.error.URLError:
-        return False
+        return True if fail_open else False
 
     try:
         data = json.loads(raw)
     except json.JSONDecodeError:
-        return False
+        return True if fail_open else False
     if not isinstance(data, dict):
-        return False
+        return True if fail_open else False
 
     model_text = _extract_text_from_response(data).strip().lower()
     if model_text.startswith("1"):
         return True
     if model_text.startswith("0"):
         return False
-    return False
+    return True if fail_open else False
 
 
 def _is_obvious_advertisement(payload: dict) -> bool:
@@ -296,6 +299,7 @@ def main() -> None:
     model = model_raw or None
     timeout_sec = float(os.getenv("GUARD_AI_TIMEOUT_SEC", "30").strip() or "30")
     enabled = os.getenv("GUARD_AI_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+    fail_open = os.getenv("GUARD_AI_FAIL_OPEN", "true").strip().lower() in {"1", "true", "yes", "on"}
 
     if not enabled:
         print("true")
@@ -303,15 +307,15 @@ def main() -> None:
 
     payload = _load_payload(Path(args.payload))
     if _is_obvious_advertisement(payload):
-        print("false")
+        print("false: obvious_advertisement")
         return
     if _is_obvious_vpn_config(payload):
-        print("false")
+        print("false: obvious_vpn_config")
         return
 
     body = _build_request(payload, Path(args.input_dir), model=model)
-    allow = _call_guard_api(endpoint=endpoint, body=body, timeout_sec=timeout_sec)
-    print("true" if allow else "false")
+    allow = _call_guard_api(endpoint=endpoint, body=body, timeout_sec=timeout_sec, fail_open=fail_open)
+    print("true" if allow else "false: ai_guard_block")
 
 
 if __name__ == "__main__":

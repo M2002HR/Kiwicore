@@ -12,6 +12,7 @@ class GuardRunner:
     def __init__(self, gaurd_scripts_dir: str, timeout_sec: int) -> None:
         self.gaurd_scripts_dir = Path(gaurd_scripts_dir)
         self.timeout_sec = timeout_sec
+        self.last_reason: str | None = None
 
     async def run(
         self,
@@ -21,6 +22,7 @@ class GuardRunner:
         input_dir: Path,
         output_dir: Path,
     ) -> bool:
+        self.last_reason = None
         script_path = self.gaurd_scripts_dir / route.gaurd_script
         if not script_path.exists():
             raise GuardExecutionError(f"Guard script not found: {script_path}")
@@ -60,10 +62,23 @@ class GuardRunner:
         if not stdout:
             raise GuardExecutionError(f"Guard script returned empty output: {script_path.name}")
 
-        token = stdout.splitlines()[-1].strip().lower()
+        token_raw = stdout.splitlines()[-1].strip()
+        token = token_raw.lower()
+        if ":" in token_raw:
+            left, right = token_raw.split(":", 1)
+            token = left.strip().lower()
+            reason = right.strip()
+            self.last_reason = reason or None
         if token in {"true", "1", "yes", "allow", "allowed"}:
             return True
         if token in {"false", "0", "no", "deny", "denied"}:
+            return False
+
+        # Guard scripts may emit extra text after decision token.
+        compact = token.split()[0] if token else ""
+        if compact in {"true", "1", "yes", "allow", "allowed"}:
+            return True
+        if compact in {"false", "0", "no", "deny", "denied"}:
             return False
 
         raise GuardExecutionError(

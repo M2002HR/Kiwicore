@@ -20,6 +20,7 @@ class FakeTelegramClient:
         self._done = False
         self.file_bytes = file_bytes
         self.get_file_calls = 0
+        self.audit_messages: list[tuple[str, str]] = []
 
     async def get_updates(self, offset, timeout, allowed_updates):
         if self._done:
@@ -37,6 +38,10 @@ class FakeTelegramClient:
         output_path.write_bytes(self.file_bytes)
         return len(self.file_bytes)
 
+    async def send_message(self, chat_id: str, text: str):
+        self.audit_messages.append((chat_id, text))
+        return {"ok": True}
+
     async def aclose(self) -> None:
         return None
 
@@ -44,6 +49,7 @@ class FakeTelegramClient:
 class FakeBaleClient:
     def __init__(self) -> None:
         self.sent: list[tuple[str, str]] = []
+        self.media_group_sent: list[tuple[str, int]] = []
 
     async def send_message(self, chat_id: str, text: str):
         self.sent.append((chat_id, text))
@@ -68,6 +74,18 @@ class FakeBaleClient:
     async def send_document(self, chat_id: str, document_path: Path, caption: str | None = None):
         self.sent.append((chat_id, f"doc:{document_path.name}"))
         return {"ok": True}
+
+    async def send_animation(self, chat_id: str, animation_path: Path, caption: str | None = None):
+        self.sent.append((chat_id, f"animation:{animation_path.name}"))
+        return {"ok": True}
+
+    async def send_video_note(self, chat_id: str, video_note_path: Path):
+        self.sent.append((chat_id, f"video_note:{video_note_path.name}"))
+        return {"ok": True}
+
+    async def send_media_group(self, chat_id: str, media_group: list[dict]):
+        self.media_group_sent.append((chat_id, len(media_group)))
+        return [{"ok": True}]
 
     async def aclose(self) -> None:
         return None
@@ -102,6 +120,8 @@ def _settings(tmp_path: Path, default_max_mb: int = 50) -> Settings:
         gaurd_script_timeout_sec=5,
         poll_idle_sleep_sec=0.01,
         poll_error_sleep_sec=0.01,
+        log_channel_target=None,
+        media_group_wait_sec=0.3,
     )
 
 
@@ -316,6 +336,273 @@ def test_service_flow_blocks_message_when_guard_denies(tmp_path: Path) -> None:
     processed = asyncio.run(service.run_once())
     assert processed == 1
     assert bale.sent == []
+
+
+def test_service_keeps_original_document_name(tmp_path: Path) -> None:
+    scripts_dir = tmp_path / "scripts"
+    scripts_dir.mkdir()
+    script_path = scripts_dir / "-1001.py"
+    script_path.write_text(
+        """
+import json
+import argparse
+from pathlib import Path
+
+p = argparse.ArgumentParser()
+p.add_argument('--payload', required=True)
+p.add_argument('--input-dir', required=True)
+p.add_argument('--output-dir', required=True)
+a = p.parse_args()
+payload = json.loads(Path(a.payload).read_text(encoding='utf-8'))
+local_name = payload['inputs'][0]['local_name']
+print(json.dumps({'messages': [{'type': 'document', 'path': local_name}]}))
+""".strip(),
+        encoding="utf-8",
+    )
+
+    update = {
+        "update_id": 501,
+        "channel_post": {
+            "message_id": 41,
+            "chat": {"id": -1001, "type": "channel"},
+            "document": {"file_id": "f3", "file_name": "Original.Name v1.pdf"},
+        },
+    }
+    settings = _settings(tmp_path)
+    route = ChannelRoute(
+        name="r",
+        enabled=True,
+        source_channel_id="-1001",
+        source_channel_username=None,
+        destination_channel_id="-2001",
+        destination_channel_username=None,
+        script="-1001.py",
+        max_message_mb=10,
+    )
+    tg = FakeTelegramClient([update], b"abc")
+    bale = FakeBaleClient()
+    service = KiwiService(
+        settings=settings,
+        routes=_route_registry(route),
+        telegram_client=tg,
+        bale_client=bale,
+        storage=StorageManager(settings.storage_dir),
+        guard_runner=GuardRunner(settings.gaurd_scripts_dir, timeout_sec=5),
+        script_runner=ScriptRunner(settings.scripts_dir, timeout_sec=5),
+        state_store=StateStore(settings.state_path),
+    )
+    processed = asyncio.run(service.run_once())
+    assert processed == 1
+    assert bale.sent == [("-2001", "doc:Original.Name v1.pdf")]
+
+
+def test_service_merges_same_media_group_in_single_processing(tmp_path: Path) -> None:
+    scripts_dir = tmp_path / "scripts"
+    scripts_dir.mkdir()
+    script_path = scripts_dir / "-1001.py"
+    script_path.write_text(
+        """
+import json
+import argparse
+from pathlib import Path
+
+p = argparse.ArgumentParser()
+p.add_argument('--payload', required=True)
+p.add_argument('--input-dir', required=True)
+p.add_argument('--output-dir', required=True)
+a = p.parse_args()
+payload = json.loads(Path(a.payload).read_text(encoding='utf-8'))
+count = len(payload.get('inputs', []))
+print(json.dumps({'messages': [{'type': 'text', 'text': f'COUNT:{count}'}]}))
+""".strip(),
+        encoding="utf-8",
+    )
+    updates = [
+        {
+            "update_id": 601,
+            "channel_post": {
+                "message_id": 71,
+                "chat": {"id": -1001, "type": "channel"},
+                "media_group_id": "mg-1",
+                "caption": "cap",
+                "photo": [{"file_id": "p1"}],
+            },
+        },
+        {
+            "update_id": 602,
+            "channel_post": {
+                "message_id": 72,
+                "chat": {"id": -1001, "type": "channel"},
+                "media_group_id": "mg-1",
+                "photo": [{"file_id": "p2"}],
+            },
+        },
+    ]
+    settings = _settings(tmp_path)
+    route = ChannelRoute(
+        name="r",
+        enabled=True,
+        source_channel_id="-1001",
+        source_channel_username=None,
+        destination_channel_id="-2001",
+        destination_channel_username=None,
+        script="-1001.py",
+        max_message_mb=10,
+    )
+    tg = FakeTelegramClient(updates, b"x")
+    bale = FakeBaleClient()
+    service = KiwiService(
+        settings=settings,
+        routes=_route_registry(route),
+        telegram_client=tg,
+        bale_client=bale,
+        storage=StorageManager(settings.storage_dir),
+        guard_runner=GuardRunner(settings.gaurd_scripts_dir, timeout_sec=5),
+        script_runner=ScriptRunner(settings.scripts_dir, timeout_sec=5),
+        state_store=StateStore(settings.state_path),
+    )
+    processed = asyncio.run(service.run_once())
+    assert processed == 1
+    assert bale.sent == [("-2001", "COUNT:2")]
+
+
+def test_service_merges_media_group_across_polls(tmp_path: Path) -> None:
+    scripts_dir = tmp_path / "scripts"
+    scripts_dir.mkdir()
+    script_path = scripts_dir / "-1001.py"
+    script_path.write_text(
+        """
+import json
+import argparse
+from pathlib import Path
+
+p = argparse.ArgumentParser()
+p.add_argument('--payload', required=True)
+p.add_argument('--input-dir', required=True)
+p.add_argument('--output-dir', required=True)
+a = p.parse_args()
+payload = json.loads(Path(a.payload).read_text(encoding='utf-8'))
+print(json.dumps({'messages': [{'type': 'text', 'text': f\"COUNT:{len(payload.get('inputs', []))}\"}]}))
+""".strip(),
+        encoding="utf-8",
+    )
+
+    class SplitPollTelegramClient(FakeTelegramClient):
+        def __init__(self, update_batches: list[list[dict]], file_bytes: bytes) -> None:
+            super().__init__([], file_bytes)
+            self._batches = update_batches
+            self._cursor = 0
+
+        async def get_updates(self, offset, timeout, allowed_updates):
+            if self._cursor >= len(self._batches):
+                return []
+            batch = self._batches[self._cursor]
+            self._cursor += 1
+            return batch
+
+    updates1 = [
+        {
+            "update_id": 801,
+            "channel_post": {
+                "message_id": 91,
+                "chat": {"id": -1001, "type": "channel"},
+                "media_group_id": "mg-x",
+                "caption": "cap",
+                "photo": [{"file_id": "x1"}],
+            },
+        }
+    ]
+    updates2 = [
+        {
+            "update_id": 802,
+            "channel_post": {
+                "message_id": 92,
+                "chat": {"id": -1001, "type": "channel"},
+                "media_group_id": "mg-x",
+                "photo": [{"file_id": "x2"}],
+            },
+        }
+    ]
+    settings = _settings(tmp_path)
+    settings.media_group_wait_sec = 0.02
+    route = ChannelRoute(
+        name="r",
+        enabled=True,
+        source_channel_id="-1001",
+        source_channel_username=None,
+        destination_channel_id="-2001",
+        destination_channel_username=None,
+        script="-1001.py",
+        max_message_mb=10,
+    )
+    tg = SplitPollTelegramClient([updates1, updates2], b"x")
+    bale = FakeBaleClient()
+    service = KiwiService(
+        settings=settings,
+        routes=_route_registry(route),
+        telegram_client=tg,
+        bale_client=bale,
+        storage=StorageManager(settings.storage_dir),
+        guard_runner=GuardRunner(settings.gaurd_scripts_dir, timeout_sec=5),
+        script_runner=ScriptRunner(settings.scripts_dir, timeout_sec=5),
+        state_store=StateStore(settings.state_path),
+    )
+
+    async def _drive() -> tuple[int, int, int]:
+        p1 = await service.run_once()
+        p2 = await service.run_once()
+        await asyncio.sleep(0.03)
+        p3 = await service.run_once()
+        return p1, p2, p3
+
+    p1, p2, p3 = asyncio.run(_drive())
+    assert (p1, p2, p3) == (0, 0, 1)
+    assert bale.sent == [("-2001", "COUNT:2")]
+
+
+def test_service_sends_audit_logs_to_telegram_channel(tmp_path: Path) -> None:
+    scripts_dir = tmp_path / "scripts"
+    scripts_dir.mkdir()
+    (scripts_dir / "-1001.py").write_text("print('{\"messages\": [{\"type\":\"text\",\"text\":\"ok\"}]}')", encoding="utf-8")
+
+    update = {
+        "update_id": 701,
+        "channel_post": {
+            "message_id": 81,
+            "chat": {"id": -1001, "type": "channel", "username": "srcchan"},
+            "text": "hello",
+        },
+    }
+    settings = _settings(tmp_path)
+    settings.log_channel_target = "@logchan"
+    route = ChannelRoute(
+        name="r",
+        enabled=True,
+        source_channel_id="-1001",
+        source_channel_username="@srcchan",
+        destination_channel_id="-2001",
+        destination_channel_username=None,
+        script="-1001.py",
+        max_message_mb=10,
+    )
+    tg = FakeTelegramClient([update], b"")
+    bale = FakeBaleClient()
+    service = KiwiService(
+        settings=settings,
+        routes=_route_registry(route),
+        telegram_client=tg,
+        bale_client=bale,
+        storage=StorageManager(settings.storage_dir),
+        guard_runner=GuardRunner(settings.gaurd_scripts_dir, timeout_sec=5),
+        script_runner=ScriptRunner(settings.scripts_dir, timeout_sec=5),
+        state_store=StateStore(settings.state_path),
+    )
+    processed = asyncio.run(service.run_once())
+    assert processed == 1
+    assert bale.sent == [("-2001", "ok")]
+    assert len(tg.audit_messages) >= 1
+    assert all(chat == "@logchan" for chat, _ in tg.audit_messages)
+    assert any("کیوی" in text for _, text in tg.audit_messages)
 
 
 class FlakyTelegramClient:

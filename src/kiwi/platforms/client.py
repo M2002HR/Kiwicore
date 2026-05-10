@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import mimetypes
 from pathlib import Path
 
 import httpx
@@ -54,7 +55,22 @@ class BotApiClient:
         return response
 
     async def send_message(self, chat_id: str, text: str) -> dict:
-        response = await self._post("sendMessage", json={"chat_id": chat_id, "text": text})
+        retries = 3  # initial attempt + 2 retries
+        backoff_sec = 0.7
+        response: object | None = None
+        last_error: PlatformApiError | None = None
+        for attempt in range(1, retries + 1):
+            try:
+                response = await self._post("sendMessage", json={"chat_id": chat_id, "text": text})
+                break
+            except PlatformApiError as exc:
+                last_error = exc
+                if attempt >= retries or not self._is_transient_upload_error(exc):
+                    raise
+                await asyncio.sleep(backoff_sec * attempt)
+        if response is None:
+            assert last_error is not None
+            raise last_error
         if not isinstance(response, dict):
             raise PlatformApiError("sendMessage response is not an object")
         return response
@@ -107,6 +123,68 @@ class BotApiClient:
             caption=None,
         )
 
+    async def send_media_group(self, chat_id: str, media_group: list[dict]) -> list[dict]:
+        if len(media_group) < 2:
+            raise ValueError("media_group requires at least two items")
+        retries = 3  # initial attempt + 2 retries
+        backoff_sec = 0.8
+        response: object | None = None
+        last_error: PlatformApiError | None = None
+        for attempt in range(1, retries + 1):
+            try:
+                response = await self._send_media_group_once(chat_id, media_group)
+                break
+            except PlatformApiError as exc:
+                last_error = exc
+                if attempt >= retries or not self._is_transient_upload_error(exc):
+                    raise
+                await asyncio.sleep(backoff_sec * attempt)
+
+        if response is None:
+            assert last_error is not None
+            raise last_error
+        if not isinstance(response, list):
+            raise PlatformApiError("sendMediaGroup response is not a list")
+        return response
+
+    async def _send_media_group_once(self, chat_id: str, media_group: list[dict]) -> object:
+        data: dict[str, str] = {"chat_id": chat_id}
+        files_payload: dict[str, tuple[str, object, str]] = {}
+        file_handles = []
+        media_items: list[dict] = []
+        try:
+            for idx, item in enumerate(media_group):
+                media_type = str(item.get("type") or "").strip().lower()
+                if media_type not in {"photo", "video", "document", "audio"}:
+                    raise ValueError(f"Unsupported media group item type: {media_type}")
+
+                raw_path = item.get("path")
+                if not isinstance(raw_path, Path):
+                    raise ValueError("media group item path must be Path")
+                if not raw_path.exists():
+                    raise FileNotFoundError(str(raw_path))
+
+                field_name = f"file{idx}"
+                fh = raw_path.open("rb")
+                file_handles.append(fh)
+                mime = self._guess_upload_mime(raw_path, media_type=media_type)
+                files_payload[field_name] = (raw_path.name, fh, mime)
+
+                media_obj: dict[str, str] = {
+                    "type": media_type,
+                    "media": f"attach://{field_name}",
+                }
+                caption = item.get("caption")
+                if isinstance(caption, str) and caption.strip():
+                    media_obj["caption"] = caption.strip()
+                media_items.append(media_obj)
+
+            data["media"] = json.dumps(media_items, ensure_ascii=False)
+            return await self._post("sendMediaGroup", data=data, files=files_payload)
+        finally:
+            for fh in file_handles:
+                fh.close()
+
     async def _send_file(
         self,
         method: str,
@@ -130,7 +208,8 @@ class BotApiClient:
         for attempt in range(1, retries + 1):
             try:
                 with file_path.open("rb") as fh:
-                    files = {field_name: (file_path.name, fh, "application/octet-stream")}
+                    mime = self._guess_upload_mime(file_path, media_type=field_name)
+                    files = {field_name: (file_path.name, fh, mime)}
                     response = await self._post(method, data=data, files=files)
                 break
             except PlatformApiError as exc:
@@ -150,12 +229,30 @@ class BotApiClient:
         text = str(exc).lower()
         return (
             "network error" in text
+            or "connecttimeout" in text
+            or "readtimeout" in text
             or "http 500" in text
             or "http 502" in text
             or "http 503" in text
             or "http 504" in text
             or "failed to upload file bytes" in text
         )
+
+    @staticmethod
+    def _guess_upload_mime(file_path: Path, *, media_type: str) -> str:
+        guessed, _ = mimetypes.guess_type(file_path.name)
+        if guessed:
+            return guessed
+        defaults = {
+            "photo": "image/jpeg",
+            "video": "video/mp4",
+            "audio": "audio/mpeg",
+            "voice": "audio/ogg",
+            "animation": "video/mp4",
+            "document": "application/octet-stream",
+            "video_note": "video/mp4",
+        }
+        return defaults.get(media_type, "application/octet-stream")
 
     async def download_file(self, file_path: str, output_path: Path, max_bytes: int) -> int:
         output_path.parent.mkdir(parents=True, exist_ok=True)

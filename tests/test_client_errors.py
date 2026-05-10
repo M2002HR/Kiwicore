@@ -56,6 +56,27 @@ def test_client_wraps_httpx_error_as_platform_error() -> None:
     assert "network error" in str(exc_info.value)
 
 
+def test_send_message_retries_on_transient_network_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def no_sleep(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr("kiwi.platforms.client.asyncio.sleep", no_sleep)
+    client = BotApiClient(
+        token="t",
+        api_base_url="https://api.telegram.org",
+        file_base_url="https://api.telegram.org/file",
+    )
+    client.client = SequencedHttpClient(
+        [
+            httpx.ConnectTimeout("timeout"),
+            _ok_response({"message_id": 9}),
+        ]
+    )
+    result = asyncio.run(client.send_message("@dest", "hi"))
+    assert result == {"message_id": 9}
+    assert client.client.calls == 2
+
+
 def test_send_file_retries_on_transient_upload_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     async def no_sleep(*args, **kwargs):
         return None
@@ -101,3 +122,38 @@ def test_send_file_no_retry_on_non_transient_error(tmp_path: Path, monkeypatch: 
         asyncio.run(client.send_document("@dest", doc_path))
 
     assert client.client.calls == 1
+
+
+def test_send_media_group_retries_on_transient_upload_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def no_sleep(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr("kiwi.platforms.client.asyncio.sleep", no_sleep)
+
+    client = BotApiClient(
+        token="t",
+        api_base_url="https://api.telegram.org",
+        file_base_url="https://api.telegram.org/file",
+    )
+    client.client = SequencedHttpClient(
+        [
+            _http_error_response(500, "Internal Error: failed to upload file bytes"),
+            _ok_response([{"message_id": 11}, {"message_id": 12}]),
+        ]
+    )
+    p1 = tmp_path / "a.mp3"
+    p2 = tmp_path / "b.mp3"
+    p1.write_bytes(b"a")
+    p2.write_bytes(b"b")
+
+    result = asyncio.run(
+        client.send_media_group(
+            "@dest",
+            [
+                {"type": "audio", "path": p1, "caption": "cap"},
+                {"type": "audio", "path": p2},
+            ],
+        )
+    )
+    assert isinstance(result, list)
+    assert client.client.calls == 2

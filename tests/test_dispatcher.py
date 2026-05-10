@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
+from kiwi.errors import PlatformApiError
 from kiwi.dispatcher import BaleDispatcher
 from kiwi.types import OutputMessageKind, ScriptOutputMessage
 
@@ -10,6 +11,7 @@ from kiwi.types import OutputMessageKind, ScriptOutputMessage
 class FakeBaleClient:
     def __init__(self) -> None:
         self.calls: list[tuple[str, str, str | None]] = []
+        self.media_group_calls: list[tuple[str, int]] = []
 
     async def send_message(self, chat_id: str, text: str):
         self.calls.append(("text", chat_id, text))
@@ -46,6 +48,10 @@ class FakeBaleClient:
     async def send_video_note(self, chat_id: str, video_note_path: Path):
         self.calls.append(("video_note", chat_id, None))
         return {"ok": True}
+
+    async def send_media_group(self, chat_id: str, media_group: list[dict]):
+        self.media_group_calls.append((chat_id, len(media_group)))
+        return [{"ok": True}]
 
 
 def test_dispatcher_sends_text_and_file(tmp_path: Path) -> None:
@@ -88,3 +94,89 @@ def test_dispatcher_blocks_sticker_and_sends_video_note(tmp_path: Path) -> None:
     asyncio.run(dispatcher.dispatch("@chan", messages, output_dir=output_dir, input_dir=input_dir))
 
     assert client.calls[0] == ("video_note", "@chan", None)
+
+
+def test_dispatcher_sends_media_group_for_consecutive_items(tmp_path: Path) -> None:
+    client = FakeBaleClient()
+    dispatcher = BaleDispatcher(client)
+
+    input_dir = tmp_path / "input"
+    output_dir = tmp_path / "output"
+    input_dir.mkdir()
+    output_dir.mkdir()
+    (output_dir / "a.jpg").write_bytes(b"1")
+    (output_dir / "b.jpg").write_bytes(b"2")
+
+    messages = [
+        ScriptOutputMessage(type=OutputMessageKind.PHOTO, path="a.jpg", caption="cap"),
+        ScriptOutputMessage(type=OutputMessageKind.PHOTO, path="b.jpg"),
+    ]
+    asyncio.run(dispatcher.dispatch("@chan", messages, output_dir=output_dir, input_dir=input_dir))
+
+    assert client.media_group_calls == [("@chan", 2)]
+    assert client.calls == []
+
+
+def test_dispatcher_groups_audio_albums(tmp_path: Path) -> None:
+    client = FakeBaleClient()
+    dispatcher = BaleDispatcher(client)
+
+    input_dir = tmp_path / "input"
+    output_dir = tmp_path / "output"
+    input_dir.mkdir()
+    output_dir.mkdir()
+    (output_dir / "a.mp3").write_bytes(b"1")
+    (output_dir / "b.mp3").write_bytes(b"2")
+
+    messages = [
+        ScriptOutputMessage(type=OutputMessageKind.AUDIO, path="a.mp3", caption="track list"),
+        ScriptOutputMessage(type=OutputMessageKind.AUDIO, path="b.mp3"),
+    ]
+    asyncio.run(dispatcher.dispatch("@chan", messages, output_dir=output_dir, input_dir=input_dir))
+
+    assert client.media_group_calls == [("@chan", 2)]
+    assert client.calls == []
+
+
+def test_dispatcher_does_not_mix_document_and_photo_groups(tmp_path: Path) -> None:
+    client = FakeBaleClient()
+    dispatcher = BaleDispatcher(client)
+
+    input_dir = tmp_path / "input"
+    output_dir = tmp_path / "output"
+    input_dir.mkdir()
+    output_dir.mkdir()
+    (output_dir / "a.jpg").write_bytes(b"1")
+    (output_dir / "b.pdf").write_bytes(b"2")
+    (output_dir / "c.pdf").write_bytes(b"3")
+
+    messages = [
+        ScriptOutputMessage(type=OutputMessageKind.PHOTO, path="a.jpg", caption="cap"),
+        ScriptOutputMessage(type=OutputMessageKind.DOCUMENT, path="b.pdf"),
+        ScriptOutputMessage(type=OutputMessageKind.DOCUMENT, path="c.pdf"),
+    ]
+    asyncio.run(dispatcher.dispatch("@chan", messages, output_dir=output_dir, input_dir=input_dir))
+
+    assert client.media_group_calls == [("@chan", 2)]
+    assert client.calls[0] == ("photo", "@chan", "cap")
+
+
+def test_dispatcher_falls_back_to_document_when_send_audio_fails(tmp_path: Path) -> None:
+    class FailingAudioClient(FakeBaleClient):
+        async def send_audio(self, chat_id: str, audio_path: Path, caption: str | None = None):
+            raise PlatformApiError("sendAudio network error: ReadTimeout")
+
+    client = FailingAudioClient()
+    dispatcher = BaleDispatcher(client)
+
+    input_dir = tmp_path / "input"
+    output_dir = tmp_path / "output"
+    input_dir.mkdir()
+    output_dir.mkdir()
+    (output_dir / "x.mp3").write_bytes(b"abc")
+
+    messages = [
+        ScriptOutputMessage(type=OutputMessageKind.AUDIO, path="x.mp3", caption="c"),
+    ]
+    asyncio.run(dispatcher.dispatch("@chan", messages, output_dir=output_dir, input_dir=input_dir))
+    assert client.calls == [("document", "@chan", "c")]

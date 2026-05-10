@@ -92,3 +92,86 @@ def test_skip_non_channel_update() -> None:
         },
     }
     assert parse_telegram_channel_update(update) is None
+
+
+def test_parse_media_group_and_text_link_entity() -> None:
+    update = {
+        "update_id": 20,
+        "channel_post": {
+            "message_id": 50,
+            "chat": {"id": -100999, "type": "channel"},
+            "media_group_id": "group-1",
+            "caption": "click here",
+            "caption_entities": [
+                {"type": "text_link", "offset": 0, "length": 5, "url": "https://example.com"},
+            ],
+            "photo": [{"file_id": "p1", "file_size": 12}],
+        },
+    }
+    parsed = parse_telegram_channel_update(update)
+    assert parsed is not None
+    assert parsed.media_group_id == "group-1"
+    assert parsed.caption == "click (https://example.com) here"
+
+
+def test_parse_blockquote_entity_to_prefixed_text() -> None:
+    update = {
+        "update_id": 21,
+        "channel_post": {
+            "message_id": 51,
+            "chat": {"id": -100999, "type": "channel"},
+            "text": "line one\nline two\nrest",
+            "entities": [
+                {"type": "blockquote", "offset": 0, "length": 17},
+            ],
+        },
+    }
+    parsed = parse_telegram_channel_update(update)
+    assert parsed is not None
+    assert parsed.text == "🖊 line one\n🖊 line two\nrest"
+
+
+def test_parse_reply_quote_is_readable() -> None:
+    update = {
+        "update_id": 22,
+        "channel_post": {
+            "message_id": 52,
+            "chat": {"id": -100999, "type": "channel"},
+            "caption": "جواب جدید",
+            "reply_to_message": {
+                "message_id": 40,
+                "text": "متن پیام قبلی",
+            },
+            "photo": [{"file_id": "p2"}],
+        },
+    }
+    parsed = parse_telegram_channel_update(update)
+    assert parsed is not None
+    assert parsed.caption is not None
+    assert "🖊 نقل‌قول:" in parsed.caption
+    assert "«متن پیام قبلی»" in parsed.caption
+
+
+def test_parse_poll_message_to_structured_text() -> None:
+    update = {
+        "update_id": 23,
+        "channel_post": {
+            "message_id": 53,
+            "chat": {"id": -100999, "type": "channel"},
+            "poll": {
+                "question": "کدام گزینه؟",
+                "type": "regular",
+                "allows_multiple_answers": True,
+                "options": [
+                    {"text": "گزینه اول"},
+                    {"text": "گزینه دوم"},
+                ],
+            },
+        },
+    }
+    parsed = parse_telegram_channel_update(update)
+    assert parsed is not None
+    assert parsed.text is not None
+    assert "📊 نظرسنجی: کدام گزینه؟" in parsed.text
+    assert "1. گزینه اول" in parsed.text
+    assert "2. گزینه دوم" in parsed.text

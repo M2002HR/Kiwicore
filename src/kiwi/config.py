@@ -39,6 +39,8 @@ class Settings:
     gaurd_script_timeout_sec: int
     poll_idle_sleep_sec: float
     poll_error_sleep_sec: float
+    log_channel_target: str | None
+    media_group_wait_sec: float
 
 
 @dataclass(slots=True)
@@ -118,6 +120,8 @@ def load_settings(env_file: str = ".env") -> Settings:
         gaurd_script_timeout_sec=max(5, _int("GAURD_SCRIPT_TIMEOUT_SEC", 60)),
         poll_idle_sleep_sec=max(0.1, _float("POLL_IDLE_SLEEP_SEC", 1.0)),
         poll_error_sleep_sec=max(0.5, _float("POLL_ERROR_SLEEP_SEC", 5.0)),
+        log_channel_target=_str("LOG_CHANNEL_TARGET", "").strip() or None,
+        media_group_wait_sec=max(0.3, _float("MEDIA_GROUP_WAIT_SEC", 1.4)),
     )
 
     if not settings.telegram_bot_token:

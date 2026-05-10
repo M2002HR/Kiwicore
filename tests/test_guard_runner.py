@@ -63,3 +63,21 @@ def test_guard_runner_invalid_output(tmp_path: Path) -> None:
 
     with pytest.raises(GuardExecutionError):
         asyncio.run(runner.run(_route(), payload_path=payload, input_dir=input_dir, output_dir=output_dir))
+
+
+def test_guard_runner_false_with_reason_token(tmp_path: Path) -> None:
+    guard_dir = tmp_path / "guards"
+    guard_dir.mkdir()
+    (guard_dir / "g.py").write_text("print('false: obvious_advertisement')", encoding="utf-8")
+
+    runner = GuardRunner(str(guard_dir), timeout_sec=5)
+    payload = tmp_path / "payload.json"
+    payload.write_text("{}", encoding="utf-8")
+    input_dir = tmp_path / "in"
+    output_dir = tmp_path / "out"
+    input_dir.mkdir()
+    output_dir.mkdir()
+
+    result = asyncio.run(runner.run(_route(), payload_path=payload, input_dir=input_dir, output_dir=output_dir))
+    assert result is False
+    assert runner.last_reason == "obvious_advertisement"

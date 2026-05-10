@@ -6,6 +6,7 @@ __pycache__/
 app_data/
 app_tmp/
 config/channels.json
+config/admin_users.json
 scripts/channel_scripts/*
 !scripts/channel_scripts/default_scripts.py
 scripts/gaurd_scrpts/*

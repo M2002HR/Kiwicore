@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from kiwi.types import IncomingChannelMessage, IncomingMedia, MediaKind
+from kiwi.types import AdminInboundMessage, IncomingChannelMessage, IncomingMedia, MediaKind
 from kiwi.utils import normalize_channel_id, normalize_channel_username
 
 
@@ -130,6 +130,37 @@ def parse_telegram_channel_update(update: dict) -> IncomingChannelMessage | None
         medias=medias,
         raw=update,
         media_group_id=media_group_id,
+    )
+
+
+def parse_telegram_private_message_update(update: dict) -> AdminInboundMessage | None:
+    raw_message = update.get("message")
+    if raw_message is None:
+        raw_message = update.get("edited_message")
+    if not isinstance(raw_message, dict):
+        return None
+
+    chat = raw_message.get("chat") or {}
+    if (chat.get("type") or "").strip().lower() != "private":
+        return None
+
+    update_id = _to_int_or_none(update.get("update_id"))
+    chat_id = normalize_channel_id(chat.get("id"))
+    from_user = raw_message.get("from") or {}
+    user_id = normalize_channel_id(from_user.get("id"))
+    if update_id is None or chat_id is None or user_id is None:
+        return None
+
+    username = normalize_channel_username(from_user.get("username"))
+    text_raw = raw_message.get("text")
+    text = text_raw.strip() if isinstance(text_raw, str) and text_raw.strip() else None
+    return AdminInboundMessage(
+        update_id=update_id,
+        chat_id=chat_id,
+        user_id=user_id,
+        username=username,
+        text=text,
+        raw=update,
     )
 
 

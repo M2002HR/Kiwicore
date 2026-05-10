@@ -54,14 +54,17 @@ class BotApiClient:
             raise PlatformApiError("getFile response is not an object")
         return response
 
-    async def send_message(self, chat_id: str, text: str) -> dict:
+    async def send_message(self, chat_id: str, text: str, reply_markup: dict | None = None) -> dict:
         retries = 3  # initial attempt + 2 retries
         backoff_sec = 0.7
         response: object | None = None
         last_error: PlatformApiError | None = None
+        payload: dict[str, object] = {"chat_id": chat_id, "text": text}
+        if reply_markup is not None:
+            payload["reply_markup"] = reply_markup
         for attempt in range(1, retries + 1):
             try:
-                response = await self._post("sendMessage", json={"chat_id": chat_id, "text": text})
+                response = await self._post("sendMessage", json=payload)
                 break
             except PlatformApiError as exc:
                 last_error = exc

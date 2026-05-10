@@ -93,3 +93,13 @@ class ScriptRunResult:
     messages: list[ScriptOutputMessage]
     stdout: str
     stderr: str
+
+
+@dataclass(slots=True)
+class AdminInboundMessage:
+    update_id: int
+    chat_id: str
+    user_id: str
+    username: str | None
+    text: str | None
+    raw: dict

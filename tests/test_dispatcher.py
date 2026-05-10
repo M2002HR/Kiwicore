@@ -13,7 +13,7 @@ class FakeBaleClient:
         self.calls: list[tuple[str, str, str | None]] = []
         self.media_group_calls: list[tuple[str, int]] = []
 
-    async def send_message(self, chat_id: str, text: str):
+    async def send_message(self, chat_id: str, text: str, reply_markup: dict | None = None):
         self.calls.append(("text", chat_id, text))
         return {"ok": True}
 

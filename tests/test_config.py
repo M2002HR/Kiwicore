@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from kiwi.config import load_routes
+from kiwi.config import load_routes, load_settings
 
 
 def test_load_routes_by_id_and_username(tmp_path: Path) -> None:
@@ -143,3 +143,50 @@ def test_load_routes_custom_gaurd_script(tmp_path: Path) -> None:
     route = registry.match("-1001", None)
     assert route is not None
     assert route.gaurd_script == "my_guard.py"
+
+
+def test_load_settings_adds_private_updates_for_admin_bot(tmp_path: Path) -> None:
+    env_path = tmp_path / ".env"
+    env_path.write_text(
+        "\n".join(
+            [
+                "TELEGRAM_BOT_TOKEN=t",
+                "BALE_BOT_TOKEN=b",
+                "TELEGRAM_ALLOWED_UPDATES=[\"channel_post\"]",
+                "ADMIN_BOT_ENABLED=true",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    settings = load_settings(str(env_path))
+    assert "channel_post" in settings.telegram_allowed_updates
+    assert "message" in settings.telegram_allowed_updates
+    assert "edited_message" in settings.telegram_allowed_updates
+
+
+def test_load_routes_allows_duplicate_sources_and_matches_all(tmp_path: Path) -> None:
+    config_path = tmp_path / "channels.json"
+    config_path.write_text(
+        json.dumps(
+            [
+                {
+                    "name": "r1",
+                    "source_channel_username": "@dup_src",
+                    "destination_channel_username": "@dst1",
+                    "script": "s1.py",
+                },
+                {
+                    "name": "r2",
+                    "source_channel_username": "@dup_src",
+                    "destination_channel_username": "@dst2",
+                    "script": "s2.py",
+                },
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    registry = load_routes(str(config_path))
+    matches = registry.match_all("-100000", "@dup_src")
+    assert len(matches) == 2
+    assert [m.name for m in matches] == ["r1", "r2"]

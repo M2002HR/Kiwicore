@@ -3,16 +3,17 @@ from __future__ import annotations
 import asyncio
 import logging
 from pathlib import Path
+from typing import Any
 
 from kiwi.config import RouteRegistry, Settings
 from kiwi.dispatcher import BaleDispatcher
 from kiwi.errors import GuardExecutionError, MessageTooLargeError, PlatformApiError, ScriptExecutionError
 from kiwi.guard_runner import GuardRunner
-from kiwi.platforms.parser import parse_telegram_channel_update
+from kiwi.platforms.parser import parse_telegram_channel_update, parse_telegram_private_message_update
 from kiwi.script_runner import ScriptRunner
 from kiwi.state import StateStore
 from kiwi.storage import StorageManager
-from kiwi.types import ChannelRoute, IncomingChannelMessage, IncomingMedia, MediaKind
+from kiwi.types import AdminInboundMessage, ChannelRoute, IncomingChannelMessage, IncomingMedia, MediaKind
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +30,7 @@ class KiwiService:
         guard_runner: GuardRunner,
         script_runner: ScriptRunner,
         state_store: StateStore,
+        admin_handler: Any | None = None,
     ) -> None:
         self.settings = settings
         self.routes = routes
@@ -39,6 +41,7 @@ class KiwiService:
         self.script_runner = script_runner
         self.state_store = state_store
         self.dispatcher = BaleDispatcher(self.bale_client)
+        self.admin_handler = admin_handler
 
         self._offset: int | None = self.state_store.load_offset()
         self._stop_event = asyncio.Event()
@@ -116,14 +119,19 @@ class KiwiService:
                 self.state_store.save_offset(self._offset)
 
             incoming = parse_telegram_channel_update(update)
+            private_incoming = parse_telegram_private_message_update(update)
+            if private_incoming is not None and self.settings.admin_bot_enabled and self.admin_handler is not None:
+                await self._process_admin_message(private_incoming)
+                continue
             if incoming is None:
                 continue
 
-            route = self.routes.match(incoming.source_channel_id, incoming.source_channel_username)
-            if route is None:
+            routes = self.routes.match_all(incoming.source_channel_id, incoming.source_channel_username)
+            if not routes:
                 continue
 
-            matched_messages.append((incoming, route))
+            for route in routes:
+                matched_messages.append((incoming, route))
 
         ready_messages = self._collect_ready_messages(matched_messages)
         ready_messages.extend(self._flush_ready_media_groups(force=False))
@@ -135,6 +143,32 @@ class KiwiService:
             processed += 1
 
         return processed
+
+    async def _process_admin_message(self, incoming: AdminInboundMessage) -> None:
+        try:
+            response = self.admin_handler.handle(incoming)
+        except Exception as exc:
+            response = f"خطا در مدیریت: {exc}"
+        if isinstance(response, str):
+            text = response
+            reply_markup = None
+        else:
+            text = str(getattr(response, "text", "") or "")
+            reply_markup = getattr(response, "reply_markup", None)
+            if not text:
+                text = "پاسخ خالی از مدیریت دریافت شد."
+        try:
+            await self.telegram_client.send_message(incoming.chat_id, text, reply_markup=reply_markup)
+        except Exception:
+            logger.exception(
+                "Failed to send admin bot response",
+                extra={
+                    "details": {
+                        "chat_id": incoming.chat_id,
+                        "user_id": incoming.user_id,
+                    }
+                },
+            )
 
     async def _process_route_message(self, incoming: IncomingChannelMessage, route: ChannelRoute) -> None:
         paths = self.storage.prepare_message_paths(incoming)
@@ -437,6 +471,9 @@ class KiwiService:
         for key in keys_to_remove:
             self._pending_media_groups.pop(key, None)
         return ready
+
+    def set_routes(self, routes: RouteRegistry) -> None:
+        self.routes = routes
 
     async def _audit_log(
         self,

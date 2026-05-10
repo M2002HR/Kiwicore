@@ -4,9 +4,12 @@ import asyncio
 import json
 from pathlib import Path
 
+from kiwi.admin_bot import AdminBotHandler
+from kiwi.admin_store import AdminStore
 from kiwi.config import RouteRegistry, Settings
 from kiwi.errors import MessageTooLargeError, PlatformApiError
 from kiwi.guard_runner import GuardRunner
+from kiwi.management_api import ManagementApi
 from kiwi.script_runner import ScriptRunner
 from kiwi.service import KiwiService
 from kiwi.state import StateStore
@@ -38,7 +41,7 @@ class FakeTelegramClient:
         output_path.write_bytes(self.file_bytes)
         return len(self.file_bytes)
 
-    async def send_message(self, chat_id: str, text: str):
+    async def send_message(self, chat_id: str, text: str, reply_markup: dict | None = None):
         self.audit_messages.append((chat_id, text))
         return {"ok": True}
 
@@ -51,7 +54,7 @@ class FakeBaleClient:
         self.sent: list[tuple[str, str]] = []
         self.media_group_sent: list[tuple[str, int]] = []
 
-    async def send_message(self, chat_id: str, text: str):
+    async def send_message(self, chat_id: str, text: str, reply_markup: dict | None = None):
         self.sent.append((chat_id, text))
         return {"ok": True}
 
@@ -122,17 +125,22 @@ def _settings(tmp_path: Path, default_max_mb: int = 50) -> Settings:
         poll_error_sleep_sec=0.01,
         log_channel_target=None,
         media_group_wait_sec=0.3,
+        admin_bot_enabled=True,
+        admin_users_config_path=str(tmp_path / "config" / "admin_users.json"),
+        admin_sessions_path=str(tmp_path / "storage" / "admin_sessions.json"),
     )
 
 
-def _route_registry(route: ChannelRoute) -> RouteRegistry:
-    by_id = {}
-    by_username = {}
-    if route.source_channel_id:
-        by_id[route.source_channel_id] = route
-    if route.source_channel_username:
-        by_username[route.source_channel_username] = route
-    return RouteRegistry(routes=[route], by_channel_id=by_id, by_channel_username=by_username)
+def _route_registry(route: ChannelRoute | list[ChannelRoute]) -> RouteRegistry:
+    routes = route if isinstance(route, list) else [route]
+    by_id: dict[str, list[ChannelRoute]] = {}
+    by_username: dict[str, list[ChannelRoute]] = {}
+    for item in routes:
+        if item.source_channel_id:
+            by_id.setdefault(item.source_channel_id, []).append(item)
+        if item.source_channel_username:
+            by_username.setdefault(item.source_channel_username, []).append(item)
+    return RouteRegistry(routes=routes, by_channel_id=by_id, by_channel_username=by_username)
 
 
 def test_service_flow_dispatches_script_output(tmp_path: Path) -> None:
@@ -200,6 +208,78 @@ print(json.dumps({'messages': [{'type': 'text', 'text': 'OUT:' + text}]}))
 
     state = json.loads(Path(settings.state_path).read_text(encoding="utf-8"))
     assert state["offset"] == 102
+
+
+def test_service_flow_fanout_same_source_to_multiple_routes(tmp_path: Path) -> None:
+    scripts_dir = tmp_path / "scripts"
+    scripts_dir.mkdir()
+    script_path = scripts_dir / "fanout.py"
+    script_path.write_text(
+        """
+import json
+import argparse
+from pathlib import Path
+
+p = argparse.ArgumentParser()
+p.add_argument('--payload', required=True)
+p.add_argument('--input-dir', required=True)
+p.add_argument('--output-dir', required=True)
+a = p.parse_args()
+
+payload = json.loads(Path(a.payload).read_text(encoding='utf-8'))
+text = payload['message'].get('text') or ''
+print(json.dumps({'messages': [{'type': 'text', 'text': 'OUT:' + text}]}))
+""".strip(),
+        encoding="utf-8",
+    )
+
+    update = {
+        "update_id": 151,
+        "channel_post": {
+            "message_id": 9,
+            "chat": {"id": -1001, "type": "channel", "username": "srcchan"},
+            "text": "hello fanout",
+        },
+    }
+
+    settings = _settings(tmp_path)
+    route1 = ChannelRoute(
+        name="r1",
+        enabled=True,
+        source_channel_id="-1001",
+        source_channel_username="@srcchan",
+        destination_channel_id="-2001",
+        destination_channel_username=None,
+        script="fanout.py",
+        max_message_mb=10,
+    )
+    route2 = ChannelRoute(
+        name="r2",
+        enabled=True,
+        source_channel_id="-1001",
+        source_channel_username="@srcchan",
+        destination_channel_id="-2002",
+        destination_channel_username=None,
+        script="fanout.py",
+        max_message_mb=10,
+    )
+
+    tg = FakeTelegramClient([update], b"")
+    bale = FakeBaleClient()
+    service = KiwiService(
+        settings=settings,
+        routes=_route_registry([route1, route2]),
+        telegram_client=tg,
+        bale_client=bale,
+        storage=StorageManager(settings.storage_dir),
+        guard_runner=GuardRunner(settings.gaurd_scripts_dir, timeout_sec=5),
+        script_runner=ScriptRunner(settings.scripts_dir, timeout_sec=5),
+        state_store=StateStore(settings.state_path),
+    )
+
+    processed = asyncio.run(service.run_once())
+    assert processed == 2
+    assert bale.sent == [("-2001", "OUT:hello fanout"), ("-2002", "OUT:hello fanout")]
 
 
 def test_service_flow_skips_large_message(tmp_path: Path) -> None:
@@ -603,6 +683,71 @@ def test_service_sends_audit_logs_to_telegram_channel(tmp_path: Path) -> None:
     assert len(tg.audit_messages) >= 1
     assert all(chat == "@logchan" for chat, _ in tg.audit_messages)
     assert any("کیوی" in text for _, text in tg.audit_messages)
+
+
+def test_service_handles_admin_private_commands(tmp_path: Path) -> None:
+    scripts_dir = tmp_path / "scripts"
+    scripts_dir.mkdir()
+    (scripts_dir / "-1001.py").write_text("print('{\"messages\": []}')", encoding="utf-8")
+
+    guards_dir = tmp_path / "gaurds"
+    guards_dir.mkdir(parents=True, exist_ok=True)
+    (guards_dir / "default_guard.py").write_text("print('true')", encoding="utf-8")
+    channels_path = tmp_path / "channels.json"
+    channels_path.write_text(
+        '[{"name":"r1","enabled":true,"source_channel_id":"-1001","destination_channel_id":"-2001","script":"-1001.py","gaurd_script":"default_guard.py"}]',
+        encoding="utf-8",
+    )
+
+    update = {
+        "update_id": 711,
+        "message": {
+            "message_id": 1,
+            "chat": {"id": 555, "type": "private"},
+            "from": {"id": 777, "username": "admin_root"},
+            "text": "/login admin change_me",
+        },
+    }
+    settings = _settings(tmp_path)
+    settings.channels_config_path = str(channels_path)
+    settings.scripts_dir = str(scripts_dir)
+    settings.gaurd_scripts_dir = str(guards_dir)
+    tg = FakeTelegramClient([update], b"")
+    bale = FakeBaleClient()
+
+    service = KiwiService(
+        settings=settings,
+        routes=_route_registry(
+            ChannelRoute(
+                name="r1",
+                enabled=True,
+                source_channel_id="-1001",
+                source_channel_username=None,
+                destination_channel_id="-2001",
+                destination_channel_username=None,
+                script="-1001.py",
+                max_message_mb=10,
+            )
+        ),
+        telegram_client=tg,
+        bale_client=bale,
+        storage=StorageManager(settings.storage_dir),
+        guard_runner=GuardRunner(settings.gaurd_scripts_dir, timeout_sec=5),
+        script_runner=ScriptRunner(settings.scripts_dir, timeout_sec=5),
+        state_store=StateStore(settings.state_path),
+    )
+    store = AdminStore(settings.admin_users_config_path, settings.admin_sessions_path)
+    api = ManagementApi(
+        channels_config_path=settings.channels_config_path,
+        scripts_dir=settings.scripts_dir,
+        gaurd_scripts_dir=settings.gaurd_scripts_dir,
+        on_routes_reloaded=service.set_routes,
+    )
+    service.admin_handler = AdminBotHandler(admin_store=store, management_api=api)
+
+    processed = asyncio.run(service.run_once())
+    assert processed == 0
+    assert any(chat == "555" and "موفق" in text for chat, text in tg.audit_messages)
 
 
 class FlakyTelegramClient:

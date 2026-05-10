@@ -41,20 +41,41 @@ class Settings:
     poll_error_sleep_sec: float
     log_channel_target: str | None
     media_group_wait_sec: float
+    admin_bot_enabled: bool
+    admin_users_config_path: str
+    admin_sessions_path: str
 
 
 @dataclass(slots=True)
 class RouteRegistry:
     routes: list[ChannelRoute]
-    by_channel_id: dict[str, ChannelRoute]
-    by_channel_username: dict[str, ChannelRoute]
+    by_channel_id: dict[str, list[ChannelRoute]]
+    by_channel_username: dict[str, list[ChannelRoute]]
 
     def match(self, source_channel_id: str, source_channel_username: str | None) -> ChannelRoute | None:
+        matches = self.match_all(source_channel_id, source_channel_username)
+        return matches[0] if matches else None
+
+    def match_all(self, source_channel_id: str, source_channel_username: str | None) -> list[ChannelRoute]:
+        out: list[ChannelRoute] = []
+        seen: set[int] = set()
+
         if source_channel_username:
-            route = self.by_channel_username.get(source_channel_username)
-            if route:
-                return route
-        return self.by_channel_id.get(source_channel_id)
+            for route in self.by_channel_username.get(source_channel_username, []):
+                key = id(route)
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append(route)
+
+        for route in self.by_channel_id.get(source_channel_id, []):
+            key = id(route)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(route)
+
+        return out
 
 
 def _str(name: str, default: str) -> str:
@@ -105,7 +126,10 @@ def load_settings(env_file: str = ".env") -> Settings:
         telegram_api_base_url=_str("TELEGRAM_API_BASE_URL", "https://api.telegram.org").strip(),
         telegram_file_base_url=_str("TELEGRAM_FILE_BASE_URL", "https://api.telegram.org/file").strip(),
         telegram_poll_timeout_sec=max(1, _int("TELEGRAM_POLL_TIMEOUT_SEC", 30)),
-        telegram_allowed_updates=_list("TELEGRAM_ALLOWED_UPDATES", ["channel_post", "edited_channel_post"]),
+        telegram_allowed_updates=_list(
+            "TELEGRAM_ALLOWED_UPDATES",
+            ["channel_post", "edited_channel_post", "message", "edited_message"],
+        ),
         bale_bot_token=_str("BALE_BOT_TOKEN", "").strip(),
         bale_api_base_url=_str("BALE_API_BASE_URL", "https://tapi.bale.ai").strip(),
         bale_file_base_url=_str("BALE_FILE_BASE_URL", "https://tapi.bale.ai/file").strip(),
@@ -122,7 +146,22 @@ def load_settings(env_file: str = ".env") -> Settings:
         poll_error_sleep_sec=max(0.5, _float("POLL_ERROR_SLEEP_SEC", 5.0)),
         log_channel_target=_str("LOG_CHANNEL_TARGET", "").strip() or None,
         media_group_wait_sec=max(0.3, _float("MEDIA_GROUP_WAIT_SEC", 1.4)),
+        admin_bot_enabled=_bool("ADMIN_BOT_ENABLED", True),
+        admin_users_config_path=_str("ADMIN_USERS_CONFIG_PATH", "./config/admin_users.json").strip(),
+        admin_sessions_path=_str("ADMIN_SESSIONS_PATH", "./app_data/admin_sessions.json").strip(),
     )
+
+    if settings.admin_bot_enabled:
+        needed = {"message", "edited_message"}
+        merged: list[str] = []
+        seen: set[str] = set()
+        for item in settings.telegram_allowed_updates + list(needed):
+            key = str(item).strip()
+            if not key or key in seen:
+                continue
+            merged.append(key)
+            seen.add(key)
+        settings.telegram_allowed_updates = merged
 
     if not settings.telegram_bot_token:
         raise ValueError("TELEGRAM_BOT_TOKEN is required")
@@ -134,6 +173,8 @@ def load_settings(env_file: str = ".env") -> Settings:
     Path(settings.gaurd_scripts_dir).mkdir(parents=True, exist_ok=True)
     Path(settings.channels_config_path).parent.mkdir(parents=True, exist_ok=True)
     Path(settings.state_path).parent.mkdir(parents=True, exist_ok=True)
+    Path(settings.admin_users_config_path).parent.mkdir(parents=True, exist_ok=True)
+    Path(settings.admin_sessions_path).parent.mkdir(parents=True, exist_ok=True)
 
     return settings
 
@@ -171,8 +212,8 @@ def load_routes(config_path: str) -> RouteRegistry:
         raise ValueError("Channels config must be a JSON list")
 
     routes: list[ChannelRoute] = []
-    by_id: dict[str, ChannelRoute] = {}
-    by_username: dict[str, ChannelRoute] = {}
+    by_id: dict[str, list[ChannelRoute]] = {}
+    by_username: dict[str, list[ChannelRoute]] = {}
 
     for idx, obj in enumerate(raw):
         if not isinstance(obj, dict):
@@ -216,13 +257,9 @@ def load_routes(config_path: str) -> RouteRegistry:
             continue
 
         if route.source_channel_id:
-            if route.source_channel_id in by_id:
-                raise ValueError(f"Duplicate source_channel_id: {route.source_channel_id}")
-            by_id[route.source_channel_id] = route
+            by_id.setdefault(route.source_channel_id, []).append(route)
 
         if route.source_channel_username:
-            if route.source_channel_username in by_username:
-                raise ValueError(f"Duplicate source_channel_username: {route.source_channel_username}")
-            by_username[route.source_channel_username] = route
+            by_username.setdefault(route.source_channel_username, []).append(route)
 
     return RouteRegistry(routes=routes, by_channel_id=by_id, by_channel_username=by_username)

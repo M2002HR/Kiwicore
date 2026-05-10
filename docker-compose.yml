@@ -22,7 +22,7 @@ services:
     environment:
       GUARD_AI_ENDPOINT: http://gemini_server:8000/proxy/gemini
     volumes:
-      - ./config:/app/config:ro
+      - ./config:/app/config
       - ./scripts:/app/scripts
       - ./app_data:/app/app_data
 

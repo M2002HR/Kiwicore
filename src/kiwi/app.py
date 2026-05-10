@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+from kiwi.admin_bot import AdminBotHandler
+from kiwi.admin_store import AdminStore
 from kiwi.config import load_routes, load_settings
 from kiwi.guard_runner import GuardRunner
+from kiwi.management_api import ManagementApi
 from kiwi.platforms.client import BotApiClient
 from kiwi.script_runner import ScriptRunner
 from kiwi.service import KiwiService
@@ -28,7 +31,7 @@ async def build_service(env_file: str = ".env") -> KiwiService:
         trust_env=settings.http_trust_env,
     )
 
-    return KiwiService(
+    service = KiwiService(
         settings=settings,
         routes=routes,
         telegram_client=telegram_client,
@@ -38,3 +41,13 @@ async def build_service(env_file: str = ".env") -> KiwiService:
         script_runner=ScriptRunner(settings.scripts_dir, settings.script_timeout_sec),
         state_store=StateStore(settings.state_path),
     )
+
+    admin_store = AdminStore(settings.admin_users_config_path, settings.admin_sessions_path)
+    management_api = ManagementApi(
+        channels_config_path=settings.channels_config_path,
+        scripts_dir=settings.scripts_dir,
+        gaurd_scripts_dir=settings.gaurd_scripts_dir,
+        on_routes_reloaded=service.set_routes,
+    )
+    service.admin_handler = AdminBotHandler(admin_store=admin_store, management_api=management_api)
+    return service

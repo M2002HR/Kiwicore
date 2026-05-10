@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from kiwi.platforms.parser import parse_telegram_channel_update
+from kiwi.platforms.parser import parse_telegram_channel_update, parse_telegram_private_message_update
 
 
 def test_parse_channel_text_message() -> None:
@@ -92,6 +92,25 @@ def test_skip_non_channel_update() -> None:
         },
     }
     assert parse_telegram_channel_update(update) is None
+
+
+def test_parse_private_message_update() -> None:
+    update = {
+        "update_id": 1000,
+        "message": {
+            "message_id": 2,
+            "chat": {"id": 555, "type": "private"},
+            "from": {"id": 777, "username": "admin_root"},
+            "text": "/help",
+        },
+    }
+    parsed = parse_telegram_private_message_update(update)
+    assert parsed is not None
+    assert parsed.update_id == 1000
+    assert parsed.chat_id == "555"
+    assert parsed.user_id == "777"
+    assert parsed.username == "@admin_root"
+    assert parsed.text == "/help"
 
 
 def test_parse_media_group_and_text_link_entity() -> None:

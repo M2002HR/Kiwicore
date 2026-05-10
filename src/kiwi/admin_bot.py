@@ -1,0 +1,629 @@
+from __future__ import annotations
+
+import json
+import shlex
+from dataclasses import dataclass
+
+from kiwi.admin_store import AdminStore
+from kiwi.management_api import ManagementApi
+from kiwi.types import AdminInboundMessage
+
+BTN_LOGIN = "🔐 ورود"
+BTN_LOGOUT = "🚪 خروج"
+BTN_BACK = "⬅️ بازگشت"
+BTN_CANCEL = "❌ لغو"
+
+BTN_LIST_ROUTES = "📋 لیست مسیرها"
+BTN_ADD_ROUTE = "➕ افزودن مسیر"
+BTN_EDIT_ROUTE = "✏️ ویرایش مسیر"
+BTN_DEL_ROUTE = "🗑 حذف مسیر"
+BTN_SCRIPTS = "🧩 لیست اسکریپت‌ها"
+BTN_GUARDS = "🛡 لیست گاردها"
+BTN_ADMINS = "👤 مدیریت ادمین‌ها"
+BTN_RELOAD = "♻️ ریلود مسیرها"
+
+BTN_ADMIN_LIST = "📄 لیست ادمین‌ها"
+BTN_ADMIN_ADD = "➕ افزودن ادمین"
+BTN_ADMIN_DELETE = "➖ حذف ادمین"
+
+BTN_SRC_ID = "🆔 مبدا با شناسه"
+BTN_SRC_USER = "👤 مبدا با یوزرنیم"
+BTN_DST_ID = "🆔 مقصد با شناسه"
+BTN_DST_USER = "👤 مقصد با یوزرنیم"
+BTN_ENABLED_ON = "✅ فعال"
+BTN_ENABLED_OFF = "⛔ غیرفعال"
+BTN_MAX_DEFAULT = "۵۰"
+BTN_MAX_100 = "۱۰۰"
+BTN_MAX_200 = "۲۰۰"
+BTN_MAX_NONE = "نامحدود"
+
+BTN_EDIT_SCRIPT = "🧩 اسکریپت"
+BTN_EDIT_GUARD = "🛡 گارد"
+BTN_EDIT_MAX = "📦 حداکثر حجم"
+BTN_EDIT_DEST_ID = "🎯 مقصد با شناسه"
+BTN_EDIT_DEST_USER = "🎯 مقصد با یوزرنیم"
+BTN_EDIT_SRC_ID = "🧭 مبدا با شناسه"
+BTN_EDIT_SRC_USER = "🧭 مبدا با یوزرنیم"
+BTN_EDIT_ENABLED = "⚙️ وضعیت فعال/غیرفعال"
+
+
+@dataclass(slots=True)
+class AdminBotResponse:
+    text: str
+    reply_markup: dict | None = None
+
+
+class AdminBotHandler:
+    def __init__(self, *, admin_store: AdminStore, management_api: ManagementApi) -> None:
+        self.admin_store = admin_store
+        self.management_api = management_api
+
+    def handle(self, inbound: AdminInboundMessage) -> AdminBotResponse:
+        text = (inbound.text or "").strip()
+
+        # Command path is always available.
+        if text.startswith("/"):
+            return self._handle_command(inbound, text)
+
+        session = self.admin_store.get_session(inbound.user_id)
+        if not bool(session.get("logged_in")):
+            flow = str(session.get("flow") or "")
+            if flow in {"login_username", "login_password"}:
+                if text in {BTN_CANCEL, BTN_BACK}:
+                    self.admin_store.set_flow(inbound.user_id, None, {"stage": None})
+                    return AdminBotResponse("ورود لغو شد.", self._login_keyboard())
+                try:
+                    return self._handle_flow(inbound, flow, text, session)
+                except Exception as exc:
+                    self.admin_store.set_flow(inbound.user_id, None, {"stage": None})
+                    return AdminBotResponse(f"خطا در ورود: {exc}", self._login_keyboard())
+            if text == BTN_LOGIN:
+                self.admin_store.set_flow(inbound.user_id, "login_username", {"stage": "username"})
+                return AdminBotResponse("نام کاربری را بفرست.", self._login_keyboard())
+            return AdminBotResponse("برای ورود روی دکمه ورود بزن.", self._login_keyboard())
+
+        # Logged in conversational flows.
+        flow = str(session.get("flow") or "")
+        if flow:
+            if text in {BTN_CANCEL, BTN_BACK}:
+                self.admin_store.set_flow(inbound.user_id, None, {"stage": None})
+                return AdminBotResponse("عملیات لغو شد.", self._main_menu_keyboard())
+            try:
+                return self._handle_flow(inbound, flow, text, session)
+            except Exception as exc:
+                self.admin_store.set_flow(inbound.user_id, None, {"stage": None})
+                return AdminBotResponse(f"خطا در عملیات: {exc}", self._main_menu_keyboard())
+
+        # Menu button path.
+        if text == BTN_LIST_ROUTES:
+            return AdminBotResponse(self._routes_text(), self._main_menu_keyboard())
+        if text == BTN_ADD_ROUTE:
+            self.admin_store.set_flow(inbound.user_id, "route_add_name", {"new_route": {}})
+            return AdminBotResponse("نام مسیر جدید را بفرست.", self._cancel_keyboard())
+        if text == BTN_EDIT_ROUTE:
+            self.admin_store.set_flow(inbound.user_id, "route_edit_pick", {"stage": "pick"})
+            return AdminBotResponse("نام مسیر برای ویرایش را بزن یا بنویس.", self._route_names_keyboard(include_back=True))
+        if text == BTN_DEL_ROUTE:
+            self.admin_store.set_flow(inbound.user_id, "route_delete_pick", {"stage": "pick"})
+            return AdminBotResponse("نام مسیر برای حذف را بزن یا بنویس.", self._route_names_keyboard(include_back=True))
+        if text == BTN_SCRIPTS:
+            return AdminBotResponse(self._list_lines("اسکریپت‌ها", self.management_api.list_script_files()), self._main_menu_keyboard())
+        if text == BTN_GUARDS:
+            return AdminBotResponse(self._list_lines("گاردها", self.management_api.list_guard_files()), self._main_menu_keyboard())
+        if text == BTN_RELOAD:
+            self.management_api.reload_routes()
+            return AdminBotResponse("ریلود مسیرها انجام شد.", self._main_menu_keyboard())
+        if text == BTN_ADMINS:
+            return AdminBotResponse("مدیریت ادمین‌ها", self._admins_menu_keyboard())
+        if text == BTN_BACK:
+            return AdminBotResponse("بازگشت به منوی اصلی.", self._main_menu_keyboard())
+        if text == BTN_ADMIN_LIST:
+            return AdminBotResponse(self._list_lines("ادمین‌ها", self.admin_store.list_admins()), self._admins_menu_keyboard())
+        if text == BTN_ADMIN_ADD:
+            self.admin_store.set_flow(inbound.user_id, "admin_add_username", {"new_admin": {}})
+            return AdminBotResponse("نام کاربری ادمین جدید را بفرست.", self._cancel_keyboard())
+        if text == BTN_ADMIN_DELETE:
+            self.admin_store.set_flow(inbound.user_id, "admin_delete_username", {"stage": "username"})
+            return AdminBotResponse("نام کاربری ادمینی که باید حذف شود را بفرست.", self._cancel_keyboard())
+        if text == BTN_LOGOUT:
+            self.admin_store.logout(inbound.user_id)
+            return AdminBotResponse("خروج انجام شد.", self._login_keyboard())
+
+        return AdminBotResponse("گزینه نامعتبر است. از دکمه‌ها استفاده کن.", self._main_menu_keyboard())
+
+    def _handle_flow(self, inbound: AdminInboundMessage, flow: str, text: str, session: dict) -> AdminBotResponse:
+        if flow == "login_username":
+            flow_data = dict(session.get("flow_data") or {})
+            flow_data["username"] = text.strip()
+            self.admin_store.set_flow(inbound.user_id, "login_password", flow_data)
+            return AdminBotResponse("رمز عبور را بفرست.", self._login_keyboard())
+
+        if flow == "login_password":
+            flow_data = dict(session.get("flow_data") or {})
+            username = str(flow_data.get("username") or "")
+            if not self.admin_store.verify_credentials(username, text):
+                self.admin_store.set_flow(inbound.user_id, None, {})
+                return AdminBotResponse("نام کاربری یا رمز اشتباه است.", self._login_keyboard())
+            self.admin_store.login(inbound.user_id, username)
+            return AdminBotResponse("ورود موفق بود. پنل مدیریت فعال شد.", self._main_menu_keyboard())
+
+        if flow == "admin_add_username":
+            flow_data = dict(session.get("flow_data") or {})
+            flow_data["username"] = text.strip()
+            self.admin_store.set_flow(inbound.user_id, "admin_add_password", flow_data)
+            return AdminBotResponse("رمز عبور ادمین جدید را بفرست.", self._cancel_keyboard())
+
+        if flow == "admin_add_password":
+            flow_data = dict(session.get("flow_data") or {})
+            username = str(flow_data.get("username") or "")
+            self.admin_store.add_admin(username, text.strip())
+            self.admin_store.set_flow(inbound.user_id, None, {})
+            return AdminBotResponse("ادمین اضافه شد.", self._admins_menu_keyboard())
+
+        if flow == "admin_delete_username":
+            self.admin_store.remove_admin(text.strip())
+            self.admin_store.set_flow(inbound.user_id, None, {})
+            return AdminBotResponse("ادمین حذف شد.", self._admins_menu_keyboard())
+
+        if flow == "route_add_name":
+            flow_data = dict(session.get("flow_data") or {})
+            new_route = dict(flow_data.get("new_route") or {})
+            new_route["name"] = text.strip()
+            flow_data["new_route"] = new_route
+            self.admin_store.set_flow(inbound.user_id, "route_add_source_type", flow_data)
+            return AdminBotResponse("نوع مبدا را انتخاب کن.", self._source_type_keyboard())
+
+        if flow == "route_add_source_type":
+            flow_data = dict(session.get("flow_data") or {})
+            new_route = dict(flow_data.get("new_route") or {})
+            if text == BTN_SRC_ID:
+                new_route["_source_field"] = "source_channel_id"
+            elif text == BTN_SRC_USER:
+                new_route["_source_field"] = "source_channel_username"
+            else:
+                return AdminBotResponse("از دکمه‌های نوع مبدا استفاده کن.", self._source_type_keyboard())
+            flow_data["new_route"] = new_route
+            self.admin_store.set_flow(inbound.user_id, "route_add_source_value", flow_data)
+            return AdminBotResponse("مقدار مبدا را بفرست.", self._cancel_keyboard())
+
+        if flow == "route_add_source_value":
+            flow_data = dict(session.get("flow_data") or {})
+            new_route = dict(flow_data.get("new_route") or {})
+            field = str(new_route.get("_source_field") or "")
+            if not field:
+                raise ValueError("source field not set")
+            new_route[field] = text.strip()
+            flow_data["new_route"] = new_route
+            self.admin_store.set_flow(inbound.user_id, "route_add_dest_type", flow_data)
+            return AdminBotResponse("نوع مقصد را انتخاب کن.", self._dest_type_keyboard())
+
+        if flow == "route_add_dest_type":
+            flow_data = dict(session.get("flow_data") or {})
+            new_route = dict(flow_data.get("new_route") or {})
+            if text == BTN_DST_ID:
+                new_route["_dest_field"] = "destination_channel_id"
+            elif text == BTN_DST_USER:
+                new_route["_dest_field"] = "destination_channel_username"
+            else:
+                return AdminBotResponse("از دکمه‌های نوع مقصد استفاده کن.", self._dest_type_keyboard())
+            flow_data["new_route"] = new_route
+            self.admin_store.set_flow(inbound.user_id, "route_add_dest_value", flow_data)
+            return AdminBotResponse("مقدار مقصد را بفرست.", self._cancel_keyboard())
+
+        if flow == "route_add_dest_value":
+            flow_data = dict(session.get("flow_data") or {})
+            new_route = dict(flow_data.get("new_route") or {})
+            field = str(new_route.get("_dest_field") or "")
+            if not field:
+                raise ValueError("destination field not set")
+            new_route[field] = text.strip()
+            flow_data["new_route"] = new_route
+            self.admin_store.set_flow(inbound.user_id, "route_add_script", flow_data)
+            return AdminBotResponse("اسکریپت را انتخاب کن.", self._scripts_keyboard())
+
+        if flow == "route_add_script":
+            scripts = self.management_api.list_script_files()
+            if text not in scripts:
+                return AdminBotResponse("اسکریپت معتبر انتخاب کن.", self._scripts_keyboard())
+            flow_data = dict(session.get("flow_data") or {})
+            new_route = dict(flow_data.get("new_route") or {})
+            new_route["script"] = text
+            flow_data["new_route"] = new_route
+            self.admin_store.set_flow(inbound.user_id, "route_add_guard", flow_data)
+            return AdminBotResponse("گارد را انتخاب کن.", self._guards_keyboard())
+
+        if flow == "route_add_guard":
+            guards = self.management_api.list_guard_files()
+            if text not in guards:
+                return AdminBotResponse("گارد معتبر انتخاب کن.", self._guards_keyboard())
+            flow_data = dict(session.get("flow_data") or {})
+            new_route = dict(flow_data.get("new_route") or {})
+            new_route["gaurd_script"] = text
+            flow_data["new_route"] = new_route
+            self.admin_store.set_flow(inbound.user_id, "route_add_max", flow_data)
+            return AdminBotResponse("حداکثر حجم پیام (MB) را انتخاب/وارد کن.", self._max_keyboard())
+
+        if flow == "route_add_max":
+            flow_data = dict(session.get("flow_data") or {})
+            new_route = dict(flow_data.get("new_route") or {})
+            parsed = self._normalize_max_input(text)
+            if parsed == "__invalid__":
+                return AdminBotResponse("عدد معتبر وارد کن یا از دکمه‌ها استفاده کن.", self._max_keyboard())
+            new_route["max_message_mb"] = None if parsed is None else max(1, int(parsed))
+            flow_data["new_route"] = new_route
+            self.admin_store.set_flow(inbound.user_id, "route_add_enabled", flow_data)
+            return AdminBotResponse("وضعیت مسیر را انتخاب کن.", self._enabled_keyboard())
+
+        if flow == "route_add_enabled":
+            flow_data = dict(session.get("flow_data") or {})
+            new_route = dict(flow_data.get("new_route") or {})
+            if text == BTN_ENABLED_ON:
+                new_route["enabled"] = True
+            elif text == BTN_ENABLED_OFF:
+                new_route["enabled"] = False
+            else:
+                return AdminBotResponse("وضعیت معتبر انتخاب کن.", self._enabled_keyboard())
+
+            new_route.pop("_source_field", None)
+            new_route.pop("_dest_field", None)
+            self.management_api.add_route(new_route)
+            self.admin_store.set_flow(inbound.user_id, None, {})
+            return AdminBotResponse(f"مسیر «{new_route.get('name')}» اضافه شد و فعال گردید.", self._main_menu_keyboard())
+
+        if flow == "route_delete_pick":
+            self.management_api.delete_route(text.strip())
+            self.admin_store.set_flow(inbound.user_id, None, {})
+            return AdminBotResponse("مسیر حذف شد.", self._main_menu_keyboard())
+
+        if flow == "route_edit_pick":
+            route = self.management_api.get_route(text.strip())
+            self.admin_store.set_flow(inbound.user_id, "route_edit_field", {"route_name": route.get("name")})
+            return AdminBotResponse("کدام بخش مسیر ویرایش شود؟", self._route_edit_fields_keyboard())
+
+        if flow == "route_edit_field":
+            flow_data = dict(session.get("flow_data") or {})
+            route_name = str(flow_data.get("route_name") or "")
+            if not route_name:
+                raise ValueError("اطلاعات مسیر برای ویرایش موجود نیست")
+
+            if text == BTN_EDIT_SCRIPT:
+                self.admin_store.set_flow(inbound.user_id, "route_edit_script", flow_data)
+                return AdminBotResponse("اسکریپت جدید را انتخاب کن.", self._scripts_keyboard())
+            if text == BTN_EDIT_GUARD:
+                self.admin_store.set_flow(inbound.user_id, "route_edit_guard", flow_data)
+                return AdminBotResponse("گارد جدید را انتخاب کن.", self._guards_keyboard())
+            if text == BTN_EDIT_MAX:
+                self.admin_store.set_flow(inbound.user_id, "route_edit_max", flow_data)
+                return AdminBotResponse("حداکثر حجم جدید (MB) را انتخاب/وارد کن.", self._max_keyboard())
+            if text == BTN_EDIT_ENABLED:
+                self.admin_store.set_flow(inbound.user_id, "route_edit_enabled", flow_data)
+                return AdminBotResponse("وضعیت جدید را انتخاب کن.", self._enabled_keyboard())
+            if text == BTN_EDIT_DEST_ID:
+                flow_data["field"] = "destination_channel_id"
+                self.admin_store.set_flow(inbound.user_id, "route_edit_dest_value", flow_data)
+                return AdminBotResponse("شناسه مقصد جدید را بفرست.", self._cancel_keyboard())
+            if text == BTN_EDIT_DEST_USER:
+                flow_data["field"] = "destination_channel_username"
+                self.admin_store.set_flow(inbound.user_id, "route_edit_dest_value", flow_data)
+                return AdminBotResponse("یوزرنیم مقصد جدید را بفرست (مثل @my_channel).", self._cancel_keyboard())
+            if text == BTN_EDIT_SRC_ID:
+                flow_data["field"] = "source_channel_id"
+                self.admin_store.set_flow(inbound.user_id, "route_edit_source_value", flow_data)
+                return AdminBotResponse("شناسه مبدا جدید را بفرست.", self._cancel_keyboard())
+            if text == BTN_EDIT_SRC_USER:
+                flow_data["field"] = "source_channel_username"
+                self.admin_store.set_flow(inbound.user_id, "route_edit_source_value", flow_data)
+                return AdminBotResponse("یوزرنیم مبدا جدید را بفرست (مثل @my_channel).", self._cancel_keyboard())
+            return AdminBotResponse("از دکمه‌های ویرایش استفاده کن.", self._route_edit_fields_keyboard())
+
+        if flow == "route_edit_script":
+            flow_data = dict(session.get("flow_data") or {})
+            route_name = str(flow_data.get("route_name") or "")
+            if not route_name:
+                raise ValueError("اطلاعات ویرایش ناقص است")
+            scripts = self.management_api.list_script_files()
+            if text not in scripts:
+                return AdminBotResponse("اسکریپت معتبر انتخاب کن.", self._scripts_keyboard())
+            self.management_api.update_route(route_name, {"script": text})
+            self.admin_store.set_flow(inbound.user_id, None, {})
+            return AdminBotResponse("اسکریپت مسیر ویرایش شد.", self._main_menu_keyboard())
+
+        if flow == "route_edit_guard":
+            flow_data = dict(session.get("flow_data") or {})
+            route_name = str(flow_data.get("route_name") or "")
+            if not route_name:
+                raise ValueError("اطلاعات ویرایش ناقص است")
+            guards = self.management_api.list_guard_files()
+            if text not in guards:
+                return AdminBotResponse("گارد معتبر انتخاب کن.", self._guards_keyboard())
+            self.management_api.update_route(route_name, {"gaurd_script": text})
+            self.admin_store.set_flow(inbound.user_id, None, {})
+            return AdminBotResponse("گارد مسیر ویرایش شد.", self._main_menu_keyboard())
+
+        if flow == "route_edit_max":
+            flow_data = dict(session.get("flow_data") or {})
+            route_name = str(flow_data.get("route_name") or "")
+            if not route_name:
+                raise ValueError("اطلاعات ویرایش ناقص است")
+            parsed = self._normalize_max_input(text)
+            if parsed == "__invalid__":
+                return AdminBotResponse("عدد معتبر وارد کن یا از دکمه‌ها استفاده کن.", self._max_keyboard())
+            value = None if parsed is None else max(1, int(parsed))
+            self.management_api.update_route(route_name, {"max_message_mb": value})
+            self.admin_store.set_flow(inbound.user_id, None, {})
+            return AdminBotResponse("حداکثر حجم مسیر ویرایش شد.", self._main_menu_keyboard())
+
+        if flow == "route_edit_enabled":
+            flow_data = dict(session.get("flow_data") or {})
+            route_name = str(flow_data.get("route_name") or "")
+            if not route_name:
+                raise ValueError("اطلاعات ویرایش ناقص است")
+            if text == BTN_ENABLED_ON:
+                value = True
+            elif text == BTN_ENABLED_OFF:
+                value = False
+            else:
+                return AdminBotResponse("وضعیت معتبر انتخاب کن.", self._enabled_keyboard())
+            self.management_api.update_route(route_name, {"enabled": value})
+            self.admin_store.set_flow(inbound.user_id, None, {})
+            return AdminBotResponse("وضعیت مسیر ویرایش شد.", self._main_menu_keyboard())
+
+        if flow == "route_edit_dest_value":
+            flow_data = dict(session.get("flow_data") or {})
+            route_name = str(flow_data.get("route_name") or "")
+            field = str(flow_data.get("field") or "")
+            if not route_name or field not in {"destination_channel_id", "destination_channel_username"}:
+                raise ValueError("اطلاعات ویرایش مقصد ناقص است")
+            self.management_api.update_route(route_name, {field: text.strip()})
+            self.admin_store.set_flow(inbound.user_id, None, {})
+            return AdminBotResponse("مقصد مسیر ویرایش شد.", self._main_menu_keyboard())
+
+        if flow == "route_edit_source_value":
+            flow_data = dict(session.get("flow_data") or {})
+            route_name = str(flow_data.get("route_name") or "")
+            field = str(flow_data.get("field") or "")
+            if not route_name or field not in {"source_channel_id", "source_channel_username"}:
+                raise ValueError("اطلاعات ویرایش مبدا ناقص است")
+            self.management_api.update_route(route_name, {field: text.strip()})
+            self.admin_store.set_flow(inbound.user_id, None, {})
+            return AdminBotResponse("مبدا مسیر ویرایش شد.", self._main_menu_keyboard())
+
+        self.admin_store.set_flow(inbound.user_id, None, {})
+        return AdminBotResponse("حالت گفتگو نامعتبر بود. بازگشت به منوی اصلی.", self._main_menu_keyboard())
+
+    def _handle_command(self, inbound: AdminInboundMessage, text: str) -> AdminBotResponse:
+        if text.startswith("/start"):
+            session = self.admin_store.get_session(inbound.user_id)
+            if bool(session.get("logged_in")):
+                return AdminBotResponse("پنل مدیریت آماده است.", self._main_menu_keyboard())
+            return AdminBotResponse("خوش آمدی. برای ورود روی دکمه ورود بزن.", self._login_keyboard())
+
+        if text.startswith("/help"):
+            return AdminBotResponse(self._help_text(), self._main_menu_keyboard() if self.admin_store.is_logged_in(inbound.user_id) else self._login_keyboard())
+
+        if text.startswith("/login"):
+            parts = shlex.split(text)
+            if len(parts) != 3:
+                self.admin_store.set_flow(inbound.user_id, "login_username", {"stage": "username"})
+                return AdminBotResponse("فرمت درست: /login <username> <password>\nیا از حالت مرحله‌ای استفاده کن.", self._login_keyboard())
+            username, password = parts[1], parts[2]
+            if not self.admin_store.verify_credentials(username, password):
+                return AdminBotResponse("نام کاربری یا رمز اشتباه است.", self._login_keyboard())
+            self.admin_store.login(inbound.user_id, username=username)
+            return AdminBotResponse("ورود موفق بود.", self._main_menu_keyboard())
+
+        if text.startswith("/logout"):
+            self.admin_store.logout(inbound.user_id)
+            return AdminBotResponse("خروج انجام شد.", self._login_keyboard())
+
+        if not self.admin_store.is_logged_in(inbound.user_id):
+            return AdminBotResponse("برای مدیریت ابتدا وارد شو. /login یا دکمه ورود", self._login_keyboard())
+
+        # Legacy command compatibility for power users.
+        if text.startswith("/routes"):
+            return AdminBotResponse(self._routes_text(), self._main_menu_keyboard())
+        if text.startswith("/scripts"):
+            return AdminBotResponse(self._list_lines("اسکریپت‌ها", self.management_api.list_script_files()), self._main_menu_keyboard())
+        if text.startswith("/guards"):
+            return AdminBotResponse(self._list_lines("گاردها", self.management_api.list_guard_files()), self._main_menu_keyboard())
+        if text.startswith("/admins"):
+            return AdminBotResponse(self._list_lines("ادمین‌ها", self.admin_store.list_admins()), self._main_menu_keyboard())
+        if text.startswith("/admin_add"):
+            parts = shlex.split(text)
+            if len(parts) != 3:
+                return AdminBotResponse("فرمت درست:\n/admin_add <username> <password>", self._main_menu_keyboard())
+            self.admin_store.add_admin(parts[1], parts[2])
+            return AdminBotResponse("ادمین اضافه شد.", self._main_menu_keyboard())
+        if text.startswith("/admin_delete"):
+            parts = shlex.split(text)
+            if len(parts) != 2:
+                return AdminBotResponse("فرمت درست:\n/admin_delete <username>", self._main_menu_keyboard())
+            self.admin_store.remove_admin(parts[1])
+            return AdminBotResponse("ادمین حذف شد.", self._main_menu_keyboard())
+        if text.startswith("/route_add"):
+            payload = self._json_tail(text, "/route_add")
+            route = self.management_api.add_route(payload)
+            return AdminBotResponse(f"مسیر اضافه شد: {route.get('name')}", self._main_menu_keyboard())
+        if text.startswith("/route_update"):
+            parts = text.split(maxsplit=2)
+            if len(parts) < 3:
+                return AdminBotResponse("فرمت درست:\n/route_update <route_name> <json_patch>", self._main_menu_keyboard())
+            name = parts[1].strip()
+            patch = self._parse_json(parts[2].strip())
+            route = self.management_api.update_route(name, patch)
+            return AdminBotResponse(f"مسیر به‌روزرسانی شد: {route.get('name')}", self._main_menu_keyboard())
+        if text.startswith("/route_delete"):
+            parts = text.split(maxsplit=1)
+            if len(parts) != 2:
+                return AdminBotResponse("فرمت درست:\n/route_delete <route_name>", self._main_menu_keyboard())
+            self.management_api.delete_route(parts[1].strip())
+            return AdminBotResponse("مسیر حذف شد.", self._main_menu_keyboard())
+        if text.startswith("/route_enable"):
+            parts = text.split(maxsplit=2)
+            if len(parts) != 3:
+                return AdminBotResponse("فرمت درست:\n/route_enable <route_name> <true|false>", self._main_menu_keyboard())
+            enabled = parts[2].strip().lower() in {"1", "true", "yes", "on"}
+            route = self.management_api.set_route_enabled(parts[1].strip(), enabled)
+            return AdminBotResponse(f"وضعیت مسیر {route.get('name')} -> {enabled}", self._main_menu_keyboard())
+        if text.startswith("/reload_routes"):
+            self.management_api.reload_routes()
+            return AdminBotResponse("ریلود شد.", self._main_menu_keyboard())
+
+        return AdminBotResponse("دستور نامعتبر است. /help", self._main_menu_keyboard())
+
+    def _routes_text(self) -> str:
+        routes = self.management_api.list_routes()
+        if not routes:
+            return "هیچ مسیری ثبت نشده."
+        lines = ["لیست مسیرها:"]
+        for idx, r in enumerate(routes, start=1):
+            lines.append(
+                f"{idx}. {r.get('name','-')} | enabled={bool(r.get('enabled', True))} | "
+                f"src={r.get('source_channel_username') or r.get('source_channel_id')} | "
+                f"dst={r.get('destination_channel_username') or r.get('destination_channel_id')} | "
+                f"script={r.get('script') or '-'} | guard={r.get('gaurd_script') or 'default_guard.py'} | "
+                f"max_mb={r.get('max_message_mb') if r.get('max_message_mb') is not None else '-'}"
+            )
+        return "\n".join(lines)
+
+    @staticmethod
+    def _help_text() -> str:
+        return (
+            "راهنما:\n"
+            "1) روی «🔐 ورود» بزن و لاگین کن.\n"
+            "2) از منوی دکمه‌ای مسیرها/ادمین‌ها را مدیریت کن.\n"
+            "3) /logout برای خروج.\n\n"
+            "دستورات پیشرفته:\n"
+            "/routes /scripts /guards /admins\n"
+            "/route_add <json>\n"
+            "/route_update <name> <json_patch>\n"
+            "/route_delete <name>\n"
+            "/route_enable <name> <true|false>\n"
+            "/reload_routes"
+        )
+
+    @staticmethod
+    def _list_lines(title: str, items: list[str]) -> str:
+        if not items:
+            return f"{title}: خالی"
+        lines = [f"{title}:"]
+        for idx, item in enumerate(items, start=1):
+            lines.append(f"{idx}. {item}")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _coerce_field_value(field: str, value: str):
+        val = value.strip()
+        if field == "enabled":
+            return val.lower() in {"1", "true", "yes", "on", "فعال", "✅"}
+        if field == "max_message_mb":
+            if val in {"", "none", "null", "نامحدود", "-"}:
+                return None
+            return max(1, int(val))
+        return val
+
+    @staticmethod
+    def _normalize_max_input(value: str):
+        val = value.strip()
+        if val == BTN_MAX_NONE or val in {"", "none", "null", "نامحدود", "-"}:
+            return None
+        digit_map = str.maketrans("۰۱۲۳۴۵۶۷۸۹", "0123456789")
+        normalized = val.translate(digit_map)
+        try:
+            return int(normalized)
+        except Exception:
+            return "__invalid__"
+
+    @staticmethod
+    def _json_tail(text: str, cmd: str) -> dict:
+        tail = text[len(cmd) :].strip()
+        if not tail:
+            raise ValueError("JSON payload is required")
+        return AdminBotHandler._parse_json(tail)
+
+    @staticmethod
+    def _parse_json(value: str) -> dict:
+        parsed = json.loads(value)
+        if not isinstance(parsed, dict):
+            raise ValueError("JSON باید آبجکت باشد")
+        return parsed
+
+    @staticmethod
+    def _reply_keyboard(rows: list[list[str]]) -> dict:
+        return {
+            "keyboard": [[{"text": item} for item in row] for row in rows],
+            "resize_keyboard": True,
+            "one_time_keyboard": False,
+        }
+
+    def _login_keyboard(self) -> dict:
+        return self._reply_keyboard([[BTN_LOGIN]])
+
+    def _main_menu_keyboard(self) -> dict:
+        return self._reply_keyboard(
+            [
+                [BTN_LIST_ROUTES, BTN_ADD_ROUTE],
+                [BTN_EDIT_ROUTE, BTN_DEL_ROUTE],
+                [BTN_SCRIPTS, BTN_GUARDS],
+                [BTN_ADMINS, BTN_RELOAD],
+                [BTN_LOGOUT],
+            ]
+        )
+
+    def _admins_menu_keyboard(self) -> dict:
+        return self._reply_keyboard(
+            [
+                [BTN_ADMIN_LIST, BTN_ADMIN_ADD],
+                [BTN_ADMIN_DELETE, BTN_BACK],
+            ]
+        )
+
+    def _source_type_keyboard(self) -> dict:
+        return self._reply_keyboard([[BTN_SRC_ID, BTN_SRC_USER], [BTN_CANCEL]])
+
+    def _dest_type_keyboard(self) -> dict:
+        return self._reply_keyboard([[BTN_DST_ID, BTN_DST_USER], [BTN_CANCEL]])
+
+    def _scripts_keyboard(self) -> dict:
+        items = self.management_api.list_script_files()
+        rows = [[name] for name in items]
+        rows.append([BTN_CANCEL])
+        return self._reply_keyboard(rows)
+
+    def _guards_keyboard(self) -> dict:
+        items = self.management_api.list_guard_files()
+        rows = [[name] for name in items]
+        rows.append([BTN_CANCEL])
+        return self._reply_keyboard(rows)
+
+    def _max_keyboard(self) -> dict:
+        return self._reply_keyboard([[BTN_MAX_DEFAULT, BTN_MAX_100, BTN_MAX_200], [BTN_MAX_NONE], [BTN_CANCEL]])
+
+    def _enabled_keyboard(self) -> dict:
+        return self._reply_keyboard([[BTN_ENABLED_ON, BTN_ENABLED_OFF], [BTN_CANCEL]])
+
+    def _route_names_keyboard(self, *, include_back: bool) -> dict:
+        names = [str(item.get("name") or "").strip() for item in self.management_api.list_routes()]
+        names = [n for n in names if n]
+        rows = [[name] for name in names]
+        controls = [BTN_CANCEL]
+        if include_back:
+            controls = [BTN_BACK, BTN_CANCEL]
+        rows.append(controls)
+        return self._reply_keyboard(rows)
+
+    def _route_edit_fields_keyboard(self) -> dict:
+        return self._reply_keyboard(
+            [
+                [BTN_EDIT_SCRIPT, BTN_EDIT_GUARD],
+                [BTN_EDIT_MAX, BTN_EDIT_ENABLED],
+                [BTN_EDIT_SRC_ID],
+                [BTN_EDIT_SRC_USER],
+                [BTN_EDIT_DEST_ID],
+                [BTN_EDIT_DEST_USER],
+                [BTN_BACK, BTN_CANCEL],
+            ]
+        )
+
+    def _cancel_keyboard(self) -> dict:
+        return self._reply_keyboard([[BTN_CANCEL]])

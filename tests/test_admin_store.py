@@ -34,3 +34,29 @@ def test_admin_store_prevents_removing_last_admin(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError):
         store.remove_admin("admin")
+
+
+def test_admin_store_repairs_empty_sessions_json(tmp_path: Path) -> None:
+    users = tmp_path / "config" / "admins.json"
+    sessions = tmp_path / "data" / "sessions.json"
+    users.parent.mkdir(parents=True, exist_ok=True)
+    sessions.parent.mkdir(parents=True, exist_ok=True)
+    users.write_text('[{"username":"admin","password":"change_me"}]', encoding="utf-8")
+    sessions.write_text("", encoding="utf-8")
+
+    store = AdminStore(str(users), str(sessions))
+    assert store.get_session("777") == {"logged_in": False, "flow": None, "flow_data": {}}
+    assert sessions.read_text(encoding="utf-8").strip() == "{}"
+
+
+def test_admin_store_repairs_invalid_sessions_json(tmp_path: Path) -> None:
+    users = tmp_path / "config" / "admins.json"
+    sessions = tmp_path / "data" / "sessions.json"
+    users.parent.mkdir(parents=True, exist_ok=True)
+    sessions.parent.mkdir(parents=True, exist_ok=True)
+    users.write_text('[{"username":"admin","password":"change_me"}]', encoding="utf-8")
+    sessions.write_text("{", encoding="utf-8")
+
+    store = AdminStore(str(users), str(sessions))
+    store.login("100", "admin")
+    assert store.is_logged_in("100") is True

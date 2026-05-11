@@ -72,6 +72,8 @@ class GuardRunner:
         if token in {"true", "1", "yes", "allow", "allowed"}:
             return True
         if token in {"false", "0", "no", "deny", "denied"}:
+            if not self.last_reason:
+                self.last_reason = _extract_reason_from_stderr(stderr) or "guard_denied"
             return False
 
         # Guard scripts may emit extra text after decision token.
@@ -79,8 +81,17 @@ class GuardRunner:
         if compact in {"true", "1", "yes", "allow", "allowed"}:
             return True
         if compact in {"false", "0", "no", "deny", "denied"}:
+            if not self.last_reason:
+                self.last_reason = _extract_reason_from_stderr(stderr) or "guard_denied"
             return False
 
         raise GuardExecutionError(
             f"Guard script output must be true/false (or 1/0), got: {stdout!r} in {script_path.name}"
         )
+
+
+def _extract_reason_from_stderr(stderr: str) -> str | None:
+    line = stderr.strip().splitlines()[-1].strip() if stderr.strip() else ""
+    if not line:
+        return None
+    return line[:300]

@@ -130,7 +130,7 @@ def _extract_text_from_response(data: dict) -> str:
     return ""
 
 
-def _call_guard_api(endpoint: str, body: dict, timeout_sec: float, *, fail_open: bool) -> bool:
+def _call_guard_api(endpoint: str, body: dict, timeout_sec: float, *, fail_open: bool) -> tuple[bool, str]:
     # Do not use process proxy env vars for container-local guard endpoint calls.
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     req = urllib.request.Request(
@@ -143,21 +143,31 @@ def _call_guard_api(endpoint: str, body: dict, timeout_sec: float, *, fail_open:
         with opener.open(req, timeout=timeout_sec) as resp:
             raw = resp.read().decode("utf-8", errors="replace")
     except urllib.error.URLError:
-        return True if fail_open else False
+        return (True, "ai_api_unreachable_fail_open") if fail_open else (False, "ai_api_unreachable")
+    except Exception as exc:
+        name = exc.__class__.__name__
+        return (True, f"ai_api_exception_fail_open:{name}") if fail_open else (False, f"ai_api_exception:{name}")
 
     try:
         data = json.loads(raw)
     except json.JSONDecodeError:
-        return True if fail_open else False
+        return (True, "ai_api_invalid_json_fail_open") if fail_open else (False, "ai_api_invalid_json")
     if not isinstance(data, dict):
-        return True if fail_open else False
+        return (True, "ai_api_invalid_payload_fail_open") if fail_open else (False, "ai_api_invalid_payload")
 
     model_text = _extract_text_from_response(data).strip().lower()
     if model_text.startswith("1"):
-        return True
+        return True, "ai_guard_allow"
     if model_text.startswith("0"):
-        return False
-    return True if fail_open else False
+        token = model_text.splitlines()[0].strip()
+        reason = "ai_guard_block"
+        if ":" in token:
+            _, right = token.split(":", 1)
+            right = right.strip()
+            if right:
+                reason = right
+        return False, reason
+    return (True, "ai_guard_unknown_fail_open") if fail_open else (False, "ai_guard_unknown")
 
 
 def _is_obvious_advertisement(payload: dict) -> bool:
@@ -206,13 +216,15 @@ def _is_obvious_advertisement(payload: dict) -> bool:
         "از لینک",
         "لینک خرید",
         "تخفیف",
+        "follow",
+        "join",
     )
     cta_hits = sum(1 for token in cta_signals if token in combined)
 
     has_link = bool(re.search(r"(https?://|t\.me/|telegram\.me/|instagram\.com/|bit\.ly/)", combined))
     has_price = bool(re.search(r"(\$|€|£|تومان|ریال|\d+\s*%|\d+\s*(k|m|b)?)", combined))
 
-    # Keep this strict for obvious ads while reducing random false positives.
+    # Block explicit commercial ads.
     if has_link and cta_hits >= 1:
         return True
     if cta_hits >= 2 and has_price:
@@ -220,23 +232,44 @@ def _is_obvious_advertisement(payload: dict) -> bool:
     if cta_hits >= 3:
         return True
 
+    # Channel-promo bundles: only block when multiple promo rows exist.
+    list_lines = [ln.strip().lower() for ln in combined.splitlines() if ln.strip()]
+    promo_line_hits = 0
+    for ln in list_lines:
+        has_desc = " - " in ln
+        has_ref = ("@" in ln) or ("t.me/" in ln) or ("channel" in ln) or ("telegram" in ln)
+        if has_desc and has_ref:
+            promo_line_hits += 1
+    has_bundle_header = (
+        ("channels for" in combined and "follow" in combined)
+        or ("follow these" in combined)
+        or ("کانال" in combined and "دنبال" in combined)
+    )
+    if promo_line_hits >= 4:
+        return True
+    if has_bundle_header and promo_line_hits >= 2:
+        return True
+
     return False
 
 
 def _is_obvious_vpn_config(payload: dict) -> bool:
+    return _vpn_match_reason(payload) is not None
+
+
+def _vpn_match_reason(payload: dict) -> str | None:
     message = payload.get("message") or {}
     text = str(message.get("text") or "")
     caption = str(message.get("caption") or "")
     combined = f"{text}\n{caption}".lower()
     if not combined.strip():
-        return False
+        return None
 
-    keywords = (
+    strong_keywords = (
         "v2ray",
         "xray",
         "sing-box",
         "singbox",
-        "clash",
         "shadowrocket",
         "shadowsocks",
         "outline vpn",
@@ -262,8 +295,25 @@ def _is_obvious_vpn_config(payload: dict) -> bool:
         "اشتراک v2ray",
         "سابسکریپشن",
     )
-    if any(token in combined for token in keywords):
-        return True
+    for token in strong_keywords:
+        if token in combined:
+            return f"keyword={token}"
+
+    # Ambiguous tokens (e.g. clash) need extra VPN context.
+    weak_keywords = ("clash", "trojan")
+    weak_context = (
+        "vpn",
+        "v2ray",
+        "proxy",
+        "پروکسی",
+        "config",
+        "کانفیگ",
+        "subscription",
+        "سابسکریپشن",
+    )
+    for token in weak_keywords:
+        if token in combined and any(ctx in combined for ctx in weak_context):
+            return f"weak_keyword={token}+context"
 
     uri_like = (
         "vmess://",
@@ -276,15 +326,16 @@ def _is_obvious_vpn_config(payload: dict) -> bool:
         "tuic://",
         "wg://",
     )
-    if any(token in combined for token in uri_like):
-        return True
+    for token in uri_like:
+        if token in combined:
+            return f"uri={token}"
 
     # Common format of VPN sub links/config endpoints.
     if re.search(r"(sub|subscription|config|cfg)[-_:/]", combined):
         if "http://" in combined or "https://" in combined:
-            return True
+            return "subscription_or_config_link"
 
-    return False
+    return None
 
 
 def main() -> None:
@@ -300,27 +351,37 @@ def main() -> None:
     timeout_sec = float(os.getenv("GUARD_AI_TIMEOUT_SEC", "30").strip() or "30")
     enabled = os.getenv("GUARD_AI_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
     fail_open = os.getenv("GUARD_AI_FAIL_OPEN", "true").strip().lower() in {"1", "true", "yes", "on"}
+    block_ads = os.getenv("GUARD_BLOCK_ADS", "true").strip().lower() in {"1", "true", "yes", "on"}
 
     if not enabled:
         print("true")
         return
 
     payload = _load_payload(Path(args.payload))
-    if _is_obvious_advertisement(payload):
+    if block_ads and _is_obvious_advertisement(payload):
         print("false: obvious_advertisement")
         return
-    if _is_obvious_vpn_config(payload):
-        print("false: obvious_vpn_config")
+    vpn_reason = _vpn_match_reason(payload)
+    if vpn_reason:
+        print(f"false: obvious_vpn_config:{vpn_reason}")
         return
 
     body = _build_request(payload, Path(args.input_dir), model=model)
-    allow = _call_guard_api(endpoint=endpoint, body=body, timeout_sec=timeout_sec, fail_open=fail_open)
-    print("true" if allow else "false: ai_guard_block")
+    allow, reason = _call_guard_api(endpoint=endpoint, body=body, timeout_sec=timeout_sec, fail_open=fail_open)
+    if allow:
+        print("true")
+        return
+    print(f"false: {reason}")
 
 
 if __name__ == "__main__":
     try:
         main()
-    except Exception:
-        print("false")
+    except Exception as exc:
+        etype = exc.__class__.__name__
+        emsg = str(exc).strip().replace("\n", " ")[:240]
+        if emsg:
+            print(f"false: guard_exception:{etype}:{emsg}")
+        else:
+            print(f"false: guard_exception:{etype}")
         sys.exit(0)

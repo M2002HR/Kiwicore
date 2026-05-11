@@ -35,6 +35,8 @@ class IncomingMedia:
     file_name: str | None = None
     mime_type: str | None = None
     duration: int | None = None
+    source: str | None = None
+    source_ref: dict | None = None
 
 
 @dataclass(slots=True)
@@ -62,6 +64,15 @@ class ChannelRoute:
     script: str
     max_message_mb: int | None
     gaurd_script: str = "default_guard.py"
+    sync_enabled: bool = False
+    sync_status: str = "active"
+    sync_backfill_count: int = 100
+    sync_interval_sec: int = 300
+    sync_batch_size: int = 1
+    sync_retry_attempts: int = 2
+    sync_pending_count: int = 0
+    sync_processed_count: int = 0
+    sync_seeded: bool = False
 
     def destination_target(self) -> str:
         if self.destination_channel_username:
@@ -69,6 +80,12 @@ class ChannelRoute:
         if self.destination_channel_id:
             return self.destination_channel_id
         raise ValueError("Route has no destination target")
+
+    def is_syncing(self) -> bool:
+        if not bool(self.sync_enabled):
+            return False
+        status = str(self.sync_status).strip().lower()
+        return status == "syncing" or not bool(self.sync_seeded)
 
 
 @dataclass(slots=True)

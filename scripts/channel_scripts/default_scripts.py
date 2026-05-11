@@ -28,6 +28,10 @@ REFERENCE_WORD_RE = re.compile(
     r"(شبکه|کانال|پیج|صفحه|source|منبع|channel|account|اکانت|follow|join|subscribe|sponsor|اسپانسر|via|from)",
     re.IGNORECASE,
 )
+AI_META_LINE_RE = re.compile(
+    r"^(goal:|constraint:|edge case:|edge-case:|input:|output:|core content:|removed:|does it|is there|are hashtags|`|[-*]\s|→|=>)",
+    re.IGNORECASE,
+)
 
 # Emojis/symbols that should be removed from outgoing content.
 EMOJI_BLOCKLIST = (
@@ -158,11 +162,12 @@ def _sanitize_text(value: str | None, *, payload: dict) -> str | None:
 
     text = _strip_reference_tokens(text)
     text = _remove_reference_lines(text)
+    text, removed_source_footer = _remove_source_footer_signature(text, payload=payload)
     text = _normalize_multiline(text)
 
     # If channel reference/footer existed, replace with destination target.
     destination = _destination_signature(payload)
-    if had_reference and destination:
+    if (had_reference or removed_source_footer) and destination:
         if text:
             text = f"{text}\n{destination}"
         else:
@@ -184,12 +189,11 @@ def _destination_signature(payload: dict) -> str | None:
 
 
 def _has_reference(text: str) -> bool:
-    return bool(URL_RE.search(text) or MENTION_RE.search(text) or HASHTAG_RE.search(text) or LINK_WORD_RE.search(text))
+    return bool(URL_RE.search(text) or HASHTAG_RE.search(text) or LINK_WORD_RE.search(text))
 
 
 def _strip_reference_tokens(text: str) -> str:
     text = URL_RE.sub(" ", text)
-    text = MENTION_RE.sub(" ", text)
     text = HASHTAG_RE.sub(" ", text)
     text = LINK_WORD_RE.sub(" ", text)
     return text
@@ -206,6 +210,47 @@ def _remove_reference_lines(text: str) -> str:
             continue
         kept.append(line)
     return "\n".join(kept)
+
+
+def _remove_source_footer_signature(text: str, *, payload: dict) -> tuple[str, bool]:
+    lines = _normalize_multiline(text).splitlines()
+    if not lines:
+        return text, False
+
+    markers = _source_footer_markers(payload)
+    if not markers:
+        return text, False
+
+    removed = False
+    while lines:
+        tail = lines[-1].strip().lower()
+        if tail in markers or tail in {"|", "｜"}:
+            lines.pop()
+            removed = True
+            continue
+        break
+
+    return "\n".join(lines), removed
+
+
+def _source_footer_markers(payload: dict) -> set[str]:
+    markers: set[str] = set()
+    route = payload.get("route") or {}
+    message = payload.get("message") or {}
+    if not isinstance(route, dict):
+        route = {}
+    if not isinstance(message, dict):
+        message = {}
+
+    for key in ("source_channel_username", "source_channel_id"):
+        v = route.get(key)
+        if isinstance(v, str) and v.strip():
+            markers.add(v.strip().lower())
+        v2 = message.get(key)
+        if isinstance(v2, str) and v2.strip():
+            markers.add(v2.strip().lower())
+
+    return markers
 
 
 def _normalize_multiline(text: str) -> str:
@@ -230,7 +275,8 @@ def _ai_cleanup_reference_text(text: str, *, payload: dict) -> str:
     prompt = (
         "You are cleaning Persian/English channel posts.\n"
         "Remove any segment that references external channels/accounts/platforms or links.\n"
-        "Delete BOTH the URL and its related mention text (for example: 'شبکه X', 'کانال ...', '@user', hashtags, 'منبع').\n"
+        "Delete BOTH the URL and its related reference phrase (for example: 'شبکه X', 'کانال ...', hashtags, 'منبع').\n"
+        "Keep plain @handles if they are part of core informational lines.\n"
         "Keep only the core informational content.\n"
         "Do not add explanations.\n"
         "If nothing meaningful remains, return exactly: EMPTY\n"
@@ -248,6 +294,7 @@ def _ai_cleanup_reference_text(text: str, *, payload: dict) -> str:
     if cleaned is None:
         return text if fail_open else ""
     cleaned = _normalize_gemini_text(cleaned)
+    cleaned = _sanitize_ai_output(cleaned, original=text)
     if cleaned.upper() == "EMPTY":
         return ""
     return cleaned or ""
@@ -304,6 +351,38 @@ def _normalize_gemini_text(text: str) -> str:
         out = re.sub(r"^```[a-zA-Z]*\n?", "", out)
         out = re.sub(r"\n?```$", "", out)
     return out.strip()
+
+
+def _sanitize_ai_output(text: str, *, original: str) -> str:
+    lines: list[str] = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if AI_META_LINE_RE.search(line):
+            continue
+        lines.append(line)
+
+    cleaned = "\n".join(lines).strip()
+    if not cleaned:
+        return ""
+    if _looks_unrelated_to_original(cleaned, original):
+        return ""
+    return cleaned
+
+
+def _looks_unrelated_to_original(cleaned: str, original: str) -> bool:
+    cleaned_tokens = _tokenize_for_overlap(cleaned)
+    original_tokens = _tokenize_for_overlap(original)
+    if not cleaned_tokens or not original_tokens:
+        return False
+    overlap = len(cleaned_tokens & original_tokens) / max(1, len(cleaned_tokens))
+    return overlap < 0.35
+
+
+def _tokenize_for_overlap(text: str) -> set[str]:
+    parts = re.findall(r"[A-Za-z0-9_آ-ی]+", text.lower())
+    return {part for part in parts if len(part) >= 2}
 
 
 def main() -> None:

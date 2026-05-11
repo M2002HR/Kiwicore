@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
-from kiwi.config import RouteRegistry, Settings
+from kiwi.config import RouteRegistry, Settings, load_routes
 from kiwi.dispatcher import BaleDispatcher
 from kiwi.errors import GuardExecutionError, MessageTooLargeError, PlatformApiError, ScriptExecutionError
 from kiwi.guard_runner import GuardRunner
@@ -26,6 +28,7 @@ class KiwiService:
         routes: RouteRegistry,
         telegram_client,
         bale_client,
+        source_client=None,
         storage: StorageManager,
         guard_runner: GuardRunner,
         script_runner: ScriptRunner,
@@ -36,6 +39,7 @@ class KiwiService:
         self.routes = routes
         self.telegram_client = telegram_client
         self.bale_client = bale_client
+        self.source_client = source_client
         self.storage = storage
         self.guard_runner = guard_runner
         self.script_runner = script_runner
@@ -46,6 +50,10 @@ class KiwiService:
         self._offset: int | None = self.state_store.load_offset()
         self._stop_event = asyncio.Event()
         self._pending_media_groups: dict[tuple[str, str, str], dict[str, object]] = {}
+        self._sync_queue: dict[str, list[IncomingChannelMessage]] = defaultdict(list)
+        self._sync_queue_ids: dict[str, set[tuple[int, int]]] = defaultdict(set)
+        self._sync_last_tick_at: dict[str, float] = {}
+        self._sync_meta_lock = asyncio.Lock()
 
     async def stop(self) -> None:
         self._stop_event.set()
@@ -53,6 +61,8 @@ class KiwiService:
     async def aclose(self) -> None:
         await self.telegram_client.aclose()
         await self.bale_client.aclose()
+        if self.source_client is not None:
+            await self.source_client.aclose()
 
     async def run(self) -> None:
         logger.info("Kiwi service started")
@@ -103,12 +113,30 @@ class KiwiService:
             timeout=self.settings.telegram_poll_timeout_sec,
             allowed_updates=self.settings.telegram_allowed_updates,
         )
+        telethon_messages: list[IncomingChannelMessage] = []
+        if self.source_client is not None:
+            try:
+                telethon_messages = await self.source_client.poll_messages(self.routes.routes)
+            except Exception:
+                logger.exception("Telethon polling failed")
+                if self.settings.telegram_source_mode == "telethon":
+                    raise
         if not updates:
             ready = self._flush_ready_media_groups(force=False)
+            for incoming in telethon_messages:
+                routes = self.routes.match_all(incoming.source_channel_id, incoming.source_channel_username)
+                for route in routes:
+                    ready.append((incoming, route))
+            ready.sort(key=lambda item: item[0].update_id)
             processed = 0
             for incoming, route in ready:
+                if route.is_syncing():
+                    await self._enqueue_sync_message(route, incoming)
+                    continue
                 await self._process_route_message(incoming, route)
                 processed += 1
+            await self._finalize_sync_seeding()
+            processed += await self._run_sync_tick()
             return processed
 
         matched_messages: list[tuple[IncomingChannelMessage, ChannelRoute]] = []
@@ -134,15 +162,284 @@ class KiwiService:
                 matched_messages.append((incoming, route))
 
         ready_messages = self._collect_ready_messages(matched_messages)
+        for incoming in telethon_messages:
+            routes = self.routes.match_all(incoming.source_channel_id, incoming.source_channel_username)
+            for route in routes:
+                ready_messages.append((incoming, route))
         ready_messages.extend(self._flush_ready_media_groups(force=False))
+
+        deduped: list[tuple[IncomingChannelMessage, ChannelRoute]] = []
+        seen_keys: set[tuple[str, str, int, str | None]] = set()
+        for incoming, route in ready_messages:
+            key = (route.name, incoming.source_channel_id, incoming.message_id, incoming.media_group_id)
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            deduped.append((incoming, route))
+        ready_messages = deduped
         ready_messages.sort(key=lambda item: item[0].update_id)
 
         processed = 0
         for incoming, route in ready_messages:
+            if route.is_syncing():
+                await self._enqueue_sync_message(route, incoming)
+                continue
             await self._process_route_message(incoming, route)
             processed += 1
 
+        await self._finalize_sync_seeding()
+        processed += await self._run_sync_tick()
         return processed
+
+    async def _enqueue_sync_message(self, route: ChannelRoute, incoming: IncomingChannelMessage) -> None:
+        queue = self._sync_queue[route.name]
+        dedupe = self._sync_queue_ids[route.name]
+        message_key = (incoming.update_id, incoming.message_id)
+        if message_key in dedupe:
+            return
+
+        queue.append(incoming)
+        dedupe.add(message_key)
+        await self._sync_patch_route(
+            route.name,
+            {
+                "sync.pending_count": len(queue),
+                "sync.status": "syncing",
+                "sync.enabled": True,
+            },
+            reload_routes=False,
+        )
+
+    async def _finalize_sync_seeding(self) -> None:
+        for route in self.routes.routes:
+            if not route.is_syncing() or route.sync_seeded:
+                continue
+
+            seeded_from_source = await self._seed_sync_from_source(route)
+            if not seeded_from_source:
+                await self._seed_sync_from_storage(route)
+            queue = self._sync_queue.get(route.name) or []
+            limit = max(0, int(route.sync_backfill_count))
+            if limit > 0 and len(queue) > limit:
+                drop_count = len(queue) - limit
+                for _ in range(drop_count):
+                    dropped = queue.pop(0)
+                    self._sync_queue_ids[route.name].discard((dropped.update_id, dropped.message_id))
+
+            await self._sync_patch_route(
+                route.name,
+                {
+                    "sync.seeded": True,
+                    "sync.pending_count": len(queue),
+                    "sync.status": "syncing",
+                    "sync.enabled": True,
+                },
+                reload_routes=False,
+            )
+
+    async def _seed_sync_from_source(self, route: ChannelRoute) -> bool:
+        if self.source_client is None:
+            return False
+        seed_func = getattr(self.source_client, "seed_recent_messages", None)
+        if not callable(seed_func):
+            return False
+
+        limit = max(0, int(route.sync_backfill_count))
+        try:
+            selected = await seed_func(route, limit)
+        except Exception:
+            logger.exception(
+                "Sync seed from source failed; falling back to storage",
+                extra={"details": {"route": route.name, "source": "telethon"}},
+            )
+            return False
+
+        if not isinstance(selected, list):
+            return False
+
+        for incoming in selected:
+            if not isinstance(incoming, IncomingChannelMessage):
+                continue
+            queue = self._sync_queue[route.name]
+            dedupe = self._sync_queue_ids[route.name]
+            key = (incoming.update_id, incoming.message_id)
+            if key in dedupe:
+                continue
+            queue.append(incoming)
+            dedupe.add(key)
+        return True
+
+    async def _seed_sync_from_storage(self, route: ChannelRoute) -> None:
+        limit = max(0, int(route.sync_backfill_count))
+        if limit <= 0:
+            return
+
+        messages_root = Path(self.settings.storage_dir) / "messages"
+        if not messages_root.exists():
+            return
+
+        source_candidates: list[IncomingChannelMessage] = []
+        for raw_path in messages_root.glob("*/**/raw_update.json"):
+            try:
+                raw = json.loads(raw_path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+
+            incoming = parse_telegram_channel_update(raw)
+            if incoming is None:
+                continue
+            if route.source_channel_id and incoming.source_channel_id != route.source_channel_id:
+                continue
+            if route.source_channel_username and incoming.source_channel_username != route.source_channel_username:
+                continue
+
+            source_candidates.append(incoming)
+
+        if not source_candidates:
+            return
+
+        source_candidates.sort(key=lambda item: (item.update_id, item.message_id))
+        selected = source_candidates[-limit:]
+        for incoming in selected:
+            queue = self._sync_queue[route.name]
+            dedupe = self._sync_queue_ids[route.name]
+            key = (incoming.update_id, incoming.message_id)
+            if key in dedupe:
+                continue
+            queue.append(incoming)
+            dedupe.add(key)
+
+    async def _run_sync_tick(self) -> int:
+        now = asyncio.get_running_loop().time()
+        processed = 0
+
+        for route in self.routes.routes:
+            if not route.is_syncing():
+                continue
+
+            queue = self._sync_queue.get(route.name) or []
+            if not queue:
+                # Keep config in sync with in-memory queue and auto-finish.
+                if route.sync_pending_count > 0:
+                    await self._sync_patch_route(route.name, {"sync.pending_count": 0}, reload_routes=False)
+                await self._maybe_finish_sync(route.name)
+                continue
+
+            last_tick = float(self._sync_last_tick_at.get(route.name) or 0.0)
+            if now - last_tick < float(route.sync_interval_sec):
+                continue
+
+            self._sync_last_tick_at[route.name] = now
+            take = min(max(1, int(route.sync_batch_size)), len(queue))
+
+            for _ in range(take):
+                item = queue.pop(0)
+                self._sync_queue_ids[route.name].discard((item.update_id, item.message_id))
+                status = await self._process_route_message_with_retries(item, route, retries=route.sync_retry_attempts)
+                processed += 1
+
+                patch: dict[str, object] = {"sync.pending_count": len(queue)}
+                if status in {"ok", "blocked", "skipped"}:
+                    patch["sync.processed_count"] = route.sync_processed_count + 1
+                await self._sync_patch_route(route.name, patch, reload_routes=False)
+
+            await self._maybe_finish_sync(route.name)
+
+        return processed
+
+    async def _maybe_finish_sync(self, route_name: str) -> None:
+        route = self._find_route(route_name)
+        if route is None or not route.is_syncing():
+            return
+        queue = self._sync_queue.get(route_name) or []
+        if queue:
+            return
+        if route.sync_pending_count > 0:
+            return
+        await self._sync_patch_route(
+            route_name,
+            {
+                "enabled": True,
+                "sync.status": "active",
+            },
+            reload_routes=True,
+        )
+
+    def _find_route(self, route_name: str) -> ChannelRoute | None:
+        for route in self.routes.routes:
+            if route.name == route_name:
+                return route
+        return None
+
+    async def _sync_patch_route(self, route_name: str, patch: dict[str, object], *, reload_routes: bool) -> None:
+        async with self._sync_meta_lock:
+            path = Path(self.settings.channels_config_path)
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(raw, list):
+                raise ValueError("channels config must be list")
+
+            updated = False
+            for item in raw:
+                if not isinstance(item, dict):
+                    continue
+                if str(item.get("name") or "").strip() != route_name:
+                    continue
+
+                for key, value in patch.items():
+                    if key.startswith("sync."):
+                        _, sub = key.split(".", 1)
+                        sync_obj = item.get("sync")
+                        if not isinstance(sync_obj, dict):
+                            sync_obj = {}
+                        sync_obj[sub] = value
+                        item["sync"] = sync_obj
+                    else:
+                        item[key] = value
+                updated = True
+                break
+
+            if not updated:
+                return
+
+            path.write_text(json.dumps(raw, ensure_ascii=False, indent=2), encoding="utf-8")
+
+            if reload_routes:
+                self.routes = load_routes(str(path))
+            else:
+                # Update in-memory route meta without full reload to avoid churn.
+                route = self._find_route(route_name)
+                if route is not None:
+                    for key, value in patch.items():
+                        if key == "enabled":
+                            route.enabled = bool(value)
+                        elif key == "sync.status":
+                            route.sync_status = str(value).strip().lower()
+                        elif key == "sync.enabled":
+                            route.sync_enabled = bool(value)
+                        elif key == "sync.pending_count":
+                            route.sync_pending_count = max(0, int(value))
+                        elif key == "sync.processed_count":
+                            route.sync_processed_count = max(0, int(value))
+                        elif key == "sync.seeded":
+                            route.sync_seeded = bool(value)
+
+    async def _process_route_message_with_retries(
+        self,
+        incoming: IncomingChannelMessage,
+        route: ChannelRoute,
+        *,
+        retries: int,
+    ) -> str:
+        attempts = max(0, int(retries)) + 1
+        last_status = "failed"
+        for idx in range(attempts):
+            status = await self._process_route_message(incoming, route)
+            last_status = status
+            if status in {"ok", "blocked", "skipped"}:
+                return status
+            if idx < attempts - 1:
+                await asyncio.sleep(0.8 * (idx + 1))
+        return last_status
 
     async def _process_admin_message(self, incoming: AdminInboundMessage) -> None:
         try:
@@ -170,7 +467,7 @@ class KiwiService:
                 },
             )
 
-    async def _process_route_message(self, incoming: IncomingChannelMessage, route: ChannelRoute) -> None:
+    async def _process_route_message(self, incoming: IncomingChannelMessage, route: ChannelRoute) -> str:
         paths = self.storage.prepare_message_paths(incoming)
         self.storage.write_raw_update(paths, incoming.raw)
 
@@ -189,6 +486,16 @@ class KiwiService:
                 "destination_channel_username": route.destination_channel_username,
                 "destination_target": route.destination_target(),
                 "script": route.script,
+                "sync": {
+                    "enabled": route.sync_enabled,
+                    "status": route.sync_status,
+                    "backfill_count": route.sync_backfill_count,
+                    "interval_sec": route.sync_interval_sec,
+                    "batch_size": route.sync_batch_size,
+                    "retry_attempts": route.sync_retry_attempts,
+                    "pending_count": route.sync_pending_count,
+                    "processed_count": route.sync_processed_count,
+                },
             },
             "message": {
                 "update_id": incoming.update_id,
@@ -219,10 +526,15 @@ class KiwiService:
                         },
                     )
                     continue
-                file_info = await self.telegram_client.get_file(media.file_id)
-                file_path = str(file_info.get("file_path") or "").strip()
-                if not file_path:
-                    raise RuntimeError(f"Telegram get_file returned empty file_path for {media.file_id}")
+
+                file_path = ""
+                if media.source == "telethon" and isinstance(media.source_ref, dict):
+                    file_path = media.file_name or f"{media.kind.value}_{idx}"
+                else:
+                    file_info = await self.telegram_client.get_file(media.file_id)
+                    file_path = str(file_info.get("file_path") or "").strip()
+                    if not file_path:
+                        raise RuntimeError(f"Telegram get_file returned empty file_path for {media.file_id}")
 
                 preferred_name = self._preferred_local_name(media, file_path=file_path, idx=idx)
                 target_rel = self._allocate_local_name(preferred_name, idx=idx, used_names=used_local_names)
@@ -233,7 +545,12 @@ class KiwiService:
                 if remaining <= 0:
                     raise MessageTooLargeError(f"Message exceeded size limit ({max_mb} MB)")
 
-                downloaded = await self.telegram_client.download_file(file_path, target_path, max_bytes=remaining)
+                if media.source == "telethon" and isinstance(media.source_ref, dict):
+                    if self.source_client is None:
+                        raise RuntimeError("Telethon source client is not available for media download")
+                    downloaded = await self.source_client.download_media(media.source_ref, target_path, max_bytes=remaining)
+                else:
+                    downloaded = await self.telegram_client.download_file(file_path, target_path, max_bytes=remaining)
                 downloaded_total += downloaded
 
                 payload["inputs"].append(
@@ -260,7 +577,7 @@ class KiwiService:
                 output_dir=output_dir,
             )
             if not is_allowed:
-                block_reason = self.guard_runner.last_reason or "پیام توسط گارد رد شد"
+                block_reason = self.guard_runner.last_reason or f"guard_denied:{route.gaurd_script}"
                 await self._audit_log(
                     stage="guard",
                     status="blocked",
@@ -279,7 +596,7 @@ class KiwiService:
                         }
                     },
                 )
-                return
+                return "blocked"
 
             run_result = await self.script_runner.run(
                 route,
@@ -306,7 +623,7 @@ class KiwiService:
                         }
                     },
                 )
-                return
+                return "skipped"
 
             await self.dispatcher.dispatch(
                 route.destination_target(),
@@ -321,6 +638,7 @@ class KiwiService:
                 route=route,
                 reason=f"ارسال شد ({len(run_result.messages)} پیام خروجی)",
             )
+            return "ok"
 
         except MessageTooLargeError as exc:
             await self._audit_log(
@@ -342,6 +660,7 @@ class KiwiService:
                     }
                 },
             )
+            return "failed"
         except ScriptExecutionError:
             await self._audit_log(
                 stage="script",
@@ -360,6 +679,7 @@ class KiwiService:
                     }
                 },
             )
+            return "failed"
         except GuardExecutionError:
             await self._audit_log(
                 stage="guard",
@@ -379,6 +699,7 @@ class KiwiService:
                     }
                 },
             )
+            return "failed"
         except Exception:
             await self._audit_log(
                 stage="processing",
@@ -397,6 +718,7 @@ class KiwiService:
                     }
                 },
             )
+            return "failed"
 
     def _collect_ready_messages(
         self,
@@ -538,6 +860,9 @@ class KiwiService:
                     f"تعداد مدیا: {len(incoming.medias)}",
                 ]
             )
+            source_link = self._source_message_link(incoming)
+            if source_link:
+                lines.append(f"لینک پیام: {source_link}")
             if incoming.media_group_id:
                 lines.append(f"media_group_id: {incoming.media_group_id}")
         if reason:
@@ -560,6 +885,21 @@ class KiwiService:
                     }
                 },
             )
+
+    @staticmethod
+    def _source_message_link(incoming: IncomingChannelMessage) -> str | None:
+        message_id = int(incoming.message_id or 0)
+        if message_id <= 0:
+            return None
+
+        username = str(incoming.source_channel_username or "").strip()
+        if username.startswith("@") and len(username) > 1:
+            return f"https://t.me/{username[1:]}/{message_id}"
+
+        channel_id = str(incoming.source_channel_id or "").strip()
+        if channel_id.startswith("-100") and channel_id[4:].isdigit():
+            return f"https://t.me/c/{channel_id[4:]}/{message_id}"
+        return None
 
     @staticmethod
     def _merge_group_messages(messages: list[IncomingChannelMessage]) -> IncomingChannelMessage:

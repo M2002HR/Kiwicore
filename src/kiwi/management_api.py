@@ -73,6 +73,32 @@ class ManagementApi:
     def set_route_enabled(self, name: str, enabled: bool) -> dict:
         return self.update_route(name, {"enabled": bool(enabled)})
 
+    def update_route_sync(self, name: str, sync_patch: dict) -> dict:
+        if not isinstance(sync_patch, dict):
+            raise ValueError("sync patch must be object")
+        route = self.get_route(name)
+        sync_obj = route.get("sync")
+        if not isinstance(sync_obj, dict):
+            sync_obj = {}
+        updated_sync = dict(sync_obj)
+        updated_sync.update(sync_patch)
+        return self.update_route(name, {"sync": updated_sync})
+
+    def start_route_sync(self, name: str) -> dict:
+        route = self.get_route(name)
+        sync_obj = route.get("sync") if isinstance(route.get("sync"), dict) else {}
+        sync_patch = {
+            "enabled": True,
+            "status": "syncing",
+            "pending_count": 0,
+            "processed_count": 0,
+            "seeded": False,
+        }
+        return self.update_route_sync(name, sync_patch)
+
+    def stop_route_sync(self, name: str) -> dict:
+        return self.update_route_sync(name, {"enabled": False, "status": "active"})
+
     def list_script_files(self) -> list[str]:
         return sorted(p.name for p in self.scripts_dir.glob("*.py") if p.is_file())
 

@@ -45,6 +45,14 @@ BTN_EDIT_DEST_USER = "🎯 مقصد با یوزرنیم"
 BTN_EDIT_SRC_ID = "🧭 مبدا با شناسه"
 BTN_EDIT_SRC_USER = "🧭 مبدا با یوزرنیم"
 BTN_EDIT_ENABLED = "⚙️ وضعیت فعال/غیرفعال"
+BTN_EDIT_SYNC_START = "▶️ شروع سینک"
+BTN_EDIT_SYNC_STOP = "⏹ توقف سینک"
+BTN_EDIT_SYNC_BACKFILL = "🔢 تعداد پیام سینک"
+BTN_EDIT_SYNC_INTERVAL = "⏱ فاصله سینک (ثانیه)"
+BTN_EDIT_SYNC_BATCH = "📨 تعداد هر نوبت سینک"
+BTN_EDIT_SYNC_RETRY = "♻️ تلاش مجدد سینک"
+BTN_SYNC_ON = "✅ سینک روشن"
+BTN_SYNC_OFF = "⛔ سینک خاموش"
 
 
 @dataclass(slots=True)
@@ -264,11 +272,94 @@ class AdminBotHandler:
             else:
                 return AdminBotResponse("وضعیت معتبر انتخاب کن.", self._enabled_keyboard())
 
-            new_route.pop("_source_field", None)
-            new_route.pop("_dest_field", None)
-            self.management_api.add_route(new_route)
-            self.admin_store.set_flow(inbound.user_id, None, {})
-            return AdminBotResponse(f"مسیر «{new_route.get('name')}» اضافه شد و فعال گردید.", self._main_menu_keyboard())
+            flow_data["new_route"] = new_route
+            self.admin_store.set_flow(inbound.user_id, "route_add_sync_enabled", flow_data)
+            return AdminBotResponse("برای این مسیر سینک زمان‌بندی‌شده می‌خواهی؟", self._sync_toggle_keyboard())
+
+        if flow == "route_add_sync_enabled":
+            flow_data = dict(session.get("flow_data") or {})
+            new_route = dict(flow_data.get("new_route") or {})
+            if text == BTN_SYNC_OFF:
+                new_route["sync"] = {
+                    "enabled": False,
+                    "status": "active",
+                    "backfill_count": 100,
+                    "interval_sec": 300,
+                    "batch_size": 1,
+                    "retry_attempts": 2,
+                    "pending_count": 0,
+                    "processed_count": 0,
+                    "seeded": False,
+                }
+                return self._finalize_route_add(inbound.user_id, new_route)
+
+            if text != BTN_SYNC_ON:
+                return AdminBotResponse("از دکمه‌های سینک استفاده کن.", self._sync_toggle_keyboard())
+
+            new_route["sync"] = {
+                "enabled": True,
+                "status": "syncing",
+                "backfill_count": 100,
+                "interval_sec": 300,
+                "batch_size": 1,
+                "retry_attempts": 2,
+                "pending_count": 0,
+                "processed_count": 0,
+                "seeded": False,
+            }
+            flow_data["new_route"] = new_route
+            self.admin_store.set_flow(inbound.user_id, "route_add_sync_backfill", flow_data)
+            return AdminBotResponse("چند پیام آخر برای سینک اولیه در نظر گرفته شود؟ (مثلا 100)", self._cancel_keyboard())
+
+        if flow == "route_add_sync_backfill":
+            flow_data = dict(session.get("flow_data") or {})
+            new_route = dict(flow_data.get("new_route") or {})
+            sync_obj = new_route.get("sync") if isinstance(new_route.get("sync"), dict) else {}
+            try:
+                sync_obj["backfill_count"] = max(0, int(text.strip()))
+            except Exception as exc:
+                raise ValueError("عدد معتبر برای backfill وارد کن") from exc
+            new_route["sync"] = sync_obj
+            flow_data["new_route"] = new_route
+            self.admin_store.set_flow(inbound.user_id, "route_add_sync_interval", flow_data)
+            return AdminBotResponse("هر چند ثانیه یک بار سینک اجرا شود؟ (مثلا 300)", self._cancel_keyboard())
+
+        if flow == "route_add_sync_interval":
+            flow_data = dict(session.get("flow_data") or {})
+            new_route = dict(flow_data.get("new_route") or {})
+            sync_obj = new_route.get("sync") if isinstance(new_route.get("sync"), dict) else {}
+            try:
+                sync_obj["interval_sec"] = max(1, int(text.strip()))
+            except Exception as exc:
+                raise ValueError("عدد معتبر برای interval وارد کن") from exc
+            new_route["sync"] = sync_obj
+            flow_data["new_route"] = new_route
+            self.admin_store.set_flow(inbound.user_id, "route_add_sync_batch", flow_data)
+            return AdminBotResponse("در هر نوبت چند پیام سینک شود؟ (مثلا 1)", self._cancel_keyboard())
+
+        if flow == "route_add_sync_batch":
+            flow_data = dict(session.get("flow_data") or {})
+            new_route = dict(flow_data.get("new_route") or {})
+            sync_obj = new_route.get("sync") if isinstance(new_route.get("sync"), dict) else {}
+            try:
+                sync_obj["batch_size"] = max(1, int(text.strip()))
+            except Exception as exc:
+                raise ValueError("عدد معتبر برای batch size وارد کن") from exc
+            new_route["sync"] = sync_obj
+            flow_data["new_route"] = new_route
+            self.admin_store.set_flow(inbound.user_id, "route_add_sync_retry", flow_data)
+            return AdminBotResponse("تعداد تلاش مجدد در خطاهای غیرگارد چقدر باشد؟ (مثلا 2)", self._cancel_keyboard())
+
+        if flow == "route_add_sync_retry":
+            flow_data = dict(session.get("flow_data") or {})
+            new_route = dict(flow_data.get("new_route") or {})
+            sync_obj = new_route.get("sync") if isinstance(new_route.get("sync"), dict) else {}
+            try:
+                sync_obj["retry_attempts"] = max(0, int(text.strip()))
+            except Exception as exc:
+                raise ValueError("عدد معتبر برای retry attempts وارد کن") from exc
+            new_route["sync"] = sync_obj
+            return self._finalize_route_add(inbound.user_id, new_route)
 
         if flow == "route_delete_pick":
             self.management_api.delete_route(text.strip())
@@ -314,6 +405,34 @@ class AdminBotHandler:
                 flow_data["field"] = "source_channel_username"
                 self.admin_store.set_flow(inbound.user_id, "route_edit_source_value", flow_data)
                 return AdminBotResponse("یوزرنیم مبدا جدید را بفرست (مثل @my_channel).", self._cancel_keyboard())
+            if text == BTN_EDIT_SYNC_START:
+                updated = self.management_api.start_route_sync(route_name)
+                self.admin_store.set_flow(inbound.user_id, None, {})
+                sync = updated.get("sync") if isinstance(updated.get("sync"), dict) else {}
+                return AdminBotResponse(
+                    f"سینک مسیر شروع شد. pending={int(sync.get('pending_count') or 0)}",
+                    self._main_menu_keyboard(),
+                )
+            if text == BTN_EDIT_SYNC_STOP:
+                self.management_api.stop_route_sync(route_name)
+                self.admin_store.set_flow(inbound.user_id, None, {})
+                return AdminBotResponse("سینک مسیر متوقف شد.", self._main_menu_keyboard())
+            if text == BTN_EDIT_SYNC_BACKFILL:
+                flow_data["field"] = "sync_backfill_count"
+                self.admin_store.set_flow(inbound.user_id, "route_edit_sync_number", flow_data)
+                return AdminBotResponse("تعداد پیام سینک اولیه را وارد کن (مثلا 100).", self._cancel_keyboard())
+            if text == BTN_EDIT_SYNC_INTERVAL:
+                flow_data["field"] = "sync_interval_sec"
+                self.admin_store.set_flow(inbound.user_id, "route_edit_sync_number", flow_data)
+                return AdminBotResponse("فاصله زمانی سینک را بر حسب ثانیه وارد کن (مثلا 300).", self._cancel_keyboard())
+            if text == BTN_EDIT_SYNC_BATCH:
+                flow_data["field"] = "sync_batch_size"
+                self.admin_store.set_flow(inbound.user_id, "route_edit_sync_number", flow_data)
+                return AdminBotResponse("در هر نوبت چند پیام سینک شود؟ (مثلا 1)", self._cancel_keyboard())
+            if text == BTN_EDIT_SYNC_RETRY:
+                flow_data["field"] = "sync_retry_attempts"
+                self.admin_store.set_flow(inbound.user_id, "route_edit_sync_number", flow_data)
+                return AdminBotResponse("تعداد تلاش مجدد برای خطاهای غیرگارد را وارد کن (مثلا 2).", self._cancel_keyboard())
             return AdminBotResponse("از دکمه‌های ویرایش استفاده کن.", self._route_edit_fields_keyboard())
 
         if flow == "route_edit_script":
@@ -388,8 +507,62 @@ class AdminBotHandler:
             self.admin_store.set_flow(inbound.user_id, None, {})
             return AdminBotResponse("مبدا مسیر ویرایش شد.", self._main_menu_keyboard())
 
+        if flow == "route_edit_sync_number":
+            flow_data = dict(session.get("flow_data") or {})
+            route_name = str(flow_data.get("route_name") or "")
+            field = str(flow_data.get("field") or "")
+            if not route_name:
+                raise ValueError("نام مسیر برای ویرایش سینک مشخص نیست")
+            try:
+                value = int(text.strip())
+            except Exception as exc:
+                raise ValueError("عدد معتبر وارد کن") from exc
+
+            route = self.management_api.get_route(route_name)
+            sync_obj = route.get("sync") if isinstance(route.get("sync"), dict) else {}
+            if field == "sync_backfill_count":
+                sync_obj["backfill_count"] = max(0, value)
+                sync_obj["seeded"] = False
+            elif field == "sync_interval_sec":
+                sync_obj["interval_sec"] = max(1, value)
+            elif field == "sync_batch_size":
+                sync_obj["batch_size"] = max(1, value)
+            elif field == "sync_retry_attempts":
+                sync_obj["retry_attempts"] = max(0, value)
+            else:
+                raise ValueError("فیلد سینک نامعتبر است")
+
+            self.management_api.update_route(route_name, {"sync": sync_obj})
+            self.admin_store.set_flow(inbound.user_id, None, {})
+            return AdminBotResponse("تنظیمات سینک مسیر ذخیره شد.", self._main_menu_keyboard())
+
         self.admin_store.set_flow(inbound.user_id, None, {})
         return AdminBotResponse("حالت گفتگو نامعتبر بود. بازگشت به منوی اصلی.", self._main_menu_keyboard())
+
+    def _finalize_route_add(self, user_id: str, new_route: dict) -> AdminBotResponse:
+        new_route.pop("_source_field", None)
+        new_route.pop("_dest_field", None)
+        if not isinstance(new_route.get("sync"), dict):
+            new_route["sync"] = {
+                "enabled": False,
+                "status": "active",
+                "backfill_count": 100,
+                "interval_sec": 300,
+                "batch_size": 1,
+                "retry_attempts": 2,
+                "pending_count": 0,
+                "processed_count": 0,
+                "seeded": False,
+            }
+        self.management_api.add_route(new_route)
+        self.admin_store.set_flow(user_id, None, {})
+        sync_obj = new_route.get("sync") if isinstance(new_route.get("sync"), dict) else {}
+        if bool(sync_obj.get("enabled", False)):
+            return AdminBotResponse(
+                f"مسیر «{new_route.get('name')}» اضافه شد و سینک روی حالت syncing فعال شد.",
+                self._main_menu_keyboard(),
+            )
+        return AdminBotResponse(f"مسیر «{new_route.get('name')}» اضافه شد و فعال گردید.", self._main_menu_keyboard())
 
     def _handle_command(self, inbound: AdminInboundMessage, text: str) -> AdminBotResponse:
         if text.startswith("/start"):
@@ -477,12 +650,17 @@ class AdminBotHandler:
             return "هیچ مسیری ثبت نشده."
         lines = ["لیست مسیرها:"]
         for idx, r in enumerate(routes, start=1):
+            sync_obj = r.get("sync") if isinstance(r.get("sync"), dict) else {}
+            sync_enabled = bool(sync_obj.get("enabled", False))
+            sync_status = str(sync_obj.get("status", "active"))
+            sync_pending = int(sync_obj.get("pending_count") or 0)
             lines.append(
                 f"{idx}. {r.get('name','-')} | enabled={bool(r.get('enabled', True))} | "
                 f"src={r.get('source_channel_username') or r.get('source_channel_id')} | "
                 f"dst={r.get('destination_channel_username') or r.get('destination_channel_id')} | "
                 f"script={r.get('script') or '-'} | guard={r.get('gaurd_script') or 'default_guard.py'} | "
-                f"max_mb={r.get('max_message_mb') if r.get('max_message_mb') is not None else '-'}"
+                f"max_mb={r.get('max_message_mb') if r.get('max_message_mb') is not None else '-'} | "
+                f"sync={sync_status if sync_enabled else 'off'} | pending={sync_pending}"
             )
         return "\n".join(lines)
 
@@ -602,6 +780,9 @@ class AdminBotHandler:
     def _enabled_keyboard(self) -> dict:
         return self._reply_keyboard([[BTN_ENABLED_ON, BTN_ENABLED_OFF], [BTN_CANCEL]])
 
+    def _sync_toggle_keyboard(self) -> dict:
+        return self._reply_keyboard([[BTN_SYNC_ON, BTN_SYNC_OFF], [BTN_CANCEL]])
+
     def _route_names_keyboard(self, *, include_back: bool) -> dict:
         names = [str(item.get("name") or "").strip() for item in self.management_api.list_routes()]
         names = [n for n in names if n]
@@ -621,6 +802,11 @@ class AdminBotHandler:
                 [BTN_EDIT_SRC_USER],
                 [BTN_EDIT_DEST_ID],
                 [BTN_EDIT_DEST_USER],
+                [BTN_EDIT_SYNC_START, BTN_EDIT_SYNC_STOP],
+                [BTN_EDIT_SYNC_BACKFILL],
+                [BTN_EDIT_SYNC_INTERVAL],
+                [BTN_EDIT_SYNC_BATCH],
+                [BTN_EDIT_SYNC_RETRY],
                 [BTN_BACK, BTN_CANCEL],
             ]
         )

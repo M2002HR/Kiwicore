@@ -81,3 +81,39 @@ def test_guard_runner_false_with_reason_token(tmp_path: Path) -> None:
     result = asyncio.run(runner.run(_route(), payload_path=payload, input_dir=input_dir, output_dir=output_dir))
     assert result is False
     assert runner.last_reason == "obvious_advertisement"
+
+
+def test_guard_runner_false_without_reason_sets_default(tmp_path: Path) -> None:
+    guard_dir = tmp_path / "guards"
+    guard_dir.mkdir()
+    (guard_dir / "g.py").write_text("print('false')", encoding="utf-8")
+
+    runner = GuardRunner(str(guard_dir), timeout_sec=5)
+    payload = tmp_path / "payload.json"
+    payload.write_text("{}", encoding="utf-8")
+    input_dir = tmp_path / "in"
+    output_dir = tmp_path / "out"
+    input_dir.mkdir()
+    output_dir.mkdir()
+
+    result = asyncio.run(runner.run(_route(), payload_path=payload, input_dir=input_dir, output_dir=output_dir))
+    assert result is False
+    assert runner.last_reason == "guard_denied"
+
+
+def test_guard_runner_keeps_detailed_reason_with_colons(tmp_path: Path) -> None:
+    guard_dir = tmp_path / "guards"
+    guard_dir.mkdir()
+    (guard_dir / "g.py").write_text("print('false: guard_exception:TimeoutError:read timed out')", encoding="utf-8")
+
+    runner = GuardRunner(str(guard_dir), timeout_sec=5)
+    payload = tmp_path / "payload.json"
+    payload.write_text("{}", encoding="utf-8")
+    input_dir = tmp_path / "in"
+    output_dir = tmp_path / "out"
+    input_dir.mkdir()
+    output_dir.mkdir()
+
+    result = asyncio.run(runner.run(_route(), payload_path=payload, input_dir=input_dir, output_dir=output_dir))
+    assert result is False
+    assert runner.last_reason == "guard_exception:TimeoutError:read timed out"

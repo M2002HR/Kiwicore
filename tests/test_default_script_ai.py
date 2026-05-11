@@ -22,11 +22,10 @@ def test_ai_cleanup_path_is_used_for_reference_text(monkeypatch) -> None:
 
     def fake_call(*, endpoint: str, body: dict, timeout_sec: float):
         assert endpoint == "http://fake.local/proxy/gemini"
-        return "متن پاکسازی شد"
+        return "در خبر"
 
     monkeypatch.setattr(m, "_call_gemini_text", fake_call)
 
     payload = {"route": {"destination_target": "@dest"}}
     out = m._sanitize_text("در شبکه x https://x.com/test", payload=payload)
-    assert out == "متن پاکسازی شد\n@dest"
-
+    assert out == "در خبر\n@dest"

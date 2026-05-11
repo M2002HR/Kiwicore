@@ -23,6 +23,7 @@ class Settings:
     telegram_file_base_url: str
     telegram_poll_timeout_sec: int
     telegram_allowed_updates: list[str]
+    telegram_source_mode: str
 
     bale_bot_token: str
     bale_api_base_url: str
@@ -44,6 +45,11 @@ class Settings:
     admin_bot_enabled: bool
     admin_users_config_path: str
     admin_sessions_path: str
+    telethon_enabled: bool
+    telethon_api_id: int | None
+    telethon_api_hash: str
+    telethon_session_path: str
+    telethon_poll_batch_size: int
 
 
 @dataclass(slots=True)
@@ -130,6 +136,7 @@ def load_settings(env_file: str = ".env") -> Settings:
             "TELEGRAM_ALLOWED_UPDATES",
             ["channel_post", "edited_channel_post", "message", "edited_message"],
         ),
+        telegram_source_mode=_str("TELEGRAM_SOURCE_MODE", "bot").strip().lower(),
         bale_bot_token=_str("BALE_BOT_TOKEN", "").strip(),
         bale_api_base_url=_str("BALE_API_BASE_URL", "https://tapi.bale.ai").strip(),
         bale_file_base_url=_str("BALE_FILE_BASE_URL", "https://tapi.bale.ai/file").strip(),
@@ -149,7 +156,15 @@ def load_settings(env_file: str = ".env") -> Settings:
         admin_bot_enabled=_bool("ADMIN_BOT_ENABLED", True),
         admin_users_config_path=_str("ADMIN_USERS_CONFIG_PATH", "./config/admin_users.json").strip(),
         admin_sessions_path=_str("ADMIN_SESSIONS_PATH", "./app_data/admin_sessions.json").strip(),
+        telethon_enabled=_bool("TELETHON_ENABLED", False),
+        telethon_api_id=_int("TELETHON_API_ID", 0) or None,
+        telethon_api_hash=_str("TELETHON_API_HASH", "").strip(),
+        telethon_session_path=_str("TELETHON_SESSION_PATH", "./app_data/telethon.session").strip(),
+        telethon_poll_batch_size=max(1, _int("TELETHON_POLL_BATCH_SIZE", 50)),
     )
+
+    if settings.telegram_source_mode not in {"bot", "telethon", "hybrid"}:
+        raise ValueError("TELEGRAM_SOURCE_MODE must be one of: bot, telethon, hybrid")
 
     if settings.admin_bot_enabled:
         needed = {"message", "edited_message"}
@@ -163,10 +178,22 @@ def load_settings(env_file: str = ".env") -> Settings:
             seen.add(key)
         settings.telegram_allowed_updates = merged
 
+    if settings.telegram_source_mode == "telethon":
+        # Keep private admin updates only; channel updates come from Telethon.
+        settings.telegram_allowed_updates = [u for u in settings.telegram_allowed_updates if u in {"message", "edited_message"}]
+
+    if settings.telegram_source_mode in {"telethon", "hybrid"}:
+        settings.telethon_enabled = True
+
     if not settings.telegram_bot_token:
         raise ValueError("TELEGRAM_BOT_TOKEN is required")
     if not settings.bale_bot_token:
         raise ValueError("BALE_BOT_TOKEN is required")
+    if settings.telethon_enabled:
+        if settings.telethon_api_id is None or settings.telethon_api_id <= 0:
+            raise ValueError("TELETHON_API_ID is required when TELETHON_ENABLED=true")
+        if not settings.telethon_api_hash:
+            raise ValueError("TELETHON_API_HASH is required when TELETHON_ENABLED=true")
 
     Path(settings.storage_dir).mkdir(parents=True, exist_ok=True)
     Path(settings.scripts_dir).mkdir(parents=True, exist_ok=True)
@@ -175,6 +202,7 @@ def load_settings(env_file: str = ".env") -> Settings:
     Path(settings.state_path).parent.mkdir(parents=True, exist_ok=True)
     Path(settings.admin_users_config_path).parent.mkdir(parents=True, exist_ok=True)
     Path(settings.admin_sessions_path).parent.mkdir(parents=True, exist_ok=True)
+    Path(settings.telethon_session_path).parent.mkdir(parents=True, exist_ok=True)
 
     return settings
 
@@ -250,10 +278,35 @@ def load_routes(config_path: str) -> RouteRegistry:
             script=script,
             max_message_mb=max_message_mb,
             gaurd_script=gaurd_script,
+            sync_enabled=bool((obj.get("sync") or {}).get("enabled", False)) if isinstance(obj.get("sync"), dict) else False,
+            sync_status=str((obj.get("sync") or {}).get("status", "active")).strip().lower()
+            if isinstance(obj.get("sync"), dict)
+            else "active",
+            sync_backfill_count=max(0, int((obj.get("sync") or {}).get("backfill_count", 100)))
+            if isinstance(obj.get("sync"), dict)
+            else 100,
+            sync_interval_sec=max(1, int((obj.get("sync") or {}).get("interval_sec", 300)))
+            if isinstance(obj.get("sync"), dict)
+            else 300,
+            sync_batch_size=max(1, int((obj.get("sync") or {}).get("batch_size", 1)))
+            if isinstance(obj.get("sync"), dict)
+            else 1,
+            sync_retry_attempts=max(0, int((obj.get("sync") or {}).get("retry_attempts", 2)))
+            if isinstance(obj.get("sync"), dict)
+            else 2,
+            sync_pending_count=max(0, int((obj.get("sync") or {}).get("pending_count", 0)))
+            if isinstance(obj.get("sync"), dict)
+            else 0,
+            sync_processed_count=max(0, int((obj.get("sync") or {}).get("processed_count", 0)))
+            if isinstance(obj.get("sync"), dict)
+            else 0,
+            sync_seeded=bool((obj.get("sync") or {}).get("seeded", False)) if isinstance(obj.get("sync"), dict) else False,
         )
+        if route.sync_status not in {"active", "syncing", "disabled"}:
+            route.sync_status = "active"
         routes.append(route)
 
-        if not route.enabled:
+        if not route.enabled and not route.is_syncing():
             continue
 
         if route.source_channel_id:

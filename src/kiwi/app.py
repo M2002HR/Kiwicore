@@ -6,6 +6,7 @@ from kiwi.config import load_routes, load_settings
 from kiwi.guard_runner import GuardRunner
 from kiwi.management_api import ManagementApi
 from kiwi.platforms.client import BotApiClient
+from kiwi.platforms.telethon_source import TelethonSourceClient
 from kiwi.script_runner import ScriptRunner
 from kiwi.service import KiwiService
 from kiwi.state import StateStore
@@ -30,12 +31,21 @@ async def build_service(env_file: str = ".env") -> KiwiService:
         timeout_sec=30.0,
         trust_env=settings.http_trust_env,
     )
+    telethon_source_client = None
+    if settings.telethon_enabled:
+        telethon_source_client = TelethonSourceClient(
+            api_id=int(settings.telethon_api_id or 0),
+            api_hash=settings.telethon_api_hash,
+            session_path=settings.telethon_session_path,
+            poll_batch_size=settings.telethon_poll_batch_size,
+        )
 
     service = KiwiService(
         settings=settings,
         routes=routes,
         telegram_client=telegram_client,
         bale_client=bale_client,
+        source_client=telethon_source_client,
         storage=StorageManager(settings.storage_dir),
         guard_runner=GuardRunner(settings.gaurd_scripts_dir, settings.gaurd_script_timeout_sec),
         script_runner=ScriptRunner(settings.scripts_dir, settings.script_timeout_sec),

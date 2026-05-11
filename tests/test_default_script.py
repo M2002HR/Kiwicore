@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import sys
+import importlib.util
 from pathlib import Path
 
 
@@ -35,6 +36,15 @@ def _run_default(payload: dict, tmp_path: Path) -> dict:
         env=env,
     )
     return json.loads(result.stdout)
+
+
+def _load_default_module():
+    script = Path(__file__).resolve().parents[1] / "scripts" / "channel_scripts" / "default_scripts.py"
+    spec = importlib.util.spec_from_file_location("kiwi_default_script_test_module", script)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def test_default_script_text_passthrough(tmp_path: Path) -> None:
@@ -101,19 +111,33 @@ def test_default_script_maps_gif_like_document_to_animation(tmp_path: Path) -> N
     assert out["messages"] == [{"type": "animation", "path": "animation.gif.mp4", "caption": "cap"}]
 
 
-def test_default_script_removes_links_mentions_and_adds_destination_signature(tmp_path: Path) -> None:
+def test_default_script_removes_links_and_replaces_source_footer_with_destination_signature(tmp_path: Path) -> None:
     payload = {
         "route": {
+            "source_channel_username": "@source_chan",
             "destination_channel_id": "-1009000",
             "destination_target": "@dest_chan",
         },
         "message": {
+            "source_channel_username": "@source_chan",
             "text": "خبر فوری\n@source_chan\nhttps://t.me/source_chan/12 #tag",
         },
         "inputs": [],
     }
     out = _run_default(payload, tmp_path)
     assert out == {"messages": [{"type": "text", "text": "خبر فوری\n-1009000"}]}
+
+
+def test_default_script_keeps_mentions_inside_core_lines(tmp_path: Path) -> None:
+    payload = {
+        "route": {"destination_target": "@dest"},
+        "message": {
+            "text": "⚽️ @jfball - just football\nhttps://t.me/any/1",
+        },
+        "inputs": [],
+    }
+    out = _run_default(payload, tmp_path)
+    assert out == {"messages": [{"type": "text", "text": "⚽️ @jfball - just football\n@dest"}]}
 
 
 def test_default_script_removes_blocklisted_emojis(tmp_path: Path) -> None:
@@ -145,3 +169,17 @@ def test_default_script_keeps_short_text_message(tmp_path: Path) -> None:
     }
     out = _run_default(payload, tmp_path)
     assert out == {"messages": [{"type": "text", "text": "س"}]}
+
+
+def test_default_script_filters_noisy_ai_output_lines() -> None:
+    mod = _load_default_module()
+    original = "🏴 Rangers v Red Star Belgrade 🇷🇸\n@kiwi_kiwi_test"
+    noisy = (
+        "Goal: Keep only core informational content.\n"
+        "Constraint: No explanations.\n"
+        "`🇪🇸 Barcelona v Galatasaray 🇹🇷` -> Core information.\n"
+        "🏴 Rangers v Red Star Belgrade 🇷🇸\n"
+        "@kiwi_kiwi_test"
+    )
+    cleaned = mod._sanitize_ai_output(noisy, original=original)
+    assert cleaned == "🏴 Rangers v Red Star Belgrade 🇷🇸\n@kiwi_kiwi_test"

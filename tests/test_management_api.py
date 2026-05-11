@@ -53,5 +53,16 @@ def test_management_api_crud_and_reload(tmp_path: Path) -> None:
     assert api.list_script_files() == ["default_scripts.py"]
     assert api.list_guard_files() == ["default_guard.py"]
 
+    sync_started = api.start_route_sync("r1")
+    assert isinstance(sync_started.get("sync"), dict)
+    assert sync_started["sync"]["status"] == "syncing"
+
+    sync_updated = api.update_route_sync("r1", {"interval_sec": 120, "batch_size": 2})
+    assert sync_updated["sync"]["interval_sec"] == 120
+    assert sync_updated["sync"]["batch_size"] == 2
+
+    sync_stopped = api.stop_route_sync("r1")
+    assert sync_stopped["sync"]["enabled"] is False
+
     api.delete_route("r1")
     assert api.list_routes() == []

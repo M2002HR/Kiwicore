@@ -164,6 +164,45 @@ def test_load_settings_adds_private_updates_for_admin_bot(tmp_path: Path) -> Non
     assert "edited_message" in settings.telegram_allowed_updates
 
 
+def test_load_settings_telethon_mode_requires_credentials(tmp_path: Path) -> None:
+    env_path = tmp_path / ".env"
+    env_path.write_text(
+        "\n".join(
+            [
+                "TELEGRAM_BOT_TOKEN=t",
+                "BALE_BOT_TOKEN=b",
+                "TELEGRAM_SOURCE_MODE=telethon",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    try:
+        load_settings(str(env_path))
+        assert False, "expected ValueError"
+    except ValueError as exc:
+        assert "TELETHON_API_ID" in str(exc)
+
+
+def test_load_settings_telethon_mode_keeps_admin_updates_only(tmp_path: Path) -> None:
+    env_path = tmp_path / ".env"
+    env_path.write_text(
+        "\n".join(
+            [
+                "TELEGRAM_BOT_TOKEN=t",
+                "BALE_BOT_TOKEN=b",
+                "TELEGRAM_SOURCE_MODE=telethon",
+                "TELETHON_API_ID=1234",
+                "TELETHON_API_HASH=abc",
+                "TELEGRAM_ALLOWED_UPDATES=[\"channel_post\",\"message\",\"edited_message\"]",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    settings = load_settings(str(env_path))
+    assert settings.telethon_enabled is True
+    assert settings.telegram_allowed_updates == ["message", "edited_message"]
+
+
 def test_load_routes_allows_duplicate_sources_and_matches_all(tmp_path: Path) -> None:
     config_path = tmp_path / "channels.json"
     config_path.write_text(
@@ -190,3 +229,69 @@ def test_load_routes_allows_duplicate_sources_and_matches_all(tmp_path: Path) ->
     matches = registry.match_all("-100000", "@dup_src")
     assert len(matches) == 2
     assert [m.name for m in matches] == ["r1", "r2"]
+
+
+def test_load_routes_reads_sync_settings_and_allows_syncing_when_disabled(tmp_path: Path) -> None:
+    config_path = tmp_path / "channels.json"
+    config_path.write_text(
+        json.dumps(
+            [
+                {
+                    "name": "sync-r1",
+                    "enabled": False,
+                    "source_channel_id": "-1001",
+                    "destination_channel_id": "-2001",
+                    "script": "s.py",
+                    "sync": {
+                        "enabled": True,
+                        "status": "syncing",
+                        "backfill_count": 77,
+                        "interval_sec": 120,
+                        "batch_size": 3,
+                        "retry_attempts": 4,
+                        "pending_count": 9,
+                        "processed_count": 6,
+                        "seeded": True,
+                    },
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    registry = load_routes(str(config_path))
+    matched = registry.match("-1001", None)
+    assert matched is not None
+    assert matched.is_syncing() is True
+    assert matched.sync_backfill_count == 77
+    assert matched.sync_interval_sec == 120
+    assert matched.sync_batch_size == 3
+    assert matched.sync_retry_attempts == 4
+    assert matched.sync_pending_count == 9
+    assert matched.sync_processed_count == 6
+    assert matched.sync_seeded is True
+
+
+def test_load_routes_sync_active_but_not_seeded_treated_as_syncing(tmp_path: Path) -> None:
+    config_path = tmp_path / "channels.json"
+    config_path.write_text(
+        json.dumps(
+            [
+                {
+                    "name": "sync-r2",
+                    "enabled": True,
+                    "source_channel_username": "@s2",
+                    "destination_channel_id": "-2002",
+                    "script": "s2.py",
+                    "sync": {
+                        "enabled": True,
+                        "status": "active",
+                        "seeded": False,
+                    },
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    route = load_routes(str(config_path)).match("-1", "@s2")
+    assert route is not None
+    assert route.is_syncing() is True

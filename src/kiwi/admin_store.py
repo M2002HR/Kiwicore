@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 
 from kiwi.utils import dump_json
 
@@ -100,7 +101,7 @@ class AdminStore:
         return self.update_session(user_id, patch)
 
     def _load_users(self) -> list[dict]:
-        raw = json.loads(self.users_path.read_text(encoding="utf-8"))
+        raw = self._load_json_file(self.users_path, fallback=[{"username": "admin", "password": "change_me"}], repair=False)
         if not isinstance(raw, list):
             raise ValueError("admin users config must be list")
         users: list[dict] = []
@@ -116,7 +117,28 @@ class AdminStore:
         return users
 
     def _load_sessions(self) -> dict:
-        raw = json.loads(self.sessions_path.read_text(encoding="utf-8"))
+        raw = self._load_json_file(self.sessions_path, fallback={}, repair=True)
         if not isinstance(raw, dict):
             return {}
         return raw
+
+    def _load_json_file(self, path: Path, *, fallback: Any, repair: bool) -> Any:
+        try:
+            raw_text = path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            dump_json(path, fallback)
+            return fallback
+
+        if not raw_text.strip():
+            if repair:
+                dump_json(path, fallback)
+                return fallback
+            raise ValueError(f"{path} is empty")
+
+        try:
+            return json.loads(raw_text)
+        except json.JSONDecodeError:
+            if repair:
+                dump_json(path, fallback)
+                return fallback
+            raise ValueError(f"{path} contains invalid JSON") from None

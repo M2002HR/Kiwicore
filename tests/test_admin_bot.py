@@ -6,6 +6,9 @@ from kiwi.admin_bot import (
     BTN_ADD_ROUTE,
     BTN_EDIT_ENABLED,
     BTN_EDIT_ROUTE,
+    BTN_EDIT_SYNC_BACKFILL,
+    BTN_EDIT_SYNC_START,
+    BTN_EDIT_SYNC_STOP,
     BTN_EDIT_SRC_ID,
     BTN_ENABLED_OFF,
     BTN_ENABLED_ON,
@@ -14,6 +17,7 @@ from kiwi.admin_bot import (
     BTN_MAX_DEFAULT,
     BTN_SCRIPTS,
     BTN_SRC_ID,
+    BTN_SYNC_OFF,
     BTN_DST_ID,
     AdminBotHandler,
 )
@@ -106,7 +110,8 @@ def test_admin_bot_add_and_edit_route_by_buttons(tmp_path: Path) -> None:
     bot.handle(_inbound("default_scripts.py"))
     bot.handle(_inbound("default_guard.py"))
     bot.handle(_inbound(BTN_MAX_DEFAULT))
-    add_result = bot.handle(_inbound(BTN_ENABLED_ON))
+    bot.handle(_inbound(BTN_ENABLED_ON))
+    add_result = bot.handle(_inbound(BTN_SYNC_OFF))
     assert "اضافه شد" in add_result.text
 
     routes = bot.handle(_inbound("/routes"))
@@ -130,3 +135,31 @@ def test_admin_bot_add_and_edit_route_by_buttons(tmp_path: Path) -> None:
 
     routes2 = bot.handle(_inbound("/routes"))
     assert "enabled=False" in routes2.text
+
+    bot.handle(_inbound(BTN_EDIT_ROUTE))
+    bot.handle(_inbound("r1"))
+    started = bot.handle(_inbound(BTN_EDIT_SYNC_START))
+    assert "سینک" in started.text
+
+    routes3 = bot.handle(_inbound("/routes"))
+    assert "sync=syncing" in routes3.text
+
+    bot.handle(_inbound(BTN_EDIT_ROUTE))
+    bot.handle(_inbound("r1"))
+    bot.handle(_inbound(BTN_EDIT_SYNC_BACKFILL))
+    backfill = bot.handle(_inbound("150"))
+    assert "تنظیمات سینک" in backfill.text
+
+    bot.handle(_inbound(BTN_EDIT_ROUTE))
+    bot.handle(_inbound("r1"))
+    stopped = bot.handle(_inbound(BTN_EDIT_SYNC_STOP))
+    assert "متوقف" in stopped.text
+
+
+def test_admin_bot_handles_empty_sessions_file(tmp_path: Path) -> None:
+    bot = _build_bot(tmp_path)
+    sessions_path = tmp_path / "data" / "sessions.json"
+    sessions_path.write_text("", encoding="utf-8")
+
+    response = bot.handle(_inbound(BTN_SCRIPTS))
+    assert "ورود" in response.text

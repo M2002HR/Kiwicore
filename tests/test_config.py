@@ -15,13 +15,13 @@ def test_load_routes_by_id_and_username(tmp_path: Path) -> None:
                     "name": "r1",
                     "source_channel_id": "-1001",
                     "destination_channel_id": "-2001",
-                    "script": "-1001.py",
+                    "channel_script": "-1001.py",
                 },
                 {
                     "name": "r2",
                     "source_channel_username": "MyChan",
                     "destination_channel_id": "-2002",
-                    "script": "my.py",
+                    "channel_script": "my.py",
                 },
             ]
         ),
@@ -105,13 +105,13 @@ def test_match_prefers_username_over_id(tmp_path: Path) -> None:
                     "name": "by-id",
                     "source_channel_id": "-100123",
                     "destination_channel_id": "-2001",
-                    "script": "id.py",
+                    "channel_script": "id.py",
                 },
                 {
                     "name": "by-username",
                     "source_channel_username": "@usd_iran",
                     "destination_channel_username": "@usd_iran",
-                    "script": "user.py",
+                    "channel_script": "user.py",
                 },
             ]
         ),
@@ -131,7 +131,7 @@ def test_load_routes_custom_gaurd_script(tmp_path: Path) -> None:
                 {
                     "source_channel_id": "-1001",
                     "destination_channel_id": "-2001",
-                    "script": "my.py",
+                    "channel_script": "my.py",
                     "gaurd_script": "my_guard.py",
                 }
             ]
@@ -212,13 +212,13 @@ def test_load_routes_allows_duplicate_sources_and_matches_all(tmp_path: Path) ->
                     "name": "r1",
                     "source_channel_username": "@dup_src",
                     "destination_channel_username": "@dst1",
-                    "script": "s1.py",
+                    "channel_script": "s1.py",
                 },
                 {
                     "name": "r2",
                     "source_channel_username": "@dup_src",
                     "destination_channel_username": "@dst2",
-                    "script": "s2.py",
+                    "channel_script": "s2.py",
                 },
             ]
         ),
@@ -241,7 +241,7 @@ def test_load_routes_reads_sync_settings_and_allows_syncing_when_disabled(tmp_pa
                     "enabled": False,
                     "source_channel_id": "-1001",
                     "destination_channel_id": "-2001",
-                    "script": "s.py",
+                    "channel_script": "s.py",
                     "sync": {
                         "enabled": True,
                         "status": "syncing",
@@ -281,7 +281,7 @@ def test_load_routes_sync_active_but_not_seeded_treated_as_syncing(tmp_path: Pat
                     "enabled": True,
                     "source_channel_username": "@s2",
                     "destination_channel_id": "-2002",
-                    "script": "s2.py",
+                    "channel_script": "s2.py",
                     "sync": {
                         "enabled": True,
                         "status": "active",

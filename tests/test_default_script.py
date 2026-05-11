@@ -16,7 +16,7 @@ def _run_default(payload: dict, tmp_path: Path) -> dict:
     output_dir.mkdir()
     payload_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
 
-    script = Path(__file__).resolve().parents[1] / "scripts" / "channel_scripts" / "default_scripts.py"
+    script = Path(__file__).resolve().parents[1] / "scripts" / "channel_scripts" / "default_channel_script.py"
     env = os.environ.copy()
     env["SCRIPT_CLEAN_AI_ENABLED"] = "false"
     result = subprocess.run(
@@ -39,7 +39,7 @@ def _run_default(payload: dict, tmp_path: Path) -> dict:
 
 
 def _load_default_module():
-    script = Path(__file__).resolve().parents[1] / "scripts" / "channel_scripts" / "default_scripts.py"
+    script = Path(__file__).resolve().parents[1] / "scripts" / "channel_scripts" / "default_channel_script.py"
     spec = importlib.util.spec_from_file_location("kiwi_default_script_test_module", script)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)

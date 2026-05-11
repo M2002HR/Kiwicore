@@ -2,11 +2,15 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import sys
+import time
 from pathlib import Path
 
 from kiwi.errors import ScriptExecutionError
 from kiwi.types import ChannelRoute, OutputMessageKind, ScriptOutputMessage, ScriptRunResult
+
+logger = logging.getLogger(__name__)
 
 
 class ScriptRunner:
@@ -21,10 +25,26 @@ class ScriptRunner:
         payload_path: Path,
         input_dir: Path,
         output_dir: Path,
+        script_name: str | None = None,
+        stage_name: str = "script",
+        trace_id: str | None = None,
     ) -> ScriptRunResult:
-        script_path = self.scripts_dir / route.script
+        selected_script = script_name or route.channel_script
+        script_path = self.scripts_dir / selected_script
         if not script_path.exists():
-            raise ScriptExecutionError(f"Script not found: {script_path}")
+            logger.error(
+                "Script not found",
+                extra={
+                    "details": {
+                        "trace_id": trace_id,
+                        "stage": stage_name,
+                        "route": route.name,
+                        "script_name": selected_script,
+                        "script_path": str(script_path),
+                    }
+                },
+            )
+            raise ScriptExecutionError(f"{stage_name} not found: {script_path}")
 
         cmd = [
             sys.executable,
@@ -36,6 +56,22 @@ class ScriptRunner:
             "--output-dir",
             str(output_dir),
         ]
+        start = time.monotonic()
+        logger.info(
+            "Script execution started",
+            extra={
+                "details": {
+                    "trace_id": trace_id,
+                    "stage": stage_name,
+                    "route": route.name,
+                    "script_name": selected_script,
+                    "script_path": str(script_path),
+                    "payload_path": str(payload_path),
+                    "input_dir": str(input_dir),
+                    "output_dir": str(output_dir),
+                }
+            },
+        )
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
@@ -47,14 +83,45 @@ class ScriptRunner:
         except asyncio.TimeoutError:
             proc.kill()
             await proc.communicate()
-            raise ScriptExecutionError(f"Script timeout after {self.timeout_sec}s: {script_path.name}")
+            logger.error(
+                "Script execution timeout",
+                extra={
+                    "details": {
+                        "trace_id": trace_id,
+                        "stage": stage_name,
+                        "route": route.name,
+                        "script_name": selected_script,
+                        "timeout_sec": self.timeout_sec,
+                        "duration_ms": round((time.monotonic() - start) * 1000.0, 2),
+                    }
+                },
+            )
+            raise ScriptExecutionError(f"{stage_name} timeout after {self.timeout_sec}s: {script_path.name}")
 
         stdout = stdout_bytes.decode("utf-8", errors="replace").strip()
         stderr = stderr_bytes.decode("utf-8", errors="replace").strip()
+        duration_ms = round((time.monotonic() - start) * 1000.0, 2)
 
         if proc.returncode != 0:
+            logger.error(
+                "Script execution failed",
+                extra={
+                    "details": {
+                        "trace_id": trace_id,
+                        "stage": stage_name,
+                        "route": route.name,
+                        "script_name": selected_script,
+                        "return_code": proc.returncode,
+                        "duration_ms": duration_ms,
+                        "stdout_chars": len(stdout),
+                        "stderr_chars": len(stderr),
+                        "stdout_preview": _preview_text(stdout),
+                        "stderr_preview": _preview_text(stderr),
+                    }
+                },
+            )
             raise ScriptExecutionError(
-                f"Script failed (code={proc.returncode}): {script_path.name}\n"
+                f"{stage_name} failed (code={proc.returncode}): {script_path.name}\n"
                 f"stderr={stderr or '<empty>'}\nstdout={stdout or '<empty>'}"
             )
 
@@ -70,7 +137,30 @@ class ScriptRunner:
         if payload is not None:
             messages = _parse_messages(payload)
 
+        logger.info(
+            "Script execution completed",
+            extra={
+                "details": {
+                    "trace_id": trace_id,
+                    "stage": stage_name,
+                    "route": route.name,
+                    "script_name": selected_script,
+                    "return_code": proc.returncode,
+                    "duration_ms": duration_ms,
+                    "stdout_chars": len(stdout),
+                    "stderr_chars": len(stderr),
+                    "output_messages_count": len(messages),
+                }
+            },
+        )
         return ScriptRunResult(messages=messages, stdout=stdout, stderr=stderr)
+
+
+def _preview_text(value: str, *, limit: int = 300) -> str:
+    compact = " ".join(value.split())
+    if len(compact) <= limit:
+        return compact
+    return compact[: limit - 3] + "..."
 
 
 def _parse_output_json(text: str, source: str) -> dict:

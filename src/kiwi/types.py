@@ -61,9 +61,10 @@ class ChannelRoute:
     source_channel_username: str | None
     destination_channel_id: str | None
     destination_channel_username: str | None
-    script: str
+    channel_script: str
     max_message_mb: int | None
     gaurd_script: str = "default_guard.py"
+    final_script: str = "default_final_script.py"
     sync_enabled: bool = False
     sync_status: str = "active"
     sync_backfill_count: int = 100
@@ -86,6 +87,15 @@ class ChannelRoute:
             return False
         status = str(self.sync_status).strip().lower()
         return status == "syncing" or not bool(self.sync_seeded)
+
+    @property
+    def script(self) -> str:
+        # Backward compatibility for older call-sites/tests.
+        return self.channel_script
+
+    @script.setter
+    def script(self, value: str) -> None:
+        self.channel_script = value
 
 
 @dataclass(slots=True)

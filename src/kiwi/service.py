@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
@@ -32,6 +33,7 @@ class KiwiService:
         storage: StorageManager,
         guard_runner: GuardRunner,
         script_runner: ScriptRunner,
+        final_script_runner: ScriptRunner | None = None,
         state_store: StateStore,
         admin_handler: Any | None = None,
     ) -> None:
@@ -43,6 +45,7 @@ class KiwiService:
         self.storage = storage
         self.guard_runner = guard_runner
         self.script_runner = script_runner
+        self.final_script_runner = final_script_runner or script_runner
         self.state_store = state_store
         self.dispatcher = BaleDispatcher(self.bale_client)
         self.admin_handler = admin_handler
@@ -433,8 +436,33 @@ class KiwiService:
         attempts = max(0, int(retries)) + 1
         last_status = "failed"
         for idx in range(attempts):
+            logger.info(
+                "Sync retry attempt started",
+                extra={
+                    "details": {
+                        "route": route.name,
+                        "update_id": incoming.update_id,
+                        "message_id": incoming.message_id,
+                        "attempt": idx + 1,
+                        "attempts_total": attempts,
+                    }
+                },
+            )
             status = await self._process_route_message(incoming, route)
             last_status = status
+            logger.info(
+                "Sync retry attempt finished",
+                extra={
+                    "details": {
+                        "route": route.name,
+                        "update_id": incoming.update_id,
+                        "message_id": incoming.message_id,
+                        "attempt": idx + 1,
+                        "attempts_total": attempts,
+                        "status": status,
+                    }
+                },
+            )
             if status in {"ok", "blocked", "skipped"}:
                 return status
             if idx < attempts - 1:
@@ -468,6 +496,29 @@ class KiwiService:
             )
 
     async def _process_route_message(self, incoming: IncomingChannelMessage, route: ChannelRoute) -> str:
+        trace_id = self._build_trace_id(route, incoming)
+        started_at = time.monotonic()
+        stage_timings_ms: dict[str, float] = {}
+
+        logger.info(
+            "Route processing started",
+            extra={
+                "details": {
+                    "trace_id": trace_id,
+                    "route": route.name,
+                    "update_id": incoming.update_id,
+                    "message_id": incoming.message_id,
+                    "media_group_id": incoming.media_group_id,
+                    "source_channel_id": incoming.source_channel_id,
+                    "source_channel_username": incoming.source_channel_username,
+                    "media_count": len(incoming.medias),
+                    "channel_script": route.channel_script,
+                    "final_script": route.final_script,
+                    "gaurd_script": route.gaurd_script,
+                }
+            },
+        )
+
         paths = self.storage.prepare_message_paths(incoming)
         self.storage.write_raw_update(paths, incoming.raw)
 
@@ -485,7 +536,8 @@ class KiwiService:
                 "destination_channel_id": route.destination_channel_id,
                 "destination_channel_username": route.destination_channel_username,
                 "destination_target": route.destination_target(),
-                "script": route.script,
+                "channel_script": route.channel_script,
+                "final_script": route.final_script,
                 "sync": {
                     "enabled": route.sync_enabled,
                     "status": route.sync_status,
@@ -511,6 +563,7 @@ class KiwiService:
 
         downloaded_total = 0
         used_local_names: set[str] = set()
+        download_started = time.monotonic()
         try:
             for idx, media in enumerate(incoming.medias, start=1):
                 if media.kind == MediaKind.STICKER:
@@ -519,6 +572,7 @@ class KiwiService:
                         extra={
                             "details": {
                                 "route": route.name,
+                                "trace_id": trace_id,
                                 "source_channel_id": incoming.source_channel_id,
                                 "update_id": incoming.update_id,
                                 "file_id": media.file_id,
@@ -552,6 +606,24 @@ class KiwiService:
                 else:
                     downloaded = await self.telegram_client.download_file(file_path, target_path, max_bytes=remaining)
                 downloaded_total += downloaded
+                logger.info(
+                    "Media downloaded",
+                    extra={
+                        "details": {
+                            "trace_id": trace_id,
+                            "route": route.name,
+                            "update_id": incoming.update_id,
+                            "message_id": incoming.message_id,
+                            "media_index": idx,
+                            "kind": media.kind.value,
+                            "source": media.source or "bot_api",
+                            "bytes": downloaded,
+                            "local_path": str(target_path),
+                            "downloaded_total_bytes": downloaded_total,
+                            "max_total_bytes": max_total_bytes,
+                        }
+                    },
+                )
 
                 payload["inputs"].append(
                     {
@@ -569,13 +641,32 @@ class KiwiService:
             payload["downloaded_total_bytes"] = downloaded_total
             payload["max_total_bytes"] = max_total_bytes
             self.storage.write_payload(paths, payload)
+            stage_timings_ms["download"] = round((time.monotonic() - download_started) * 1000.0, 2)
+            logger.info(
+                "Inputs prepared for scripts",
+                extra={
+                    "details": {
+                        "trace_id": trace_id,
+                        "route": route.name,
+                        "payload_path": paths.payload_path,
+                        "input_dir": paths.input_dir,
+                        "output_dir": paths.output_dir,
+                        "inputs_count": len(payload["inputs"]),
+                        "downloaded_total_bytes": downloaded_total,
+                        "download_ms": stage_timings_ms["download"],
+                    }
+                },
+            )
 
+            guard_started = time.monotonic()
             is_allowed = await self.guard_runner.run(
                 route,
                 payload_path=Path(paths.payload_path),
                 input_dir=input_dir,
                 output_dir=output_dir,
+                trace_id=trace_id,
             )
+            stage_timings_ms["guard"] = round((time.monotonic() - guard_started) * 1000.0, 2)
             if not is_allowed:
                 block_reason = self.guard_runner.last_reason or f"guard_denied:{route.gaurd_script}"
                 await self._audit_log(
@@ -584,137 +675,363 @@ class KiwiService:
                     incoming=incoming,
                     route=route,
                     reason=block_reason,
+                    trace_id=trace_id,
+                    stage_timings_ms=stage_timings_ms,
                 )
                 logger.info(
                     "Message blocked by guard script",
                     extra={
                         "details": {
                             "route": route.name,
+                            "trace_id": trace_id,
                             "source_channel_id": incoming.source_channel_id,
                             "update_id": incoming.update_id,
                             "gaurd_script": route.gaurd_script,
+                            "guard_ms": stage_timings_ms["guard"],
+                            "reason": block_reason,
                         }
                     },
                 )
                 return "blocked"
+            await self._audit_log(
+                stage="guard",
+                status="ok",
+                incoming=incoming,
+                route=route,
+                reason=f"گارد عبور داد ({route.gaurd_script})",
+                trace_id=trace_id,
+                stage_timings_ms=stage_timings_ms,
+                stage_output={
+                    "token": self.guard_runner.last_token,
+                    "stdout": self.guard_runner.last_stdout,
+                    "stderr": self.guard_runner.last_stderr,
+                    "duration_ms": self.guard_runner.last_duration_ms,
+                },
+            )
 
+            channel_started = time.monotonic()
             run_result = await self.script_runner.run(
                 route,
                 payload_path=Path(paths.payload_path),
                 input_dir=input_dir,
                 output_dir=output_dir,
+                script_name=route.channel_script,
+                stage_name="channel_script",
+                trace_id=trace_id,
+            )
+            stage_timings_ms["channel_script"] = round((time.monotonic() - channel_started) * 1000.0, 2)
+            logger.info(
+                "Channel script completed",
+                extra={
+                    "details": {
+                        "trace_id": trace_id,
+                        "route": route.name,
+                        "channel_script": route.channel_script,
+                        "output_messages_count": len(run_result.messages),
+                        "stage_ms": stage_timings_ms["channel_script"],
+                    }
+                },
             )
 
             if not run_result.messages:
                 await self._audit_log(
-                    stage="script",
+                    stage="channel_script",
                     status="skipped",
                     incoming=incoming,
                     route=route,
-                    reason="اسکریپت خروجی نداشت",
+                    reason="خروجی channel script خالی بود",
+                    trace_id=trace_id,
+                    stage_timings_ms=stage_timings_ms,
                 )
                 logger.info(
-                    "Script generated no output messages",
+                    "Channel script generated no output messages",
                     extra={
                         "details": {
                             "route": route.name,
+                            "trace_id": trace_id,
                             "source_channel_id": incoming.source_channel_id,
                             "update_id": incoming.update_id,
+                            "channel_script": route.channel_script,
+                            "stage_ms": stage_timings_ms["channel_script"],
+                        }
+                    },
+                )
+                return "skipped"
+            await self._audit_log(
+                stage="channel_script",
+                status="ok",
+                incoming=incoming,
+                route=route,
+                reason=f"channel script اجرا شد ({len(run_result.messages)} پیام خروجی)",
+                trace_id=trace_id,
+                stage_timings_ms=stage_timings_ms,
+                stage_output={
+                    "stdout": run_result.stdout,
+                    "stderr": run_result.stderr,
+                    "messages": [self._script_message_to_dict(msg) for msg in run_result.messages],
+                },
+            )
+
+            final_payload_path = output_dir / "final_payload.json"
+            final_output_dir = output_dir / "final_stage"
+            final_output_dir.mkdir(parents=True, exist_ok=True)
+            final_payload = {
+                "route": payload["route"],
+                "message": payload["message"],
+                "messages": [self._script_message_to_dict(msg) for msg in run_result.messages],
+            }
+            final_payload_path.write_text(json.dumps(final_payload, ensure_ascii=False), encoding="utf-8")
+            logger.info(
+                "Final payload prepared",
+                extra={
+                    "details": {
+                        "trace_id": trace_id,
+                        "route": route.name,
+                        "final_payload_path": str(final_payload_path),
+                        "final_input_messages_count": len(run_result.messages),
+                    }
+                },
+            )
+
+            final_script_path = self.final_script_runner.scripts_dir / route.final_script
+            final_started = time.monotonic()
+            if final_script_path.exists():
+                final_result = await self.final_script_runner.run(
+                    route,
+                    payload_path=final_payload_path,
+                    input_dir=output_dir,
+                    output_dir=final_output_dir,
+                    script_name=route.final_script,
+                    stage_name="final_script",
+                    trace_id=trace_id,
+                )
+            else:
+                fallback_name = "default_final_script.py"
+                fallback_path = self.final_script_runner.scripts_dir / fallback_name
+                if fallback_path.exists():
+                    logger.warning(
+                        "Final script not found; using default final script",
+                        extra={
+                            "details": {
+                                "route": route.name,
+                                "trace_id": trace_id,
+                                "final_script": route.final_script,
+                                "missing_path": str(final_script_path),
+                                "fallback_script": fallback_name,
+                            }
+                        },
+                    )
+                    final_result = await self.final_script_runner.run(
+                        route,
+                        payload_path=final_payload_path,
+                        input_dir=output_dir,
+                        output_dir=final_output_dir,
+                        script_name=fallback_name,
+                        stage_name="final_script",
+                        trace_id=trace_id,
+                    )
+                else:
+                    logger.warning(
+                        "Final script not found; dispatching channel script output as-is",
+                        extra={
+                            "details": {
+                                "route": route.name,
+                                "trace_id": trace_id,
+                                "final_script": route.final_script,
+                                "missing_path": str(final_script_path),
+                            }
+                        },
+                    )
+                    final_result = run_result
+            stage_timings_ms["final_script"] = round((time.monotonic() - final_started) * 1000.0, 2)
+            logger.info(
+                "Final script stage completed",
+                extra={
+                    "details": {
+                        "trace_id": trace_id,
+                        "route": route.name,
+                        "final_script": route.final_script,
+                        "output_messages_count": len(final_result.messages),
+                        "stage_ms": stage_timings_ms["final_script"],
+                    }
+                },
+            )
+
+            if not final_result.messages:
+                await self._audit_log(
+                    stage="final_script",
+                    status="skipped",
+                    incoming=incoming,
+                    route=route,
+                    reason="خروجی final script خالی بود",
+                    trace_id=trace_id,
+                    stage_timings_ms=stage_timings_ms,
+                )
+                logger.info(
+                    "Final script generated no output messages",
+                    extra={
+                        "details": {
+                            "route": route.name,
+                            "trace_id": trace_id,
+                            "source_channel_id": incoming.source_channel_id,
+                            "update_id": incoming.update_id,
+                            "final_script": route.final_script,
+                            "stage_ms": stage_timings_ms["final_script"],
                         }
                     },
                 )
                 return "skipped"
 
+            await self._audit_log(
+                stage="final_script",
+                status="ok",
+                incoming=incoming,
+                route=route,
+                reason=f"فاینال‌اسکریپت اجرا شد ({len(final_result.messages)} پیام خروجی)",
+                trace_id=trace_id,
+                stage_timings_ms=stage_timings_ms,
+                stage_output={
+                    "stdout": final_result.stdout,
+                    "stderr": final_result.stderr,
+                    "messages": [self._script_message_to_dict(msg) for msg in final_result.messages],
+                },
+            )
+            (final_output_dir / "final_messages.json").write_text(
+                json.dumps(
+                    {"messages": [self._script_message_to_dict(msg) for msg in final_result.messages]},
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            dispatch_started = time.monotonic()
             await self.dispatcher.dispatch(
                 route.destination_target(),
-                run_result.messages,
-                output_dir=output_dir,
+                final_result.messages,
+                output_dir=final_output_dir,
                 input_dir=input_dir,
+                extra_input_dirs=[output_dir],
             )
+            stage_timings_ms["dispatch"] = round((time.monotonic() - dispatch_started) * 1000.0, 2)
+            stage_timings_ms["total"] = round((time.monotonic() - started_at) * 1000.0, 2)
             await self._audit_log(
                 stage="dispatch",
                 status="ok",
                 incoming=incoming,
                 route=route,
-                reason=f"ارسال شد ({len(run_result.messages)} پیام خروجی)",
+                reason=f"ارسال شد ({len(final_result.messages)} پیام خروجی)",
+                trace_id=trace_id,
+                stage_timings_ms=stage_timings_ms,
+            )
+            logger.info(
+                "Route processing completed",
+                extra={
+                    "details": {
+                        "trace_id": trace_id,
+                        "route": route.name,
+                        "status": "ok",
+                        "timings_ms": stage_timings_ms,
+                        "output_messages_count": len(final_result.messages),
+                    }
+                },
             )
             return "ok"
 
         except MessageTooLargeError as exc:
+            stage_timings_ms["total"] = round((time.monotonic() - started_at) * 1000.0, 2)
             await self._audit_log(
                 stage="download",
                 status="failed",
                 incoming=incoming,
                 route=route,
                 reason=f"حجم پیام از حد مجاز بیشتر بود: {exc}",
+                trace_id=trace_id,
+                stage_timings_ms=stage_timings_ms,
             )
             logger.warning(
                 "Message skipped: size limit exceeded",
                 extra={
                     "details": {
                         "route": route.name,
+                        "trace_id": trace_id,
                         "source_channel_id": incoming.source_channel_id,
                         "update_id": incoming.update_id,
                         "max_mb": max_mb,
                         "error": str(exc),
+                        "timings_ms": stage_timings_ms,
                     }
                 },
             )
             return "failed"
         except ScriptExecutionError:
+            stage_timings_ms["total"] = round((time.monotonic() - started_at) * 1000.0, 2)
             await self._audit_log(
-                stage="script",
+                stage="processing",
                 status="failed",
                 incoming=incoming,
                 route=route,
-                reason="اجرای اسکریپت خطا داد",
+                reason="اجرای channel/final script خطا داد",
+                trace_id=trace_id,
+                stage_timings_ms=stage_timings_ms,
             )
             logger.exception(
                 "Script execution failed",
                 extra={
                     "details": {
                         "route": route.name,
+                        "trace_id": trace_id,
                         "source_channel_id": incoming.source_channel_id,
                         "update_id": incoming.update_id,
+                        "timings_ms": stage_timings_ms,
                     }
                 },
             )
             return "failed"
         except GuardExecutionError:
+            stage_timings_ms["total"] = round((time.monotonic() - started_at) * 1000.0, 2)
             await self._audit_log(
                 stage="guard",
                 status="failed",
                 incoming=incoming,
                 route=route,
                 reason=f"اجرای گارد خطا داد ({route.gaurd_script})",
+                trace_id=trace_id,
+                stage_timings_ms=stage_timings_ms,
             )
             logger.exception(
                 "Guard script execution failed",
                 extra={
                     "details": {
                         "route": route.name,
+                        "trace_id": trace_id,
                         "source_channel_id": incoming.source_channel_id,
                         "update_id": incoming.update_id,
                         "gaurd_script": route.gaurd_script,
+                        "timings_ms": stage_timings_ms,
                     }
                 },
             )
             return "failed"
         except Exception:
+            stage_timings_ms["total"] = round((time.monotonic() - started_at) * 1000.0, 2)
             await self._audit_log(
                 stage="processing",
                 status="failed",
                 incoming=incoming,
                 route=route,
                 reason="خطای غیرمنتظره در پردازش",
+                trace_id=trace_id,
+                stage_timings_ms=stage_timings_ms,
             )
             logger.exception(
                 "Unexpected error in route processing",
                 extra={
                     "details": {
                         "route": route.name,
+                        "trace_id": trace_id,
                         "source_channel_id": incoming.source_channel_id,
                         "update_id": incoming.update_id,
+                        "timings_ms": stage_timings_ms,
                     }
                 },
             )
@@ -805,11 +1122,16 @@ class KiwiService:
         incoming: IncomingChannelMessage | None = None,
         route: ChannelRoute | None = None,
         reason: str | None = None,
+        trace_id: str | None = None,
+        stage_timings_ms: dict[str, float] | None = None,
+        stage_output: object | None = None,
     ) -> None:
+        stage_output_text = self._format_stage_output(stage_output)
         logger.info(
             "audit_event",
             extra={
                 "details": {
+                    "trace_id": trace_id,
                     "stage": stage,
                     "status": status,
                     "reason": reason,
@@ -820,6 +1142,8 @@ class KiwiService:
                     "update_id": incoming.update_id if incoming else None,
                     "media_group_id": incoming.media_group_id if incoming else None,
                     "media_count": len(incoming.medias) if incoming else None,
+                    "timings_ms": stage_timings_ms or {},
+                    "stage_output": stage_output_text,
                 }
             },
         )
@@ -834,6 +1158,8 @@ class KiwiService:
             "dispatch": "ارسال به مقصد",
             "guard": "بررسی گارد",
             "script": "اجرای اسکریپت",
+            "channel_script": "اجرای channel script",
+            "final_script": "اجرای final script",
             "download": "دانلود فایل",
             "processing": "پردازش پیام",
             "route_match": "تطبیق مسیر",
@@ -856,6 +1182,7 @@ class KiwiService:
                 [
                     f"update_id: {incoming.update_id}",
                     f"message_id: {incoming.message_id}",
+                    f"trace_id: {trace_id or '-'}",
                     f"مبدا: {incoming.source_channel_username or incoming.source_channel_id}",
                     f"تعداد مدیا: {len(incoming.medias)}",
                 ]
@@ -867,6 +1194,10 @@ class KiwiService:
                 lines.append(f"media_group_id: {incoming.media_group_id}")
         if reason:
             lines.append(f"توضیح: {reason}")
+        if stage_timings_ms:
+            lines.append(f"timings_ms: {json.dumps(stage_timings_ms, ensure_ascii=False)}")
+        if stage_output_text:
+            lines.append(f"stage_output: {stage_output_text}")
 
         message = "\n".join(lines)
         if len(message) > 3900:
@@ -887,6 +1218,24 @@ class KiwiService:
             )
 
     @staticmethod
+    def _format_stage_output(stage_output: object, *, limit: int = 2500) -> str | None:
+        if stage_output is None:
+            return None
+        try:
+            if isinstance(stage_output, str):
+                raw = stage_output
+            else:
+                raw = json.dumps(stage_output, ensure_ascii=False)
+        except Exception:
+            raw = str(stage_output)
+        compact = " ".join(raw.split())
+        if not compact:
+            return None
+        if len(compact) <= limit:
+            return compact
+        return compact[: limit - 3] + "..."
+
+    @staticmethod
     def _source_message_link(incoming: IncomingChannelMessage) -> str | None:
         message_id = int(incoming.message_id or 0)
         if message_id <= 0:
@@ -900,6 +1249,11 @@ class KiwiService:
         if channel_id.startswith("-100") and channel_id[4:].isdigit():
             return f"https://t.me/c/{channel_id[4:]}/{message_id}"
         return None
+
+    @staticmethod
+    def _build_trace_id(route: ChannelRoute, incoming: IncomingChannelMessage) -> str:
+        group = incoming.media_group_id or "-"
+        return f"{route.name}:{incoming.update_id}:{incoming.message_id}:{group}"
 
     @staticmethod
     def _merge_group_messages(messages: list[IncomingChannelMessage]) -> IncomingChannelMessage:
@@ -927,6 +1281,17 @@ class KiwiService:
             raw={"group_updates": raw_updates},
             media_group_id=first.media_group_id,
         )
+
+    @staticmethod
+    def _script_message_to_dict(msg) -> dict:
+        out: dict[str, object] = {"type": msg.type.value}
+        if msg.text:
+            out["text"] = msg.text
+        if msg.path:
+            out["path"] = msg.path
+        if msg.caption:
+            out["caption"] = msg.caption
+        return out
 
     @staticmethod
     def _preferred_local_name(media: IncomingMedia, *, file_path: str, idx: int) -> str:

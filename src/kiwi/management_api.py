@@ -15,11 +15,13 @@ class ManagementApi:
         channels_config_path: str,
         scripts_dir: str,
         gaurd_scripts_dir: str,
+        final_scripts_dir: str | None = None,
         on_routes_reloaded: Callable[[RouteRegistry], None],
     ) -> None:
         self.channels_path = Path(channels_config_path)
         self.scripts_dir = Path(scripts_dir)
         self.guards_dir = Path(gaurd_scripts_dir)
+        self.final_scripts_dir = Path(final_scripts_dir or scripts_dir)
         self.on_routes_reloaded = on_routes_reloaded
         self.channels_path.parent.mkdir(parents=True, exist_ok=True)
         if not self.channels_path.exists():
@@ -31,6 +33,7 @@ class ManagementApi:
     def add_route(self, route_obj: dict) -> dict:
         if not isinstance(route_obj, dict):
             raise ValueError("route payload must be object")
+        route_obj = self._normalize_route_payload(route_obj)
         routes = self._load_routes_raw()
         name = str(route_obj.get("name") or "").strip()
         if not name:
@@ -44,6 +47,7 @@ class ManagementApi:
     def update_route(self, name: str, patch: dict) -> dict:
         if not isinstance(patch, dict):
             raise ValueError("patch must be object")
+        patch = self._normalize_route_payload(patch)
         routes = self._load_routes_raw()
         for idx, item in enumerate(routes):
             if str(item.get("name") or "").strip() != name:
@@ -99,8 +103,15 @@ class ManagementApi:
     def stop_route_sync(self, name: str) -> dict:
         return self.update_route_sync(name, {"enabled": False, "status": "active"})
 
-    def list_script_files(self) -> list[str]:
+    def list_channel_script_files(self) -> list[str]:
         return sorted(p.name for p in self.scripts_dir.glob("*.py") if p.is_file())
+
+    def list_script_files(self) -> list[str]:
+        # Backward compatibility with older call-sites.
+        return self.list_channel_script_files()
+
+    def list_final_script_files(self) -> list[str]:
+        return sorted(p.name for p in self.final_scripts_dir.glob("*.py") if p.is_file())
 
     def list_guard_files(self) -> list[str]:
         return sorted(p.name for p in self.guards_dir.glob("*.py") if p.is_file())
@@ -121,4 +132,12 @@ class ManagementApi:
         for item in raw:
             if isinstance(item, dict):
                 out.append(item)
+        return out
+
+    @staticmethod
+    def _normalize_route_payload(obj: dict) -> dict:
+        out = dict(obj)
+        if "channel_script" not in out and "script" in out:
+            out["channel_script"] = out.get("script")
+        out.pop("script", None)
         return out

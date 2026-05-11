@@ -25,12 +25,19 @@ class BaleDispatcher:
         *,
         output_dir: Path,
         input_dir: Path,
+        extra_input_dirs: list[Path] | None = None,
     ) -> None:
         idx = 0
         while idx < len(messages):
             current = messages[idx]
             if current.type not in self.MEDIA_GROUP_TYPES:
-                await self._send_one(destination_target, current, output_dir=output_dir, input_dir=input_dir)
+                await self._send_one(
+                    destination_target,
+                    current,
+                    output_dir=output_dir,
+                    input_dir=input_dir,
+                    extra_input_dirs=extra_input_dirs,
+                )
                 idx += 1
                 continue
 
@@ -46,13 +53,24 @@ class BaleDispatcher:
                 j += 1
 
             if len(group) < 2:
-                await self._send_one(destination_target, current, output_dir=output_dir, input_dir=input_dir)
+                await self._send_one(
+                    destination_target,
+                    current,
+                    output_dir=output_dir,
+                    input_dir=input_dir,
+                    extra_input_dirs=extra_input_dirs,
+                )
                 idx = j
                 continue
 
             media_group = []
             for item in group:
-                path = self._resolve_path(item.path or "", output_dir=output_dir, input_dir=input_dir)
+                path = self._resolve_path(
+                    item.path or "",
+                    output_dir=output_dir,
+                    input_dir=input_dir,
+                    extra_input_dirs=extra_input_dirs,
+                )
                 media_group.append({"type": item.type.value, "path": path, "caption": item.caption})
 
             try:
@@ -67,6 +85,7 @@ class BaleDispatcher:
                             item,
                             output_dir=output_dir,
                             input_dir=input_dir,
+                            extra_input_dirs=extra_input_dirs,
                         ) or sent_any
                     except PlatformApiError as exc:
                         last_error = exc
@@ -82,12 +101,18 @@ class BaleDispatcher:
         *,
         output_dir: Path,
         input_dir: Path,
+        extra_input_dirs: list[Path] | None = None,
     ) -> bool:
         if message.type == OutputMessageKind.TEXT:
             await self.bale_client.send_message(destination_target, message.text or "")
             return True
 
-        path = self._resolve_path(message.path or "", output_dir=output_dir, input_dir=input_dir)
+        path = self._resolve_path(
+            message.path or "",
+            output_dir=output_dir,
+            input_dir=input_dir,
+            extra_input_dirs=extra_input_dirs,
+        )
 
         if message.type == OutputMessageKind.PHOTO:
             return await self._send_with_document_fallback(
@@ -137,7 +162,13 @@ class BaleDispatcher:
         raise ValueError(f"Unsupported output message type: {message.type}")
 
     @staticmethod
-    def _resolve_path(value: str, *, output_dir: Path, input_dir: Path) -> Path:
+    def _resolve_path(
+        value: str,
+        *,
+        output_dir: Path,
+        input_dir: Path,
+        extra_input_dirs: list[Path] | None = None,
+    ) -> Path:
         candidate = Path(value)
         if candidate.is_absolute():
             resolved = candidate
@@ -146,7 +177,16 @@ class BaleDispatcher:
             if out_path.exists():
                 resolved = out_path
             else:
-                resolved = input_dir / candidate
+                in_path = input_dir / candidate
+                if in_path.exists():
+                    resolved = in_path
+                else:
+                    resolved = in_path
+                    for extra_dir in extra_input_dirs or []:
+                        extra_path = extra_dir / candidate
+                        if extra_path.exists():
+                            resolved = extra_path
+                            break
 
         if not resolved.exists():
             raise FileNotFoundError(str(resolved))

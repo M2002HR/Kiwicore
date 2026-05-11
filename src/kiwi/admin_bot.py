@@ -18,6 +18,7 @@ BTN_ADD_ROUTE = "➕ افزودن مسیر"
 BTN_EDIT_ROUTE = "✏️ ویرایش مسیر"
 BTN_DEL_ROUTE = "🗑 حذف مسیر"
 BTN_SCRIPTS = "🧩 لیست اسکریپت‌ها"
+BTN_FINAL_SCRIPTS = "✨ لیست فاینال‌اسکریپت‌ها"
 BTN_GUARDS = "🛡 لیست گاردها"
 BTN_ADMINS = "👤 مدیریت ادمین‌ها"
 BTN_RELOAD = "♻️ ریلود مسیرها"
@@ -38,6 +39,7 @@ BTN_MAX_200 = "۲۰۰"
 BTN_MAX_NONE = "نامحدود"
 
 BTN_EDIT_SCRIPT = "🧩 اسکریپت"
+BTN_EDIT_FINAL_SCRIPT = "✨ فاینال‌اسکریپت"
 BTN_EDIT_GUARD = "🛡 گارد"
 BTN_EDIT_MAX = "📦 حداکثر حجم"
 BTN_EDIT_DEST_ID = "🎯 مقصد با شناسه"
@@ -115,7 +117,9 @@ class AdminBotHandler:
             self.admin_store.set_flow(inbound.user_id, "route_delete_pick", {"stage": "pick"})
             return AdminBotResponse("نام مسیر برای حذف را بزن یا بنویس.", self._route_names_keyboard(include_back=True))
         if text == BTN_SCRIPTS:
-            return AdminBotResponse(self._list_lines("اسکریپت‌ها", self.management_api.list_script_files()), self._main_menu_keyboard())
+            return AdminBotResponse(self._list_lines("اسکریپت‌های کانال", self.management_api.list_channel_script_files()), self._main_menu_keyboard())
+        if text == BTN_FINAL_SCRIPTS:
+            return AdminBotResponse(self._list_lines("فاینال‌اسکریپت‌ها", self.management_api.list_final_script_files()), self._main_menu_keyboard())
         if text == BTN_GUARDS:
             return AdminBotResponse(self._list_lines("گاردها", self.management_api.list_guard_files()), self._main_menu_keyboard())
         if text == BTN_RELOAD:
@@ -227,15 +231,26 @@ class AdminBotHandler:
             new_route[field] = text.strip()
             flow_data["new_route"] = new_route
             self.admin_store.set_flow(inbound.user_id, "route_add_script", flow_data)
-            return AdminBotResponse("اسکریپت را انتخاب کن.", self._scripts_keyboard())
+            return AdminBotResponse("اسکریپت کانال را انتخاب کن.", self._channel_scripts_keyboard())
 
         if flow == "route_add_script":
-            scripts = self.management_api.list_script_files()
+            scripts = self.management_api.list_channel_script_files()
             if text not in scripts:
-                return AdminBotResponse("اسکریپت معتبر انتخاب کن.", self._scripts_keyboard())
+                return AdminBotResponse("اسکریپت کانال معتبر انتخاب کن.", self._channel_scripts_keyboard())
             flow_data = dict(session.get("flow_data") or {})
             new_route = dict(flow_data.get("new_route") or {})
-            new_route["script"] = text
+            new_route["channel_script"] = text
+            flow_data["new_route"] = new_route
+            self.admin_store.set_flow(inbound.user_id, "route_add_final_script", flow_data)
+            return AdminBotResponse("فاینال‌اسکریپت را انتخاب کن.", self._final_scripts_keyboard())
+
+        if flow == "route_add_final_script":
+            scripts = self.management_api.list_final_script_files()
+            if text not in scripts:
+                return AdminBotResponse("فاینال‌اسکریپت معتبر انتخاب کن.", self._final_scripts_keyboard())
+            flow_data = dict(session.get("flow_data") or {})
+            new_route = dict(flow_data.get("new_route") or {})
+            new_route["final_script"] = text
             flow_data["new_route"] = new_route
             self.admin_store.set_flow(inbound.user_id, "route_add_guard", flow_data)
             return AdminBotResponse("گارد را انتخاب کن.", self._guards_keyboard())
@@ -379,7 +394,10 @@ class AdminBotHandler:
 
             if text == BTN_EDIT_SCRIPT:
                 self.admin_store.set_flow(inbound.user_id, "route_edit_script", flow_data)
-                return AdminBotResponse("اسکریپت جدید را انتخاب کن.", self._scripts_keyboard())
+                return AdminBotResponse("اسکریپت کانال جدید را انتخاب کن.", self._channel_scripts_keyboard())
+            if text == BTN_EDIT_FINAL_SCRIPT:
+                self.admin_store.set_flow(inbound.user_id, "route_edit_final_script", flow_data)
+                return AdminBotResponse("فاینال‌اسکریپت جدید را انتخاب کن.", self._final_scripts_keyboard())
             if text == BTN_EDIT_GUARD:
                 self.admin_store.set_flow(inbound.user_id, "route_edit_guard", flow_data)
                 return AdminBotResponse("گارد جدید را انتخاب کن.", self._guards_keyboard())
@@ -440,12 +458,24 @@ class AdminBotHandler:
             route_name = str(flow_data.get("route_name") or "")
             if not route_name:
                 raise ValueError("اطلاعات ویرایش ناقص است")
-            scripts = self.management_api.list_script_files()
+            scripts = self.management_api.list_channel_script_files()
             if text not in scripts:
-                return AdminBotResponse("اسکریپت معتبر انتخاب کن.", self._scripts_keyboard())
-            self.management_api.update_route(route_name, {"script": text})
+                return AdminBotResponse("اسکریپت کانال معتبر انتخاب کن.", self._channel_scripts_keyboard())
+            self.management_api.update_route(route_name, {"channel_script": text})
             self.admin_store.set_flow(inbound.user_id, None, {})
-            return AdminBotResponse("اسکریپت مسیر ویرایش شد.", self._main_menu_keyboard())
+            return AdminBotResponse("اسکریپت کانال مسیر ویرایش شد.", self._main_menu_keyboard())
+
+        if flow == "route_edit_final_script":
+            flow_data = dict(session.get("flow_data") or {})
+            route_name = str(flow_data.get("route_name") or "")
+            if not route_name:
+                raise ValueError("اطلاعات ویرایش ناقص است")
+            scripts = self.management_api.list_final_script_files()
+            if text not in scripts:
+                return AdminBotResponse("فاینال‌اسکریپت معتبر انتخاب کن.", self._final_scripts_keyboard())
+            self.management_api.update_route(route_name, {"final_script": text})
+            self.admin_store.set_flow(inbound.user_id, None, {})
+            return AdminBotResponse("فاینال‌اسکریپت مسیر ویرایش شد.", self._main_menu_keyboard())
 
         if flow == "route_edit_guard":
             flow_data = dict(session.get("flow_data") or {})
@@ -596,7 +626,9 @@ class AdminBotHandler:
         if text.startswith("/routes"):
             return AdminBotResponse(self._routes_text(), self._main_menu_keyboard())
         if text.startswith("/scripts"):
-            return AdminBotResponse(self._list_lines("اسکریپت‌ها", self.management_api.list_script_files()), self._main_menu_keyboard())
+            return AdminBotResponse(self._list_lines("اسکریپت‌های کانال", self.management_api.list_channel_script_files()), self._main_menu_keyboard())
+        if text.startswith("/final_scripts"):
+            return AdminBotResponse(self._list_lines("فاینال‌اسکریپت‌ها", self.management_api.list_final_script_files()), self._main_menu_keyboard())
         if text.startswith("/guards"):
             return AdminBotResponse(self._list_lines("گاردها", self.management_api.list_guard_files()), self._main_menu_keyboard())
         if text.startswith("/admins"):
@@ -658,7 +690,9 @@ class AdminBotHandler:
                 f"{idx}. {r.get('name','-')} | enabled={bool(r.get('enabled', True))} | "
                 f"src={r.get('source_channel_username') or r.get('source_channel_id')} | "
                 f"dst={r.get('destination_channel_username') or r.get('destination_channel_id')} | "
-                f"script={r.get('script') or '-'} | guard={r.get('gaurd_script') or 'default_guard.py'} | "
+                f"channel_script={r.get('channel_script') or r.get('script') or '-'} | "
+                f"final_script={r.get('final_script') or 'default_final_script.py'} | "
+                f"guard={r.get('gaurd_script') or 'default_guard.py'} | "
                 f"max_mb={r.get('max_message_mb') if r.get('max_message_mb') is not None else '-'} | "
                 f"sync={sync_status if sync_enabled else 'off'} | pending={sync_pending}"
             )
@@ -672,7 +706,7 @@ class AdminBotHandler:
             "2) از منوی دکمه‌ای مسیرها/ادمین‌ها را مدیریت کن.\n"
             "3) /logout برای خروج.\n\n"
             "دستورات پیشرفته:\n"
-            "/routes /scripts /guards /admins\n"
+            "/routes /scripts /final_scripts /guards /admins\n"
             "/route_add <json>\n"
             "/route_update <name> <json_patch>\n"
             "/route_delete <name>\n"
@@ -742,7 +776,8 @@ class AdminBotHandler:
             [
                 [BTN_LIST_ROUTES, BTN_ADD_ROUTE],
                 [BTN_EDIT_ROUTE, BTN_DEL_ROUTE],
-                [BTN_SCRIPTS, BTN_GUARDS],
+                [BTN_SCRIPTS, BTN_FINAL_SCRIPTS],
+                [BTN_GUARDS],
                 [BTN_ADMINS, BTN_RELOAD],
                 [BTN_LOGOUT],
             ]
@@ -762,11 +797,21 @@ class AdminBotHandler:
     def _dest_type_keyboard(self) -> dict:
         return self._reply_keyboard([[BTN_DST_ID, BTN_DST_USER], [BTN_CANCEL]])
 
-    def _scripts_keyboard(self) -> dict:
-        items = self.management_api.list_script_files()
+    def _channel_scripts_keyboard(self) -> dict:
+        items = self.management_api.list_channel_script_files()
         rows = [[name] for name in items]
         rows.append([BTN_CANCEL])
         return self._reply_keyboard(rows)
+
+    def _final_scripts_keyboard(self) -> dict:
+        items = self.management_api.list_final_script_files()
+        rows = [[name] for name in items]
+        rows.append([BTN_CANCEL])
+        return self._reply_keyboard(rows)
+
+    def _scripts_keyboard(self) -> dict:
+        # Backward compatibility with existing tests/helpers.
+        return self._channel_scripts_keyboard()
 
     def _guards_keyboard(self) -> dict:
         items = self.management_api.list_guard_files()
@@ -796,7 +841,8 @@ class AdminBotHandler:
     def _route_edit_fields_keyboard(self) -> dict:
         return self._reply_keyboard(
             [
-                [BTN_EDIT_SCRIPT, BTN_EDIT_GUARD],
+                [BTN_EDIT_SCRIPT, BTN_EDIT_FINAL_SCRIPT],
+                [BTN_EDIT_GUARD],
                 [BTN_EDIT_MAX, BTN_EDIT_ENABLED],
                 [BTN_EDIT_SRC_ID],
                 [BTN_EDIT_SRC_USER],

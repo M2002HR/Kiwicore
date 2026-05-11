@@ -311,7 +311,7 @@ def _call_gemini_text(*, endpoint: str, body: dict, timeout_sec: float) -> str |
     try:
         with opener.open(req, timeout=timeout_sec) as resp:
             raw = resp.read().decode("utf-8", errors="replace")
-    except urllib.error.URLError:
+    except Exception:
         return None
 
     try:

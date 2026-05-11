@@ -131,6 +131,14 @@ def _settings(tmp_path: Path, default_max_mb: int = 50) -> Settings:
     gaurd_dir = tmp_path / "gaurds"
     gaurd_dir.mkdir(parents=True, exist_ok=True)
     (gaurd_dir / "default_guard.py").write_text("print('true')", encoding="utf-8")
+    final_dir = tmp_path / "final_scripts"
+    final_dir.mkdir(parents=True, exist_ok=True)
+    (final_dir / "default_final_script.py").write_text(
+        "import json; import argparse; from pathlib import Path; "
+        "p=argparse.ArgumentParser(); p.add_argument('--payload', required=True); p.add_argument('--input-dir', required=True); p.add_argument('--output-dir', required=True); "
+        "a=p.parse_args(); payload=json.loads(Path(a.payload).read_text(encoding='utf-8')); print(json.dumps({'messages': payload.get('messages', [])}))",
+        encoding="utf-8",
+    )
 
     return Settings(
         app_env="test",
@@ -150,11 +158,13 @@ def _settings(tmp_path: Path, default_max_mb: int = 50) -> Settings:
         channels_config_path=str(tmp_path / "channels.json"),
         scripts_dir=str(tmp_path / "scripts"),
         gaurd_scripts_dir=str(gaurd_dir),
+        final_scripts_dir=str(final_dir),
         storage_dir=str(tmp_path / "storage"),
         state_path=str(tmp_path / "storage" / "state.json"),
         default_max_message_mb=default_max_mb,
         script_timeout_sec=5,
         gaurd_script_timeout_sec=5,
+        final_script_timeout_sec=5,
         poll_idle_sleep_sec=0.01,
         poll_error_sleep_sec=0.01,
         log_channel_target=None,
@@ -223,7 +233,7 @@ print(json.dumps({'messages': [{'type': 'text', 'text': 'OUT:' + text}]}))
         source_channel_username="@srcchan",
         destination_channel_id="-2001",
         destination_channel_username=None,
-        script="-1001.py",
+        channel_script="-1001.py",
         max_message_mb=10,
     )
 
@@ -270,7 +280,7 @@ print(json.dumps({"messages":[{"type":"text","text":"from-telethon"}]}))
         source_channel_username="@srcchan",
         destination_channel_id="-2001",
         destination_channel_username=None,
-        script="script.py",
+        channel_script="script.py",
         max_message_mb=10,
     )
     incoming = IncomingChannelMessage(
@@ -343,7 +353,7 @@ print(json.dumps({'messages': [{'type': 'text', 'text': 'OUT:' + text}]}))
         source_channel_username="@srcchan",
         destination_channel_id="-2001",
         destination_channel_username=None,
-        script="fanout.py",
+        channel_script="fanout.py",
         max_message_mb=10,
     )
     route2 = ChannelRoute(
@@ -353,7 +363,7 @@ print(json.dumps({'messages': [{'type': 'text', 'text': 'OUT:' + text}]}))
         source_channel_username="@srcchan",
         destination_channel_id="-2002",
         destination_channel_username=None,
-        script="fanout.py",
+        channel_script="fanout.py",
         max_message_mb=10,
     )
 
@@ -397,7 +407,7 @@ def test_service_flow_skips_large_message(tmp_path: Path) -> None:
         source_channel_username=None,
         destination_channel_id="-2001",
         destination_channel_username=None,
-        script="-1001.py",
+        channel_script="-1001.py",
         max_message_mb=1,
     )
 
@@ -443,7 +453,7 @@ def test_service_flow_skips_sticker_media(tmp_path: Path) -> None:
         source_channel_username=None,
         destination_channel_id="-2001",
         destination_channel_username=None,
-        script="-1001.py",
+        channel_script="-1001.py",
         max_message_mb=10,
     )
     tg = FakeTelegramClient([update], b"abc")
@@ -490,7 +500,7 @@ def test_service_flow_blocks_message_when_guard_denies(tmp_path: Path) -> None:
         source_channel_username="@srcchan",
         destination_channel_id="-2001",
         destination_channel_username=None,
-        script="-1001.py",
+        channel_script="-1001.py",
         max_message_mb=10,
         gaurd_script="deny.py",
     )
@@ -553,7 +563,7 @@ print(json.dumps({'messages': [{'type': 'document', 'path': local_name}]}))
         source_channel_username=None,
         destination_channel_id="-2001",
         destination_channel_username=None,
-        script="-1001.py",
+        channel_script="-1001.py",
         max_message_mb=10,
     )
     tg = FakeTelegramClient([update], b"abc")
@@ -623,7 +633,7 @@ print(json.dumps({'messages': [{'type': 'text', 'text': f'COUNT:{count}'}]}))
         source_channel_username=None,
         destination_channel_id="-2001",
         destination_channel_username=None,
-        script="-1001.py",
+        channel_script="-1001.py",
         max_message_mb=10,
     )
     tg = FakeTelegramClient(updates, b"x")
@@ -709,7 +719,7 @@ print(json.dumps({'messages': [{'type': 'text', 'text': f\"COUNT:{len(payload.ge
         source_channel_username=None,
         destination_channel_id="-2001",
         destination_channel_username=None,
-        script="-1001.py",
+        channel_script="-1001.py",
         max_message_mb=10,
     )
     tg = SplitPollTelegramClient([updates1, updates2], b"x")
@@ -759,7 +769,7 @@ def test_service_sends_audit_logs_to_telegram_channel(tmp_path: Path) -> None:
         source_channel_username="@srcchan",
         destination_channel_id="-2001",
         destination_channel_username=None,
-        script="-1001.py",
+        channel_script="-1001.py",
         max_message_mb=10,
     )
     tg = FakeTelegramClient([update], b"")
@@ -793,7 +803,7 @@ def test_service_handles_admin_private_commands(tmp_path: Path) -> None:
     (guards_dir / "default_guard.py").write_text("print('true')", encoding="utf-8")
     channels_path = tmp_path / "channels.json"
     channels_path.write_text(
-        '[{"name":"r1","enabled":true,"source_channel_id":"-1001","destination_channel_id":"-2001","script":"-1001.py","gaurd_script":"default_guard.py"}]',
+        '[{"name":"r1","enabled":true,"source_channel_id":"-1001","destination_channel_id":"-2001","channel_script":"-1001.py","gaurd_script":"default_guard.py"}]',
         encoding="utf-8",
     )
 
@@ -823,7 +833,7 @@ def test_service_handles_admin_private_commands(tmp_path: Path) -> None:
                 source_channel_username=None,
                 destination_channel_id="-2001",
                 destination_channel_username=None,
-                script="-1001.py",
+                channel_script="-1001.py",
                 max_message_mb=10,
             )
         ),
@@ -882,7 +892,7 @@ print(json.dumps({'messages': [{'type': 'text', 'text': 'SYNC:' + text}]}))
                     "enabled": False,
                     "source_channel_id": "-1001",
                     "destination_channel_id": "-2001",
-                    "script": "sync.py",
+                    "channel_script": "sync.py",
                     "gaurd_script": "default_guard.py",
                     "sync": {
                         "enabled": True,
@@ -948,7 +958,7 @@ def test_service_syncing_retries_non_guard_failures(tmp_path: Path) -> None:
                     "enabled": True,
                     "source_channel_id": "-1001",
                     "destination_channel_id": "-2001",
-                    "script": "-1001.py",
+                    "channel_script": "-1001.py",
                     "gaurd_script": "default_guard.py",
                     "sync": {
                         "enabled": True,
@@ -1041,7 +1051,7 @@ print(json.dumps({'messages': [{'type': 'text', 'text': 'SYNC:' + text}]}))
                     "enabled": True,
                     "source_channel_username": "@stored_src",
                     "destination_channel_id": "-2001",
-                    "script": "sync.py",
+                    "channel_script": "sync.py",
                     "gaurd_script": "default_guard.py",
                     "sync": {
                         "enabled": True,
@@ -1142,7 +1152,7 @@ print(json.dumps({'messages': [{'type': 'text', 'text': 'SYNC:' + text}]}))
                     "enabled": True,
                     "source_channel_username": "@stored_src",
                     "destination_channel_id": "-2001",
-                    "script": "sync.py",
+                    "channel_script": "sync.py",
                     "gaurd_script": "default_guard.py",
                     "sync": {
                         "enabled": True,
@@ -1253,7 +1263,7 @@ def test_service_run_retries_after_poll_error(tmp_path: Path) -> None:
         source_channel_username=None,
         destination_channel_id="-2001",
         destination_channel_username=None,
-        script="-1001.py",
+        channel_script="-1001.py",
         max_message_mb=1,
     )
     scripts_dir = tmp_path / "scripts"
@@ -1281,3 +1291,63 @@ def test_service_run_retries_after_poll_error(tmp_path: Path) -> None:
 
     asyncio.run(_run_for_a_moment())
     assert tg.calls >= 2
+
+
+def test_service_logs_each_stage_with_stage_output(tmp_path: Path) -> None:
+    scripts_dir = tmp_path / "scripts"
+    scripts_dir.mkdir()
+    (scripts_dir / "stage_script.py").write_text(
+        """
+import json
+print(json.dumps({"messages":[{"type":"text","text":"sample out"}]}))
+""".strip(),
+        encoding="utf-8",
+    )
+
+    update = {
+        "update_id": 144,
+        "channel_post": {
+            "message_id": 144,
+            "chat": {"id": -100123, "type": "channel", "username": "kiwi_kiwi_test"},
+            "text": "Bruno Fernandes congratulating Marcus Rashford on his LALIGA title win ❤️",
+        },
+    }
+
+    settings = _settings(tmp_path)
+    settings.log_channel_target = "@logchan"
+    route = ChannelRoute(
+        name="kiwi_test",
+        enabled=True,
+        source_channel_id="-100123",
+        source_channel_username="@kiwi_kiwi_test",
+        destination_channel_id=None,
+        destination_channel_username="@kiwi_kiwi_test",
+        channel_script="stage_script.py",
+        final_script="default_final_script.py",
+        max_message_mb=10,
+    )
+
+    tg = FakeTelegramClient([update], b"")
+    bale = FakeBaleClient()
+    service = KiwiService(
+        settings=settings,
+        routes=_route_registry(route),
+        telegram_client=tg,
+        bale_client=bale,
+        storage=StorageManager(settings.storage_dir),
+        guard_runner=GuardRunner(settings.gaurd_scripts_dir, timeout_sec=5),
+        script_runner=ScriptRunner(settings.scripts_dir, timeout_sec=5),
+        final_script_runner=ScriptRunner(settings.final_scripts_dir, timeout_sec=5),
+        state_store=StateStore(settings.state_path),
+    )
+
+    processed = asyncio.run(service.run_once())
+    assert processed == 1
+    assert bale.sent == [("@kiwi_kiwi_test", "sample out")]
+
+    stage_logs = [text for chat, text in tg.audit_messages if chat == "@logchan"]
+    assert any("بررسی گارد | موفق" in text for text in stage_logs)
+    assert any("اجرای channel script | موفق" in text for text in stage_logs)
+    assert any("اجرای final script | موفق" in text for text in stage_logs)
+    assert any("stage_output:" in text for text in stage_logs)
+    assert any("sample out" in text for text in stage_logs)

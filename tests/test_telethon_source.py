@@ -82,7 +82,7 @@ def _route() -> ChannelRoute:
         source_channel_username="@stored_src",
         destination_channel_id="-2001",
         destination_channel_username=None,
-        script="default_scripts.py",
+        channel_script="default_channel_script.py",
         max_message_mb=50,
     )
 

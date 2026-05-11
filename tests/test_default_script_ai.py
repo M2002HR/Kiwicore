@@ -6,7 +6,7 @@ from pathlib import Path
 
 
 def _load_default_script_module():
-    path = Path(__file__).resolve().parents[1] / "scripts" / "channel_scripts" / "default_scripts.py"
+    path = Path(__file__).resolve().parents[1] / "scripts" / "channel_scripts" / "default_channel_script.py"
     spec = importlib.util.spec_from_file_location("default_scripts", path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)

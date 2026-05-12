@@ -223,3 +223,52 @@ def test_football_script_respects_global_budget_and_fails_open_fast(tmp_path: Pa
     }
     out = mod.build_messages(payload, input_dir=tmp_path)
     assert out == [{"type": "text", "text": "متن کوتاه"}]
+
+
+def test_football_script_forces_persian_rewrite_when_first_output_is_english(tmp_path: Path, monkeypatch) -> None:
+    mod = _load_module()
+    monkeypatch.setenv("FOOTBALL_AI_ENABLED", "true")
+    monkeypatch.setenv("FOOTBALL_AI_ENDPOINT", "http://fake.local/proxy/gemini")
+
+    calls = {"count": 0}
+
+    def fake_call(*, endpoint: str, body: dict, timeout_sec: float):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return "Bruno Fernandes beat Declan Rice to the FWA Footballer of the Year award."
+        return "برونو فرناندس در رای‌گیری جایزه بهترین بازیکن سال نویسندگان فوتبال، دکلان رایس را پشت سر گذاشت."
+
+    monkeypatch.setattr(mod, "_call_gemini_text", fake_call)
+    payload = {
+        "route": {"destination_target": "@dest"},
+        "message": {"caption": "raw cap"},
+        "inputs": [{"kind": "photo", "local_name": "a.jpg"}],
+    }
+    out = mod.build_messages(payload, input_dir=tmp_path)
+    assert calls["count"] >= 2
+    assert "برونو فرناندس" in (out[0].get("caption") or "")
+
+
+def test_football_script_emergency_caption_for_media_without_caption(tmp_path: Path, monkeypatch) -> None:
+    mod = _load_module()
+    monkeypatch.setenv("FOOTBALL_AI_ENABLED", "true")
+    monkeypatch.setenv("FOOTBALL_AI_ENDPOINT", "http://fake.local/proxy/gemini")
+
+    calls = {"count": 0}
+
+    def fake_call(*, endpoint: str, body: dict, timeout_sec: float):
+        calls["count"] += 1
+        # first generation fails, emergency caption path succeeds
+        if calls["count"] == 1:
+            return None
+        return "آرسنال با این برد فاصله‌اش تا قهرمانی را کمتر کرد."
+
+    monkeypatch.setattr(mod, "_call_gemini_text", fake_call)
+    payload = {
+        "route": {"destination_target": "@dest"},
+        "message": {},
+        "inputs": [{"kind": "photo", "local_name": "a.jpg"}],
+    }
+    out = mod.build_messages(payload, input_dir=tmp_path)
+    assert out and out[0].get("type") == "photo"
+    assert "آرسنال" in str(out[0].get("caption") or "")

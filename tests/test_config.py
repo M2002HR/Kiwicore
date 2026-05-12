@@ -145,6 +145,30 @@ def test_load_routes_custom_gaurd_script(tmp_path: Path) -> None:
     assert route.gaurd_script == "my_guard.py"
 
 
+def test_load_routes_allows_null_scripts(tmp_path: Path) -> None:
+    config_path = tmp_path / "channels.json"
+    config_path.write_text(
+        json.dumps(
+            [
+                {
+                    "source_channel_id": "-1001",
+                    "destination_channel_id": "-2001",
+                    "channel_script": None,
+                    "gaurd_script": None,
+                    "final_script": None,
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    registry = load_routes(str(config_path))
+    route = registry.match("-1001", None)
+    assert route is not None
+    assert route.channel_script is None
+    assert route.gaurd_script is None
+    assert route.final_script is None
+
+
 def test_load_settings_adds_private_updates_for_admin_bot(tmp_path: Path) -> None:
     env_path = tmp_path / ".env"
     env_path.write_text(
@@ -162,6 +186,7 @@ def test_load_settings_adds_private_updates_for_admin_bot(tmp_path: Path) -> Non
     assert "channel_post" in settings.telegram_allowed_updates
     assert "message" in settings.telegram_allowed_updates
     assert "edited_message" in settings.telegram_allowed_updates
+    assert "callback_query" in settings.telegram_allowed_updates
 
 
 def test_load_settings_telethon_mode_requires_credentials(tmp_path: Path) -> None:
@@ -200,7 +225,7 @@ def test_load_settings_telethon_mode_keeps_admin_updates_only(tmp_path: Path) ->
     )
     settings = load_settings(str(env_path))
     assert settings.telethon_enabled is True
-    assert settings.telegram_allowed_updates == ["message", "edited_message"]
+    assert settings.telegram_allowed_updates == ["message", "edited_message", "callback_query"]
 
 
 def test_load_routes_allows_duplicate_sources_and_matches_all(tmp_path: Path) -> None:

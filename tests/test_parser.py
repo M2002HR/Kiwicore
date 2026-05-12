@@ -110,7 +110,32 @@ def test_parse_private_message_update() -> None:
     assert parsed.chat_id == "555"
     assert parsed.user_id == "777"
     assert parsed.username == "@admin_root"
+    assert parsed.message_id == 2
     assert parsed.text == "/help"
+    assert parsed.callback_query_id is None
+
+
+def test_parse_private_callback_query_update() -> None:
+    update = {
+        "update_id": 1001,
+        "callback_query": {
+            "id": "cb-1",
+            "from": {"id": 777, "username": "admin_root"},
+            "message": {
+                "message_id": 15,
+                "chat": {"id": 555, "type": "private"},
+            },
+            "data": "txt:🔐 ورود",
+        },
+    }
+    parsed = parse_telegram_private_message_update(update)
+    assert parsed is not None
+    assert parsed.update_id == 1001
+    assert parsed.chat_id == "555"
+    assert parsed.user_id == "777"
+    assert parsed.message_id == 15
+    assert parsed.callback_query_id == "cb-1"
+    assert parsed.callback_data == "txt:🔐 ورود"
 
 
 def test_parse_media_group_and_text_link_entity() -> None:

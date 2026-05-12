@@ -36,6 +36,8 @@ class GuardRunner:
         self.last_stderr = ""
         self.last_token = None
         self.last_duration_ms = None
+        if not route.gaurd_script:
+            raise GuardExecutionError("Guard script name is empty")
         script_path = self.gaurd_scripts_dir / route.gaurd_script
         if not script_path.exists():
             logger.error(

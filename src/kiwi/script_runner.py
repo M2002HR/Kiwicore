@@ -30,6 +30,8 @@ class ScriptRunner:
         trace_id: str | None = None,
     ) -> ScriptRunResult:
         selected_script = script_name or route.channel_script
+        if not selected_script:
+            raise ScriptExecutionError(f"{stage_name} name is empty")
         script_path = self.scripts_dir / selected_script
         if not script_path.exists():
             logger.error(
@@ -164,13 +166,29 @@ def _preview_text(value: str, *, limit: int = 300) -> str:
 
 
 def _parse_output_json(text: str, source: str) -> dict:
+    direct_error: Exception | None = None
     try:
         data = json.loads(text)
     except json.JSONDecodeError as exc:
-        raise ScriptExecutionError(f"Invalid JSON output in {source}: {exc}")
-    if not isinstance(data, dict):
+        direct_error = exc
+    else:
+        if isinstance(data, dict):
+            return data
         raise ScriptExecutionError(f"Output in {source} must be a JSON object")
-    return data
+
+    # Compatibility fallback: tolerate log lines before the JSON body.
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    for line in reversed(lines):
+        try:
+            data = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(data, dict):
+            return data
+
+    if direct_error is not None:
+        raise ScriptExecutionError(f"Invalid JSON output in {source}: {direct_error}")
+    raise ScriptExecutionError(f"Invalid JSON output in {source}")
 
 
 def _parse_messages(payload: dict) -> list[ScriptOutputMessage]:

@@ -33,7 +33,11 @@ def _inbound(text: str, user_id: str = "100") -> AdminInboundMessage:
         chat_id=user_id,
         user_id=user_id,
         username="@admin",
+        message_id=10,
         text=text,
+        callback_query_id=None,
+        callback_data=None,
+        callback_message_id=None,
         raw={},
     )
 
@@ -67,7 +71,8 @@ def _extract_buttons(reply_markup: dict | None) -> set[str]:
     if not isinstance(reply_markup, dict):
         return set()
     out: set[str] = set()
-    for row in reply_markup.get("keyboard") or []:
+    rows = reply_markup.get("keyboard") or reply_markup.get("inline_keyboard") or []
+    for row in rows:
         if not isinstance(row, list):
             continue
         for item in row:
@@ -123,7 +128,7 @@ def test_admin_bot_add_and_edit_route_by_buttons(tmp_path: Path) -> None:
 
     routes = bot.handle(_inbound("/routes"))
     assert "r1" in routes.text
-    assert "enabled=True" in routes.text
+    assert "✅" in routes.text
 
     bot.handle(_inbound(BTN_EDIT_ROUTE))
     bot.handle(_inbound("r1"))
@@ -132,7 +137,7 @@ def test_admin_bot_add_and_edit_route_by_buttons(tmp_path: Path) -> None:
     assert "مبدا مسیر ویرایش شد" in src_edit.text
 
     routes_src = bot.handle(_inbound("/routes"))
-    assert "src=-1111" in routes_src.text
+    assert "مبدا: -1111" in routes_src.text
 
     bot.handle(_inbound(BTN_EDIT_ROUTE))
     bot.handle(_inbound("r1"))
@@ -141,7 +146,7 @@ def test_admin_bot_add_and_edit_route_by_buttons(tmp_path: Path) -> None:
     assert "ویرایش شد" in edit_result.text
 
     routes2 = bot.handle(_inbound("/routes"))
-    assert "enabled=False" in routes2.text
+    assert "⛔ r1" in routes2.text
 
     bot.handle(_inbound(BTN_EDIT_ROUTE))
     bot.handle(_inbound("r1"))
@@ -149,7 +154,7 @@ def test_admin_bot_add_and_edit_route_by_buttons(tmp_path: Path) -> None:
     assert "سینک" in started.text
 
     routes3 = bot.handle(_inbound("/routes"))
-    assert "sync=syncing" in routes3.text
+    assert "سینک: syncing" in routes3.text
 
     bot.handle(_inbound(BTN_EDIT_ROUTE))
     bot.handle(_inbound("r1"))

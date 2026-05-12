@@ -61,10 +61,10 @@ class ChannelRoute:
     source_channel_username: str | None
     destination_channel_id: str | None
     destination_channel_username: str | None
-    channel_script: str
+    channel_script: str | None
     max_message_mb: int | None
-    gaurd_script: str = "default_guard.py"
-    final_script: str = "default_final_script.py"
+    gaurd_script: str | None = "default_guard.py"
+    final_script: str | None = "default_final_script.py"
     sync_enabled: bool = False
     sync_status: str = "active"
     sync_backfill_count: int = 100
@@ -89,12 +89,12 @@ class ChannelRoute:
         return status == "syncing" or not bool(self.sync_seeded)
 
     @property
-    def script(self) -> str:
+    def script(self) -> str | None:
         # Backward compatibility for older call-sites/tests.
         return self.channel_script
 
     @script.setter
-    def script(self, value: str) -> None:
+    def script(self, value: str | None) -> None:
         self.channel_script = value
 
 
@@ -128,5 +128,9 @@ class AdminInboundMessage:
     chat_id: str
     user_id: str
     username: str | None
+    message_id: int | None
     text: str | None
+    callback_query_id: str | None
+    callback_data: str | None
+    callback_message_id: int | None
     raw: dict

@@ -134,6 +134,45 @@ def parse_telegram_channel_update(update: dict) -> IncomingChannelMessage | None
 
 
 def parse_telegram_private_message_update(update: dict) -> AdminInboundMessage | None:
+    update_id = _to_int_or_none(update.get("update_id"))
+    if update_id is None:
+        return None
+
+    callback_query = update.get("callback_query")
+    if isinstance(callback_query, dict):
+        raw_message = callback_query.get("message")
+        if not isinstance(raw_message, dict):
+            return None
+        chat = raw_message.get("chat") or {}
+        if (chat.get("type") or "").strip().lower() != "private":
+            return None
+
+        from_user = callback_query.get("from") or {}
+        chat_id = normalize_channel_id(chat.get("id"))
+        user_id = normalize_channel_id(from_user.get("id"))
+        if chat_id is None or user_id is None:
+            return None
+
+        username = normalize_channel_username(from_user.get("username"))
+        callback_query_id_raw = callback_query.get("id")
+        callback_query_id = str(callback_query_id_raw).strip() if callback_query_id_raw is not None else None
+        if not callback_query_id:
+            return None
+        callback_data_raw = callback_query.get("data")
+        callback_data = callback_data_raw.strip() if isinstance(callback_data_raw, str) and callback_data_raw.strip() else None
+        return AdminInboundMessage(
+            update_id=update_id,
+            chat_id=chat_id,
+            user_id=user_id,
+            username=username,
+            message_id=_to_int_or_none(raw_message.get("message_id")),
+            text=None,
+            callback_query_id=callback_query_id,
+            callback_data=callback_data,
+            callback_message_id=_to_int_or_none(raw_message.get("message_id")),
+            raw=update,
+        )
+
     raw_message = update.get("message")
     if raw_message is None:
         raw_message = update.get("edited_message")
@@ -144,7 +183,6 @@ def parse_telegram_private_message_update(update: dict) -> AdminInboundMessage |
     if (chat.get("type") or "").strip().lower() != "private":
         return None
 
-    update_id = _to_int_or_none(update.get("update_id"))
     chat_id = normalize_channel_id(chat.get("id"))
     from_user = raw_message.get("from") or {}
     user_id = normalize_channel_id(from_user.get("id"))
@@ -159,7 +197,11 @@ def parse_telegram_private_message_update(update: dict) -> AdminInboundMessage |
         chat_id=chat_id,
         user_id=user_id,
         username=username,
+        message_id=_to_int_or_none(raw_message.get("message_id")),
         text=text,
+        callback_query_id=None,
+        callback_data=None,
+        callback_message_id=None,
         raw=update,
     )
 

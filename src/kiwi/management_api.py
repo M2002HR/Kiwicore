@@ -140,4 +140,12 @@ class ManagementApi:
         if "channel_script" not in out and "script" in out:
             out["channel_script"] = out.get("script")
         out.pop("script", None)
+        for key in ("channel_script", "gaurd_script", "final_script"):
+            if key not in out:
+                continue
+            value = out.get(key)
+            if value is None:
+                continue
+            if isinstance(value, str) and not value.strip():
+                out[key] = None
         return out

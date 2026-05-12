@@ -16,7 +16,16 @@ from kiwi.platforms.parser import parse_telegram_channel_update, parse_telegram_
 from kiwi.script_runner import ScriptRunner
 from kiwi.state import StateStore
 from kiwi.storage import StorageManager
-from kiwi.types import AdminInboundMessage, ChannelRoute, IncomingChannelMessage, IncomingMedia, MediaKind
+from kiwi.types import (
+    AdminInboundMessage,
+    ChannelRoute,
+    IncomingChannelMessage,
+    IncomingMedia,
+    MediaKind,
+    OutputMessageKind,
+    ScriptOutputMessage,
+    ScriptRunResult,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -470,6 +479,20 @@ class KiwiService:
         return last_status
 
     async def _process_admin_message(self, incoming: AdminInboundMessage) -> None:
+        if incoming.callback_query_id:
+            try:
+                await self.telegram_client.answer_callback_query(incoming.callback_query_id)
+            except Exception:
+                logger.exception(
+                    "Failed to answer admin callback query",
+                    extra={
+                        "details": {
+                            "chat_id": incoming.chat_id,
+                            "user_id": incoming.user_id,
+                            "callback_query_id": incoming.callback_query_id,
+                        }
+                    },
+                )
         try:
             response = self.admin_handler.handle(incoming)
         except Exception as exc:
@@ -477,9 +500,11 @@ class KiwiService:
         if isinstance(response, str):
             text = response
             reply_markup = None
+            delete_message_id = None
         else:
             text = str(getattr(response, "text", "") or "")
             reply_markup = getattr(response, "reply_markup", None)
+            delete_message_id = getattr(response, "delete_message_id", None)
             if not text:
                 text = "پاسخ خالی از مدیریت دریافت شد."
         try:
@@ -494,6 +519,22 @@ class KiwiService:
                     }
                 },
             )
+            return
+
+        if isinstance(delete_message_id, int) and delete_message_id > 0:
+            try:
+                await self.telegram_client.delete_message(incoming.chat_id, delete_message_id)
+            except Exception:
+                logger.exception(
+                    "Failed to delete admin message",
+                    extra={
+                        "details": {
+                            "chat_id": incoming.chat_id,
+                            "user_id": incoming.user_id,
+                            "message_id": delete_message_id,
+                        }
+                    },
+                )
 
     async def _process_route_message(self, incoming: IncomingChannelMessage, route: ChannelRoute) -> str:
         trace_id = self._build_trace_id(route, incoming)
@@ -659,13 +700,15 @@ class KiwiService:
             )
 
             guard_started = time.monotonic()
-            is_allowed = await self.guard_runner.run(
-                route,
-                payload_path=Path(paths.payload_path),
-                input_dir=input_dir,
-                output_dir=output_dir,
-                trace_id=trace_id,
-            )
+            is_allowed = True
+            if route.gaurd_script:
+                is_allowed = await self.guard_runner.run(
+                    route,
+                    payload_path=Path(paths.payload_path),
+                    input_dir=input_dir,
+                    output_dir=output_dir,
+                    trace_id=trace_id,
+                )
             stage_timings_ms["guard"] = round((time.monotonic() - guard_started) * 1000.0, 2)
             if not is_allowed:
                 block_reason = self.guard_runner.last_reason or f"guard_denied:{route.gaurd_script}"
@@ -698,7 +741,7 @@ class KiwiService:
                 status="ok",
                 incoming=incoming,
                 route=route,
-                reason=f"گارد عبور داد ({route.gaurd_script})",
+                reason=f"گارد عبور داد ({route.gaurd_script})" if route.gaurd_script else "گارد تنظیم نشده بود؛ عبور مستقیم",
                 trace_id=trace_id,
                 stage_timings_ms=stage_timings_ms,
                 stage_output={
@@ -706,19 +749,28 @@ class KiwiService:
                     "stdout": self.guard_runner.last_stdout,
                     "stderr": self.guard_runner.last_stderr,
                     "duration_ms": self.guard_runner.last_duration_ms,
-                },
+                }
+                if route.gaurd_script
+                else {"skipped": True},
             )
 
             channel_started = time.monotonic()
-            run_result = await self.script_runner.run(
-                route,
-                payload_path=Path(paths.payload_path),
-                input_dir=input_dir,
-                output_dir=output_dir,
-                script_name=route.channel_script,
-                stage_name="channel_script",
-                trace_id=trace_id,
-            )
+            if route.channel_script:
+                run_result = await self.script_runner.run(
+                    route,
+                    payload_path=Path(paths.payload_path),
+                    input_dir=input_dir,
+                    output_dir=output_dir,
+                    script_name=route.channel_script,
+                    stage_name="channel_script",
+                    trace_id=trace_id,
+                )
+            else:
+                run_result = ScriptRunResult(
+                    messages=self._build_passthrough_messages(incoming=incoming, payload=payload),
+                    stdout="",
+                    stderr="",
+                )
             stage_timings_ms["channel_script"] = round((time.monotonic() - channel_started) * 1000.0, 2)
             logger.info(
                 "Channel script completed",
@@ -729,6 +781,7 @@ class KiwiService:
                         "channel_script": route.channel_script,
                         "output_messages_count": len(run_result.messages),
                         "stage_ms": stage_timings_ms["channel_script"],
+                        "passthrough": route.channel_script is None,
                     }
                 },
             )
@@ -762,7 +815,9 @@ class KiwiService:
                 status="ok",
                 incoming=incoming,
                 route=route,
-                reason=f"channel script اجرا شد ({len(run_result.messages)} پیام خروجی)",
+                reason=f"channel script اجرا شد ({len(run_result.messages)} پیام خروجی)"
+                if route.channel_script
+                else f"channel script تنظیم نشده بود؛ خروجی مستقیم از پیام ورودی ({len(run_result.messages)} پیام)",
                 trace_id=trace_id,
                 stage_timings_ms=stage_timings_ms,
                 stage_output={
@@ -793,56 +848,59 @@ class KiwiService:
                 },
             )
 
-            final_script_path = self.final_script_runner.scripts_dir / route.final_script
             final_started = time.monotonic()
-            if final_script_path.exists():
-                final_result = await self.final_script_runner.run(
-                    route,
-                    payload_path=final_payload_path,
-                    input_dir=output_dir,
-                    output_dir=final_output_dir,
-                    script_name=route.final_script,
-                    stage_name="final_script",
-                    trace_id=trace_id,
-                )
-            else:
-                fallback_name = "default_final_script.py"
-                fallback_path = self.final_script_runner.scripts_dir / fallback_name
-                if fallback_path.exists():
-                    logger.warning(
-                        "Final script not found; using default final script",
-                        extra={
-                            "details": {
-                                "route": route.name,
-                                "trace_id": trace_id,
-                                "final_script": route.final_script,
-                                "missing_path": str(final_script_path),
-                                "fallback_script": fallback_name,
-                            }
-                        },
-                    )
+            if route.final_script:
+                final_script_path = self.final_script_runner.scripts_dir / route.final_script
+                if final_script_path.exists():
                     final_result = await self.final_script_runner.run(
                         route,
                         payload_path=final_payload_path,
                         input_dir=output_dir,
                         output_dir=final_output_dir,
-                        script_name=fallback_name,
+                        script_name=route.final_script,
                         stage_name="final_script",
                         trace_id=trace_id,
                     )
                 else:
-                    logger.warning(
-                        "Final script not found; dispatching channel script output as-is",
-                        extra={
-                            "details": {
-                                "route": route.name,
-                                "trace_id": trace_id,
-                                "final_script": route.final_script,
-                                "missing_path": str(final_script_path),
-                            }
-                        },
-                    )
-                    final_result = run_result
+                    fallback_name = "default_final_script.py"
+                    fallback_path = self.final_script_runner.scripts_dir / fallback_name
+                    if fallback_path.exists():
+                        logger.warning(
+                            "Final script not found; using default final script",
+                            extra={
+                                "details": {
+                                    "route": route.name,
+                                    "trace_id": trace_id,
+                                    "final_script": route.final_script,
+                                    "missing_path": str(final_script_path),
+                                    "fallback_script": fallback_name,
+                                }
+                            },
+                        )
+                        final_result = await self.final_script_runner.run(
+                            route,
+                            payload_path=final_payload_path,
+                            input_dir=output_dir,
+                            output_dir=final_output_dir,
+                            script_name=fallback_name,
+                            stage_name="final_script",
+                            trace_id=trace_id,
+                        )
+                    else:
+                        logger.warning(
+                            "Final script not found; dispatching channel script output as-is",
+                            extra={
+                                "details": {
+                                    "route": route.name,
+                                    "trace_id": trace_id,
+                                    "final_script": route.final_script,
+                                    "missing_path": str(final_script_path),
+                                }
+                            },
+                        )
+                        final_result = run_result
+            else:
+                final_result = run_result
             stage_timings_ms["final_script"] = round((time.monotonic() - final_started) * 1000.0, 2)
             logger.info(
                 "Final script stage completed",
@@ -853,6 +911,7 @@ class KiwiService:
                         "final_script": route.final_script,
                         "output_messages_count": len(final_result.messages),
                         "stage_ms": stage_timings_ms["final_script"],
+                        "passthrough": route.final_script is None,
                     }
                 },
             )
@@ -887,7 +946,9 @@ class KiwiService:
                 status="ok",
                 incoming=incoming,
                 route=route,
-                reason=f"فاینال‌اسکریپت اجرا شد ({len(final_result.messages)} پیام خروجی)",
+                reason=f"فاینال‌اسکریپت اجرا شد ({len(final_result.messages)} پیام خروجی)"
+                if route.final_script
+                else f"فاینال‌اسکریپت تنظیم نشده بود؛ خروجی channel بدون تغییر ارسال شد ({len(final_result.messages)} پیام)",
                 trace_id=trace_id,
                 stage_timings_ms=stage_timings_ms,
                 stage_output={
@@ -1292,6 +1353,52 @@ class KiwiService:
         if msg.caption:
             out["caption"] = msg.caption
         return out
+
+    @staticmethod
+    def _media_kind_to_output_kind(media_kind: str) -> OutputMessageKind:
+        mapping = {
+            MediaKind.PHOTO.value: OutputMessageKind.PHOTO,
+            MediaKind.VIDEO.value: OutputMessageKind.VIDEO,
+            MediaKind.VOICE.value: OutputMessageKind.VOICE,
+            MediaKind.AUDIO.value: OutputMessageKind.AUDIO,
+            MediaKind.DOCUMENT.value: OutputMessageKind.DOCUMENT,
+            MediaKind.ANIMATION.value: OutputMessageKind.ANIMATION,
+            MediaKind.STICKER.value: OutputMessageKind.STICKER,
+            MediaKind.VIDEO_NOTE.value: OutputMessageKind.VIDEO_NOTE,
+        }
+        return mapping.get(media_kind, OutputMessageKind.DOCUMENT)
+
+    def _build_passthrough_messages(self, *, incoming: IncomingChannelMessage, payload: dict) -> list[ScriptOutputMessage]:
+        messages: list[ScriptOutputMessage] = []
+        caption = (incoming.caption or incoming.text or "").strip() or None
+        raw_inputs = payload.get("inputs")
+        inputs = raw_inputs if isinstance(raw_inputs, list) else []
+
+        for idx, raw_item in enumerate(inputs):
+            if not isinstance(raw_item, dict):
+                continue
+            local_name = str(raw_item.get("local_name") or "").strip()
+            if not local_name:
+                continue
+            kind_raw = str(raw_item.get("kind") or "").strip().lower()
+            out_kind = self._media_kind_to_output_kind(kind_raw)
+            if out_kind == OutputMessageKind.STICKER:
+                continue
+            messages.append(
+                ScriptOutputMessage(
+                    type=out_kind,
+                    path=local_name,
+                    caption=caption if idx == 0 else None,
+                )
+            )
+
+        if messages:
+            return messages
+
+        text = (incoming.text or incoming.caption or "").strip()
+        if text:
+            return [ScriptOutputMessage(type=OutputMessageKind.TEXT, text=text)]
+        return []
 
     @staticmethod
     def _preferred_local_name(media: IncomingMedia, *, file_path: str, idx: int) -> str:

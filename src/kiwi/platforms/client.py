@@ -78,6 +78,26 @@ class BotApiClient:
             raise PlatformApiError("sendMessage response is not an object")
         return response
 
+    async def delete_message(self, chat_id: str, message_id: int) -> bool:
+        response = await self._post("deleteMessage", json={"chat_id": chat_id, "message_id": int(message_id)})
+        return bool(response)
+
+    async def answer_callback_query(
+        self,
+        callback_query_id: str,
+        *,
+        text: str | None = None,
+        show_alert: bool = False,
+    ) -> bool:
+        payload: dict[str, object] = {
+            "callback_query_id": callback_query_id,
+            "show_alert": bool(show_alert),
+        }
+        if isinstance(text, str) and text.strip():
+            payload["text"] = text.strip()
+        response = await self._post("answerCallbackQuery", json=payload)
+        return bool(response)
+
     async def send_photo(self, chat_id: str, photo_path: Path, caption: str | None = None) -> dict:
         return await self._send_file("sendPhoto", chat_id=chat_id, field_name="photo", file_path=photo_path, caption=caption)
 

@@ -173,7 +173,7 @@ def load_settings(env_file: str = ".env") -> Settings:
         raise ValueError("TELEGRAM_SOURCE_MODE must be one of: bot, telethon, hybrid")
 
     if settings.admin_bot_enabled:
-        needed = {"message", "edited_message"}
+        needed = {"message", "edited_message", "callback_query"}
         merged: list[str] = []
         seen: set[str] = set()
         for item in settings.telegram_allowed_updates + list(needed):
@@ -186,7 +186,7 @@ def load_settings(env_file: str = ".env") -> Settings:
 
     if settings.telegram_source_mode == "telethon":
         # Keep private admin updates only; channel updates come from Telethon.
-        settings.telegram_allowed_updates = [u for u in settings.telegram_allowed_updates if u in {"message", "edited_message"}]
+        settings.telegram_allowed_updates = [u for u in settings.telegram_allowed_updates if u in {"message", "edited_message", "callback_query"}]
 
     if settings.telegram_source_mode in {"telethon", "hybrid"}:
         settings.telethon_enabled = True
@@ -214,9 +214,12 @@ def load_settings(env_file: str = ".env") -> Settings:
     return settings
 
 
-def _default_channel_script_name(route_obj: dict) -> str:
-    script = str(route_obj.get("channel_script") or route_obj.get("script") or "").strip()
-    if script:
+def _default_channel_script_name(route_obj: dict) -> str | None:
+    if "channel_script" in route_obj or "script" in route_obj:
+        raw_script = route_obj.get("channel_script") if "channel_script" in route_obj else route_obj.get("script")
+        script = str(raw_script or "").strip()
+        if not script:
+            return None
         return safe_script_name(script)
 
     source_username = normalize_channel_username(route_obj.get("source_channel_username"))
@@ -230,16 +233,20 @@ def _default_channel_script_name(route_obj: dict) -> str:
     raise ValueError("Route must define either source_channel_id or source_channel_username")
 
 
-def _default_gaurd_script_name(route_obj: dict) -> str:
-    script = str(route_obj.get("gaurd_script") or "").strip()
-    if script:
+def _default_gaurd_script_name(route_obj: dict) -> str | None:
+    if "gaurd_script" in route_obj:
+        script = str(route_obj.get("gaurd_script") or "").strip()
+        if not script:
+            return None
         return safe_script_name(script)
     return "default_guard.py"
 
 
-def _default_final_script_name(route_obj: dict) -> str:
-    script = str(route_obj.get("final_script") or "").strip()
-    if script:
+def _default_final_script_name(route_obj: dict) -> str | None:
+    if "final_script" in route_obj:
+        script = str(route_obj.get("final_script") or "").strip()
+        if not script:
+            return None
         return safe_script_name(script)
     return "default_final_script.py"
 

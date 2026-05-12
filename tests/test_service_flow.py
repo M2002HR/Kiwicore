@@ -177,6 +177,7 @@ def _settings(tmp_path: Path, default_max_mb: int = 50) -> Settings:
         telethon_api_hash="",
         telethon_session_path=str(tmp_path / "storage" / "telethon.session"),
         telethon_poll_batch_size=50,
+        telethon_proxy_url="",
     )
 
 
@@ -255,8 +256,55 @@ print(json.dumps({'messages': [{'type': 'text', 'text': 'OUT:' + text}]}))
     assert processed == 1
     assert bale.sent == [("-2001", "OUT:hello")]
 
+
+def test_service_flow_allows_route_without_any_scripts(tmp_path: Path) -> None:
+    scripts_dir = tmp_path / "scripts"
+    scripts_dir.mkdir()
+
+    update = {
+        "update_id": 102,
+        "channel_post": {
+            "message_id": 18,
+            "chat": {"id": -1001, "type": "channel", "username": "srcchan"},
+            "text": "hello-no-scripts",
+        },
+    }
+
+    settings = _settings(tmp_path)
+    route = ChannelRoute(
+        name="r-no-scripts",
+        enabled=True,
+        source_channel_id="-1001",
+        source_channel_username="@srcchan",
+        destination_channel_id="-2001",
+        destination_channel_username=None,
+        channel_script=None,
+        final_script=None,
+        gaurd_script=None,
+        max_message_mb=10,
+    )
+
+    tg = FakeTelegramClient([update], b"")
+    bale = FakeBaleClient()
+    storage = StorageManager(settings.storage_dir)
+    service = KiwiService(
+        settings=settings,
+        routes=_route_registry(route),
+        telegram_client=tg,
+        bale_client=bale,
+        source_client=None,
+        storage=storage,
+        guard_runner=GuardRunner(settings.gaurd_scripts_dir, settings.gaurd_script_timeout_sec),
+        script_runner=ScriptRunner(settings.scripts_dir, settings.script_timeout_sec),
+        final_script_runner=ScriptRunner(settings.final_scripts_dir, settings.final_script_timeout_sec),
+        state_store=StateStore(settings.state_path),
+    )
+
+    asyncio.run(service.run_once())
+    assert bale.sent == [("-2001", "hello-no-scripts")]
+
     state = json.loads(Path(settings.state_path).read_text(encoding="utf-8"))
-    assert state["offset"] == 102
+    assert state["offset"] == 103
 
 
 def test_service_flow_dispatches_from_telethon_source(tmp_path: Path) -> None:

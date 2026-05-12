@@ -52,6 +52,7 @@ class Settings:
     telethon_api_hash: str
     telethon_session_path: str
     telethon_poll_batch_size: int
+    telethon_proxy_url: str
 
 
 @dataclass(slots=True)
@@ -165,6 +166,7 @@ def load_settings(env_file: str = ".env") -> Settings:
         telethon_api_hash=_str("TELETHON_API_HASH", "").strip(),
         telethon_session_path=_str("TELETHON_SESSION_PATH", "./app_data/telethon.session").strip(),
         telethon_poll_batch_size=max(1, _int("TELETHON_POLL_BATCH_SIZE", 50)),
+        telethon_proxy_url=_str("TELETHON_PROXY_URL", "").strip(),
     )
 
     if settings.telegram_source_mode not in {"bot", "telethon", "hybrid"}:

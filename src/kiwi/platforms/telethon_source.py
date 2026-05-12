@@ -5,6 +5,7 @@ import logging
 import shutil
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote, urlparse
 
 from kiwi.errors import MessageTooLargeError
 from kiwi.types import ChannelRoute, IncomingChannelMessage, IncomingMedia, MediaKind
@@ -22,12 +23,14 @@ class TelethonSourceClient:
         session_path: str,
         poll_batch_size: int = 50,
         trust_env_proxy: bool = False,
+        proxy_url: str | None = None,
     ) -> None:
         self.api_id = int(api_id)
         self.api_hash = api_hash.strip()
         self.session_path = session_path
         self.poll_batch_size = max(1, int(poll_batch_size))
         self.trust_env_proxy = bool(trust_env_proxy)
+        self.proxy_url = (proxy_url or "").strip() or None
 
         self._client: Any | None = None
         self._entity_cache: dict[str, Any] = {}
@@ -244,7 +247,8 @@ class TelethonSourceClient:
 
             session_file = Path(self.session_path)
             session_file.parent.mkdir(parents=True, exist_ok=True)
-            client = TelegramClient(str(session_file), self.api_id, self.api_hash)
+            proxy = _parse_proxy_url(self.proxy_url)
+            client = TelegramClient(str(session_file), self.api_id, self.api_hash, proxy=proxy)
             await client.connect()
             if not await client.is_user_authorized():
                 await client.disconnect()
@@ -375,3 +379,40 @@ class TelethonSourceClient:
         if route.source_channel_id:
             return normalize_channel_id(route.source_channel_id)
         return None
+
+
+def _parse_proxy_url(proxy_url: str | None) -> object | None:
+    if not proxy_url:
+        return None
+
+    raw = proxy_url.strip()
+    parsed = urlparse(raw)
+    scheme = parsed.scheme.strip().lower()
+    host = parsed.hostname
+    port = parsed.port
+    if not scheme or not host or port is None:
+        raise ValueError("Invalid TELETHON_PROXY_URL. Expected scheme://host:port")
+
+    proxy_type = _proxy_type_from_scheme(scheme)
+    username = unquote(parsed.username) if parsed.username else None
+    password = unquote(parsed.password) if parsed.password else None
+    rdns = scheme in {"socks5h", "socks4a"}
+    return (proxy_type, host, port, rdns, username, password)
+
+
+def _proxy_type_from_scheme(scheme: str) -> object:
+    normalized = {"socks5h": "socks5", "socks4a": "socks4", "https": "http"}.get(scheme, scheme)
+    if normalized not in {"socks5", "socks4", "http"}:
+        raise ValueError(
+            "Unsupported TELETHON_PROXY_URL scheme. Use socks5://, socks5h://, socks4://, socks4a://, http://, or https://"
+        )
+    try:
+        import socks  # type: ignore[import-not-found]
+
+        if normalized == "socks5":
+            return socks.SOCKS5
+        if normalized == "socks4":
+            return socks.SOCKS4
+        return socks.HTTP
+    except Exception:
+        return normalized

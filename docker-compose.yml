@@ -14,13 +14,14 @@ services:
         no_proxy: ${build_no_proxy:-}
     image: ${DOCKER_IMAGE_TAG:-kiwi-bridge:latest}
     restart: unless-stopped
+    network_mode: host
     depends_on:
       gemini_server:
         condition: service_healthy
     env_file:
       - .env
     environment:
-      GUARD_AI_ENDPOINT: http://gemini_server:8000/proxy/gemini
+      GUARD_AI_ENDPOINT: http://127.0.0.1:${GEMINI_SERVER_PORT:-18000}/proxy/gemini
     volumes:
       - ./config:/app/config
       - ./scripts:/app/scripts

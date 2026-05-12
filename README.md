@@ -174,6 +174,7 @@ Important variables:
 - `FINAL_SCRIPT_TIMEOUT_SEC`: Max final script runtime
 - `POLL_IDLE_SLEEP_SEC`: Delay when no updates
 - `POLL_ERROR_SLEEP_SEC`: Base retry delay on polling errors
+- `TELETHON_PROXY_URL`: Optional proxy for MTProto (Telethon), e.g. `socks5://127.0.0.1:1080` or `http://127.0.0.1:2080`
 
 Guard AI (used by `default_guard.py`):
 
@@ -197,6 +198,16 @@ HTTP_PROXY=http://127.0.0.1:2080
 HTTPS_PROXY=http://127.0.0.1:2080
 ALL_PROXY=http://127.0.0.1:2080
 NO_PROXY=127.0.0.1,localhost
+```
+
+In this repository's Docker Compose setup, `kiwi` runs on host network mode.  
+If your proxy is on the host machine, use:
+
+```env
+HTTP_PROXY=http://127.0.0.1:2080
+HTTPS_PROXY=http://127.0.0.1:2080
+ALL_PROXY=http://127.0.0.1:2080
+TELETHON_PROXY_URL=http://127.0.0.1:2080
 ```
 
 ## Local Development

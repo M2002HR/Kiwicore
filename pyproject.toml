@@ -13,6 +13,7 @@ dependencies = [
   "python-dotenv>=1.0.1,<2",
   "telethon>=1.43.0,<2",
   "watchfiles>=0.22.0,<1",
+  "python-socks[asyncio]>=2.4.4,<3",
 ]
 
 [project.optional-dependencies]

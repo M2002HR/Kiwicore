@@ -38,6 +38,7 @@ async def build_service(env_file: str = ".env") -> KiwiService:
             api_hash=settings.telethon_api_hash,
             session_path=settings.telethon_session_path,
             poll_batch_size=settings.telethon_poll_batch_size,
+            proxy_url=settings.telethon_proxy_url,
         )
 
     service = KiwiService(

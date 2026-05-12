@@ -79,6 +79,7 @@ All scripts must be under:
 Default channel script included:
 
 - `scripts/channel_scripts/default_channel_script.py`
+- `scripts/channel_scripts/football.py` (AI football post generator + passthrough media)
 
 ### Script Contract
 
@@ -108,6 +109,16 @@ A script must return JSON via `stdout` (or `output.json` in `output-dir`) in thi
 `sticker` outputs are ignored by global policy and are never sent.
 
 For file-based outputs, `path` may be relative to `output-dir` or `input-dir`, or absolute.
+
+Football AI script environment knobs (`football.py`):
+
+- `FOOTBALL_AI_ENABLED`
+- `FOOTBALL_AI_ENDPOINT` (fallbacks to `SCRIPT_CLEAN_AI_ENDPOINT` / `FINAL_SCRIPT_AI_ENDPOINT` / `GUARD_AI_ENDPOINT`)
+- `FOOTBALL_AI_MODEL`
+- `FOOTBALL_AI_TIMEOUT_SEC`
+- `FOOTBALL_AI_RETRY_COUNT`
+- `FOOTBALL_AI_FAIL_OPEN`
+- `FOOTBALL_AI_MAX_IMAGES`
 
 ## Final Scripts
 

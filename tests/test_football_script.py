@@ -204,3 +204,22 @@ def test_football_script_postprocess_removes_prompt_leak_and_duplicate_signature
     assert "Professional Persian football content writer" not in caption
     assert caption.count("@kiwi_kiwi_test") == 1
     assert "ساخت فیلم بیوگرافی رسمی ایان رایت در حال توسعه است." in caption
+
+
+def test_football_script_respects_global_budget_and_fails_open_fast(tmp_path: Path, monkeypatch) -> None:
+    mod = _load_module()
+    monkeypatch.setenv("FOOTBALL_AI_ENABLED", "true")
+    monkeypatch.setenv("FOOTBALL_AI_ENDPOINT", "http://fake.local/proxy/gemini")
+    monkeypatch.setattr(mod, "_ai_total_budget_sec", lambda: 0.1)
+
+    def should_not_call(**kwargs):
+        raise AssertionError("_call_gemini_text should not be called when global budget is exhausted")
+
+    monkeypatch.setattr(mod, "_call_gemini_text", should_not_call)
+    payload = {
+        "route": {"destination_target": "@dest"},
+        "message": {"text": "متن کوتاه"},
+        "inputs": [],
+    }
+    out = mod.build_messages(payload, input_dir=tmp_path)
+    assert out == [{"type": "text", "text": "متن کوتاه"}]

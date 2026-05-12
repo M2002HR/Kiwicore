@@ -117,6 +117,7 @@ Football AI script environment knobs (`football.py`):
 - `FOOTBALL_AI_MODEL`
 - `FOOTBALL_AI_TIMEOUT_SEC`
 - `FOOTBALL_AI_RETRY_COUNT`
+- `FOOTBALL_AI_TOTAL_BUDGET_SEC` (global time budget to avoid script timeout)
 - `FOOTBALL_AI_FAIL_OPEN`
 - `FOOTBALL_AI_MAX_IMAGES`
 

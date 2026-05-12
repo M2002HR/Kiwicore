@@ -130,15 +130,20 @@ def _pick_ai_model() -> str:
 
 
 def _ai_timeout_sec() -> float:
-    return float(os.getenv("FOOTBALL_AI_TIMEOUT_SEC", "28").strip() or "28")
+    raw = os.getenv("FOOTBALL_AI_TIMEOUT_SEC", "20").strip() or "20"
+    try:
+        return max(4.0, min(45.0, float(raw)))
+    except Exception:
+        return 20.0
 
 
 def _ai_retry_count() -> int:
-    raw = os.getenv("FOOTBALL_AI_RETRY_COUNT", "2").strip() or "2"
+    raw = os.getenv("FOOTBALL_AI_RETRY_COUNT", "1").strip() or "1"
     try:
-        return max(0, int(raw))
+        # Hard cap retries for latency safety in channel-script runtime.
+        return max(0, min(1, int(raw)))
     except Exception:
-        return 2
+        return 1
 
 
 def _ai_fail_open() -> bool:
@@ -151,6 +156,14 @@ def _ai_max_images() -> int:
         return max(0, min(6, int(raw)))
     except Exception:
         return 3
+
+
+def _ai_total_budget_sec() -> float:
+    raw = os.getenv("FOOTBALL_AI_TOTAL_BUDGET_SEC", "75").strip() or "75"
+    try:
+        return max(15.0, min(110.0, float(raw)))
+    except Exception:
+        return 75.0
 
 
 def _destination_signature(payload: dict) -> str:
@@ -279,14 +292,21 @@ def _call_gemini_text(*, endpoint: str, body: dict, timeout_sec: float) -> str |
     )
 
     retries = _ai_retry_count()
+    deadline = time.monotonic() + max(1.0, float(timeout_sec))
     for attempt in range(retries + 1):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.8:
+            return None
         try:
-            with opener.open(req, timeout=timeout_sec) as resp:
+            with opener.open(req, timeout=max(1.0, remaining)) as resp:
                 raw = resp.read().decode("utf-8", errors="replace")
         except Exception:
             if attempt >= retries:
                 return None
-            time.sleep(0.35 * (attempt + 1))
+            backoff = 0.25 * (attempt + 1)
+            if deadline - time.monotonic() <= backoff:
+                return None
+            time.sleep(backoff)
             continue
 
         try:
@@ -294,20 +314,29 @@ def _call_gemini_text(*, endpoint: str, body: dict, timeout_sec: float) -> str |
         except json.JSONDecodeError:
             if attempt >= retries:
                 return None
-            time.sleep(0.2 * (attempt + 1))
+            backoff = 0.15 * (attempt + 1)
+            if deadline - time.monotonic() <= backoff:
+                return None
+            time.sleep(backoff)
             continue
 
         if not isinstance(data, dict):
             if attempt >= retries:
                 return None
-            time.sleep(0.2 * (attempt + 1))
+            backoff = 0.15 * (attempt + 1)
+            if deadline - time.monotonic() <= backoff:
+                return None
+            time.sleep(backoff)
             continue
 
         candidates = data.get("candidates")
         if not isinstance(candidates, list):
             if attempt >= retries:
                 return None
-            time.sleep(0.2 * (attempt + 1))
+            backoff = 0.15 * (attempt + 1)
+            if deadline - time.monotonic() <= backoff:
+                return None
+            time.sleep(backoff)
             continue
 
         for cand in candidates:
@@ -452,6 +481,18 @@ def _generate_football_text(*, payload: dict, input_dir: Path, base_messages: li
     if not source_text and not base_messages:
         return None
 
+    deadline = time.monotonic() + _ai_total_budget_sec()
+
+    def _remaining_budget() -> float:
+        return max(0.0, deadline - time.monotonic())
+
+    def _call_with_budget(body: dict) -> str | None:
+        remaining = _remaining_budget()
+        if remaining <= 2.0:
+            return None
+        call_budget = min(_ai_timeout_sec(), remaining)
+        return _call_gemini_text(endpoint=endpoint, body=body, timeout_sec=call_budget)
+
     destination = _destination_signature(payload)
     prompt = _football_prompt(source_text, destination=destination)
 
@@ -467,18 +508,18 @@ def _generate_football_text(*, payload: dict, input_dir: Path, base_messages: li
 
     model = _pick_ai_model()
     text_only_body = _build_body([{"text": prompt}], temperature=0.2)
-    first = _call_gemini_text(endpoint=endpoint, body=text_only_body, timeout_sec=_ai_timeout_sec())
+    first = _call_with_budget(text_only_body)
     if first is None:
         image_parts = _load_image_parts(payload, input_dir)
-        if image_parts:
+        if image_parts and _remaining_budget() > 5.0:
             image_body = _build_body([{"text": prompt}, *image_parts], temperature=0.2)
-            first = _call_gemini_text(endpoint=endpoint, body=image_body, timeout_sec=_ai_timeout_sec())
+            first = _call_with_budget(image_body)
     if first is None:
         return "" if not _ai_fail_open() else None
 
     cleaned = _postprocess_generated_text(first, destination=destination)
 
-    if _looks_low_quality(cleaned):
+    if _looks_low_quality(cleaned) and _remaining_budget() > 6.0:
         refine_prompt = (
             "متن زیر را به یک پست فوتبالی فارسی روان، طبیعی و آماده انتشار بازنویسی کن.\n"
             "هیچ توضیحی اضافه نکن و فقط نسخه نهایی را بده.\n"
@@ -495,7 +536,7 @@ def _generate_football_text(*, payload: dict, input_dir: Path, base_messages: li
         if model:
             refine_body["model"] = model
 
-        second = _call_gemini_text(endpoint=endpoint, body=refine_body, timeout_sec=_ai_timeout_sec())
+        second = _call_with_budget(refine_body)
         if second:
             candidate = _postprocess_generated_text(second, destination=destination)
             if candidate:

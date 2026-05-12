@@ -170,7 +170,7 @@ def test_football_script_stdout_stays_json_when_ai_enabled_and_endpoint_fails(tm
             "FOOTBALL_AI_FAIL_OPEN": "true",
         },
     )
-    assert out == {"messages": [{"type": "text", "text": "متن تست"}]}
+    assert out == {"messages": []}
 
 
 def test_football_script_postprocess_removes_prompt_leak_and_duplicate_signature(tmp_path: Path, monkeypatch) -> None:
@@ -206,7 +206,7 @@ def test_football_script_postprocess_removes_prompt_leak_and_duplicate_signature
     assert "ساخت فیلم بیوگرافی رسمی ایان رایت در حال توسعه است." in caption
 
 
-def test_football_script_respects_global_budget_and_fails_open_fast(tmp_path: Path, monkeypatch) -> None:
+def test_football_script_respects_global_budget_and_fails_closed_fast(tmp_path: Path, monkeypatch) -> None:
     mod = _load_module()
     monkeypatch.setenv("FOOTBALL_AI_ENABLED", "true")
     monkeypatch.setenv("FOOTBALL_AI_ENDPOINT", "http://fake.local/proxy/gemini")
@@ -222,7 +222,7 @@ def test_football_script_respects_global_budget_and_fails_open_fast(tmp_path: Pa
         "inputs": [],
     }
     out = mod.build_messages(payload, input_dir=tmp_path)
-    assert out == [{"type": "text", "text": "متن کوتاه"}]
+    assert out == []
 
 
 def test_football_script_forces_persian_rewrite_when_first_output_is_english(tmp_path: Path, monkeypatch) -> None:
@@ -272,3 +272,21 @@ def test_football_script_emergency_caption_for_media_without_caption(tmp_path: P
     out = mod.build_messages(payload, input_dir=tmp_path)
     assert out and out[0].get("type") == "photo"
     assert "آرسنال" in str(out[0].get("caption") or "")
+
+
+def test_football_script_never_passes_non_persian_caption_in_ai_mode(tmp_path: Path, monkeypatch) -> None:
+    mod = _load_module()
+    monkeypatch.setenv("FOOTBALL_AI_ENABLED", "true")
+    monkeypatch.setenv("FOOTBALL_AI_ENDPOINT", "http://fake.local/proxy/gemini")
+
+    def fake_call(*, endpoint: str, body: dict, timeout_sec: float):
+        return "Saka dropping these memes on his Instagram story after two huge Arsenal wins last week 😂"
+
+    monkeypatch.setattr(mod, "_call_gemini_text", fake_call)
+    payload = {
+        "route": {"destination_target": "@dest"},
+        "message": {"caption": "english cap"},
+        "inputs": [{"kind": "photo", "local_name": "a.jpg"}],
+    }
+    out = mod.build_messages(payload, input_dir=tmp_path)
+    assert out == []

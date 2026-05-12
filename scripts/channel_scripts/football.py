@@ -495,6 +495,16 @@ def _has_media_without_caption(messages: list[dict]) -> bool:
     return False
 
 
+def _has_any_media(messages: list[dict]) -> bool:
+    for item in messages:
+        if not isinstance(item, dict):
+            continue
+        msg_type = str(item.get("type") or "").strip().lower()
+        if msg_type in MEDIA_OUTPUT_TYPES:
+            return True
+    return False
+
+
 def _fallback_source_caption(payload: dict) -> str | None:
     message = payload.get("message")
     if not isinstance(message, dict):
@@ -581,30 +591,43 @@ def _generate_football_text(*, payload: dict, input_dir: Path, base_messages: li
             if candidate:
                 cleaned = candidate
 
-    # Hard quality gate: if still non-Persian, force one strict Persian rewrite.
-    if not _is_persian_acceptable(cleaned) and _remaining_budget() > 4.0:
-        strict_prompt = (
-            "متن زیر را فقط به فارسی روان و طبیعی بازنویسی کن.\n"
-            "هیچ توضیح اضافه نده.\n"
-            "هیچ خط انگلیسی نیاور.\n"
-            "معنی تغییر نکند.\n"
-            "حداکثر 4 جمله.\n\n"
-            f"متن:\n{cleaned or source_text}"
-        )
-        strict_body: dict = {
-            "contents": [{"role": "user", "parts": [{"text": strict_prompt}]}],
-            "generationConfig": {"temperature": 0.05},
-        }
-        if model:
-            strict_body["model"] = model
-        strict = _call_with_budget(strict_body)
-        if strict:
+    # Hard quality gate: if still non-Persian, force strict Persian rewrite retries.
+    strict_sources = [cleaned or source_text, source_text]
+    for strict_source in strict_sources:
+        if _is_persian_acceptable(cleaned):
+            break
+        attempts = 0
+        while attempts < 2 and _remaining_budget() > 4.0:
+            attempts += 1
+            strict_prompt = (
+                "متن زیر را فقط به فارسی روان و طبیعی بازنویسی کن.\n"
+                "هیچ توضیح اضافه نده.\n"
+                "هیچ خط انگلیسی نیاور.\n"
+                "معنی تغییر نکند.\n"
+                "حداکثر 4 جمله.\n\n"
+                f"متن:\n{strict_source}"
+            )
+            strict_body: dict = {
+                "contents": [{"role": "user", "parts": [{"text": strict_prompt}]}],
+                "generationConfig": {"temperature": 0.05},
+            }
+            if model:
+                strict_body["model"] = model
+            strict = _call_with_budget(strict_body)
+            if not strict:
+                continue
             strict_clean = _postprocess_generated_text(strict, destination=destination)
             if strict_clean:
                 cleaned = strict_clean
+            if _is_persian_acceptable(cleaned):
+                break
 
     if not cleaned:
-        return "" if not _ai_fail_open() else None
+        return ""
+
+    # Never allow non-Persian output to pass through when AI path is active.
+    if not _is_persian_acceptable(cleaned):
+        return ""
 
     return cleaned
 
@@ -636,13 +659,16 @@ def _apply_generated_text(base_messages: list[dict], generated_text: str) -> lis
 def build_messages(payload: dict, *, input_dir: Path) -> list[dict]:
     base = _build_base_messages(payload)
     generated = _generate_football_text(payload=payload, input_dir=input_dir, base_messages=base)
-    if generated is not None:
+    ai_mandatory = _football_ai_enabled() and bool(_pick_ai_endpoint())
+    if generated is None:
+        out = [] if ai_mandatory else base
+    elif generated:
         out = _apply_generated_text(base, generated)
     else:
-        out = base
+        out = []
 
     # If media exists without caption, force AI caption generation once more.
-    if _has_media_without_caption(out) and _football_ai_enabled():
+    if (_has_media_without_caption(out) or (not out and _has_any_media(base))) and _football_ai_enabled():
         endpoint = _pick_ai_endpoint()
         if endpoint:
             source_text = _collect_source_text(payload)
@@ -667,7 +693,7 @@ def build_messages(payload: dict, *, input_dir: Path) -> list[dict]:
                     out = _apply_generated_text(base, emergency_clean)
 
     # Last safety net: never let media out without caption when source had text/caption.
-    if _has_media_without_caption(out):
+    if _has_media_without_caption(out) and not ai_mandatory:
         fallback_caption = _fallback_source_caption(payload)
         if fallback_caption:
             injected: list[dict] = []
@@ -682,6 +708,21 @@ def build_messages(payload: dict, *, input_dir: Path) -> list[dict]:
                     assigned = True
                 injected.append(obj)
             out = injected
+
+    # AI-enabled route: never emit output with non-Persian text/captions.
+    if ai_mandatory:
+        for item in out:
+            if not isinstance(item, dict):
+                continue
+            msg_type = str(item.get("type") or "").strip().lower()
+            if msg_type == "text":
+                text = str(item.get("text") or "").strip()
+                if text and not _is_persian_acceptable(text):
+                    return []
+            if msg_type in CAPTION_TYPES:
+                caption = str(item.get("caption") or "").strip()
+                if caption and not _is_persian_acceptable(caption):
+                    return []
     return out
 
 

@@ -25,9 +25,16 @@ def normalize_channel_id(value: str | int | None) -> str | None:
 def normalize_channel_username(value: str | None) -> str | None:
     if value is None:
         return None
-    text = value.strip().lower()
+    text = value.strip()
     if not text:
         return None
+    lowered = text.lower()
+    # Preserve Telegram invite/public links as-is for Telethon source resolution.
+    if lowered.startswith("https://t.me/") or lowered.startswith("http://t.me/") or lowered.startswith("t.me/"):
+        if lowered.startswith("t.me/"):
+            return f"https://{text}"
+        return text
+    text = lowered
     if not text.startswith("@"):
         text = f"@{text}"
     return text

@@ -11,6 +11,8 @@ from kiwi.script_runner import ScriptRunner
 from kiwi.service import KiwiService
 from kiwi.state import StateStore
 from kiwi.storage import StorageManager
+from kiwi.sync_ledger import SyncLedger
+from kiwi.sync_queue import build_sync_queue_backend
 
 
 async def build_service(env_file: str = ".env") -> KiwiService:
@@ -40,6 +42,11 @@ async def build_service(env_file: str = ".env") -> KiwiService:
             poll_batch_size=settings.telethon_poll_batch_size,
             proxy_url=settings.telethon_proxy_url,
         )
+    sync_ledger = SyncLedger(settings.sync_ledger_db_path)
+    sync_queue = await build_sync_queue_backend(
+        backend=settings.sync_queue_backend,
+        redis_url=settings.redis_url,
+    )
 
     service = KiwiService(
         settings=settings,
@@ -51,6 +58,8 @@ async def build_service(env_file: str = ".env") -> KiwiService:
         guard_runner=GuardRunner(settings.gaurd_scripts_dir, settings.gaurd_script_timeout_sec),
         script_runner=ScriptRunner(settings.scripts_dir, settings.script_timeout_sec),
         state_store=StateStore(settings.state_path),
+        sync_ledger=sync_ledger,
+        sync_queue=sync_queue,
     )
 
     admin_store = AdminStore(settings.admin_users_config_path, settings.admin_sessions_path)
@@ -58,6 +67,8 @@ async def build_service(env_file: str = ".env") -> KiwiService:
         channels_config_path=settings.channels_config_path,
         scripts_dir=settings.scripts_dir,
         gaurd_scripts_dir=settings.gaurd_scripts_dir,
+        sync_ledger=sync_ledger,
+        sync_queue=sync_queue,
         on_routes_reloaded=service.set_routes,
     )
     service.admin_handler = AdminBotHandler(admin_store=admin_store, management_api=management_api)

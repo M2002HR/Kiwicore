@@ -35,7 +35,24 @@ class TelethonSourceClient:
         self._client: Any | None = None
         self._entity_cache: dict[str, Any] = {}
         self._last_message_id: dict[str, int] = {}
+        self._resolve_retry_after: dict[str, float] = {}
+        self._resolve_last_warn_at: dict[str, float] = {}
         self._lock = asyncio.Lock()
+
+    def route_source_key(self, route: ChannelRoute) -> str | None:
+        return self._route_source_key(route)
+
+    def prime_cursor(self, source_key: str, message_id: int) -> None:
+        key = str(source_key or "").strip()
+        if not key:
+            return
+        seeded = max(0, int(message_id))
+        current = self._last_message_id.get(key)
+        if current is None:
+            self._last_message_id[key] = seeded
+            return
+        # Keep the lower cursor so shared sources never skip messages for slower routes.
+        self._last_message_id[key] = min(int(current), seeded)
 
     async def aclose(self) -> None:
         if self._client is None:
@@ -47,17 +64,28 @@ class TelethonSourceClient:
         await self._ensure_connected()
         assert self._client is not None
 
-        sources: dict[str, tuple[str | None, str | None]] = {}
+        sources: dict[str, tuple[str | None, str | None, list[str]]] = {}
         for route in routes:
             if not route.enabled and not route.is_syncing():
                 continue
             source_key = self._route_source_key(route)
             if source_key is None:
                 continue
-            sources[source_key] = (route.source_channel_username, route.source_channel_id)
+            existing = sources.get(source_key)
+            if existing is None:
+                sources[source_key] = (route.source_channel_username, route.source_channel_id, [route.name])
+            else:
+                names = list(existing[2])
+                if route.name not in names:
+                    names.append(route.name)
+                sources[source_key] = (existing[0], existing[1], names)
 
         out: list[IncomingChannelMessage] = []
-        for source_key, (username, channel_id) in sources.items():
+        for source_key, (username, channel_id, route_names) in sources.items():
+            now = asyncio.get_running_loop().time()
+            retry_after = float(self._resolve_retry_after.get(source_key) or 0.0)
+            if retry_after > now:
+                continue
             try:
                 entity = await self._resolve_entity(source_key, username=username, channel_id=channel_id)
                 if source_key not in self._last_message_id:
@@ -86,17 +114,42 @@ class TelethonSourceClient:
 
                 if max_seen > min_id:
                     self._last_message_id[source_key] = max_seen
-            except Exception:
-                logger.exception(
-                    "Telethon source poll failed",
-                    extra={
-                        "details": {
-                            "source_key": source_key,
-                            "source_username": username,
-                            "source_channel_id": channel_id,
-                        }
-                    },
-                )
+                self._resolve_retry_after.pop(source_key, None)
+                self._resolve_last_warn_at.pop(source_key, None)
+            except Exception as exc:
+                err_text = str(exc)
+                if "Unable to resolve source entity" in err_text:
+                    # Back off repeated resolution attempts for invalid/missing channels.
+                    self._resolve_retry_after[source_key] = now + 300.0
+                    last_warn_at = float(self._resolve_last_warn_at.get(source_key) or 0.0)
+                    if (now - last_warn_at) >= 300.0:
+                        self._resolve_last_warn_at[source_key] = now
+                        logger.warning(
+                            "Telethon source resolve failed; route temporarily paused",
+                            extra={
+                                "details": {
+                                    "routes": route_names,
+                                    "source_key": source_key,
+                                    "source_username": username,
+                                    "source_channel_id": channel_id,
+                                    "retry_in_sec": 300,
+                                    "resolve_strategy": "username_then_channel_id_then_numeric_source_key",
+                                }
+                            },
+                        )
+                else:
+                    logger.exception(
+                        "Telethon source poll failed",
+                        extra={
+                            "details": {
+                                "routes": route_names,
+                                "source_key": source_key,
+                                "source_username": username,
+                                "source_channel_id": channel_id,
+                                "resolve_strategy": "username_then_channel_id_then_numeric_source_key",
+                            }
+                        },
+                    )
                 continue
 
         out.sort(key=lambda item: (item.update_id, item.message_id))
@@ -150,6 +203,18 @@ class TelethonSourceClient:
 
         self._last_message_id[source_key] = max_seen
         return parsed
+
+    async def latest_message_id_for_route(self, route: ChannelRoute) -> int:
+        await self._ensure_connected()
+        source_key = self._route_source_key(route)
+        if source_key is None:
+            return 0
+        entity = await self._resolve_entity(
+            source_key,
+            username=route.source_channel_username,
+            channel_id=route.source_channel_id,
+        )
+        return await self._latest_message_id(entity)
 
     async def download_media(self, source_ref: dict, output_path: Path, max_bytes: int) -> int:
         await self._ensure_connected()
@@ -266,26 +331,69 @@ class TelethonSourceClient:
         try:
             entity = await self._client.get_entity(candidate)
             self._entity_cache[source_key] = entity
+            logger.debug(
+                "Telethon source resolved via username/source_key",
+                extra={"details": {"source_key": source_key, "resolve_strategy": "username_or_source_key"}},
+            )
             return entity
         except Exception:
             pass
 
         if channel_id:
-            cid = str(channel_id).strip()
-            if cid.startswith("-100"):
-                cid = cid[4:]
-            cid_int = int(cid)
-            entity = await self._client.get_entity(cid_int)
-            self._entity_cache[source_key] = entity
-            return entity
+            normalized = normalize_channel_id(channel_id)
+            if normalized:
+                # Telegram channel ids are stored as -100<channel_id>; resolve via PeerChannel first.
+                if normalized.startswith("-100") and normalized[4:].isdigit():
+                    from telethon.tl.types import PeerChannel  # type: ignore[import-not-found]
+
+                    cid_int = int(normalized[4:])
+                    try:
+                        entity = await self._client.get_entity(PeerChannel(cid_int))
+                    except Exception:
+                        entity = await self._client.get_entity(cid_int)
+                    self._entity_cache[source_key] = entity
+                    logger.debug(
+                        "Telethon source resolved via route channel_id",
+                        extra={
+                            "details": {
+                                "source_key": source_key,
+                                "route_channel_id": channel_id,
+                                "resolve_strategy": "route_channel_id_peerchannel",
+                            }
+                        },
+                    )
+                    return entity
+
+                if normalized.lstrip("-").isdigit():
+                    cid_int = int(normalized)
+                    entity = await self._client.get_entity(cid_int)
+                    self._entity_cache[source_key] = entity
+                    logger.debug(
+                        "Telethon source resolved via numeric route id",
+                        extra={
+                            "details": {
+                                "source_key": source_key,
+                                "route_channel_id": channel_id,
+                                "resolve_strategy": "route_channel_id_numeric",
+                            }
+                        },
+                    )
+                    return entity
 
         # As a fallback, try source key as numeric channel id.
         stripped = source_key
         if stripped.startswith("-100"):
             stripped = stripped[4:]
-        entity = await self._client.get_entity(int(stripped))
-        self._entity_cache[source_key] = entity
-        return entity
+        if stripped.lstrip("-").isdigit():
+            entity = await self._client.get_entity(int(stripped))
+            self._entity_cache[source_key] = entity
+            logger.debug(
+                "Telethon source resolved via numeric source_key",
+                extra={"details": {"source_key": source_key, "resolve_strategy": "numeric_source_key"}},
+            )
+            return entity
+
+        raise ValueError(f"Unable to resolve source entity for source_key={source_key}")
 
     async def _to_incoming(
         self,
@@ -374,10 +482,14 @@ class TelethonSourceClient:
 
     @staticmethod
     def _route_source_key(route: ChannelRoute) -> str | None:
-        if route.source_channel_username:
-            return normalize_channel_username(route.source_channel_username)
+        raw_username = str(route.source_channel_username or "").strip()
+        lowered = raw_username.lower()
+        if lowered.startswith("https://t.me/") or lowered.startswith("http://t.me/") or lowered.startswith("t.me/"):
+            return raw_username
         if route.source_channel_id:
             return normalize_channel_id(route.source_channel_id)
+        if route.source_channel_username:
+            return normalize_channel_username(route.source_channel_username)
         return None
 
 

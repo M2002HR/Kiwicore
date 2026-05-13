@@ -133,3 +133,38 @@ def test_download_media_accepts_telethon_generated_filename(tmp_path: Path) -> N
     assert size == 6
     assert out.exists()
     assert out.read_bytes() == b"abc123"
+
+
+def test_poll_messages_can_resolve_via_source_channel_id() -> None:
+    class _ChannelIdFake(_FakeTelethonClient):
+        async def get_entity(self, entity):
+            if str(entity) == "-100555":
+                raise ValueError("not resolvable as plain numeric string")
+            return str(entity)
+
+    source = TelethonSourceClient(api_id=1, api_hash="x", session_path="./tmp.session")
+    fake = _ChannelIdFake()
+    # Fake client stores history by stringified entity. get_entity(PeerChannel(...)) => str(PeerChannel(...)).
+    fake.history_by_entity["PeerChannel(channel_id=555)"] = [_Msg(10, "x"), _Msg(11, "y")]
+    source._client = fake  # noqa: SLF001
+    source._ensure_connected = lambda: asyncio.sleep(0)  # type: ignore[method-assign]  # noqa: SLF001
+
+    route = ChannelRoute(
+        name="r-id",
+        enabled=True,
+        source_channel_id="-100555",
+        source_channel_username=None,
+        destination_channel_id="-2001",
+        destination_channel_username=None,
+        channel_script="default_channel_script.py",
+        max_message_mb=50,
+        sync_enabled=True,
+        sync_status="syncing",
+        sync_seeded=True,
+    )
+
+    first = asyncio.run(source.poll_messages([route]))
+    assert first == []
+    fake.history_by_entity["PeerChannel(channel_id=555)"].append(_Msg(12, "z"))
+    second = asyncio.run(source.poll_messages([route]))
+    assert [item.message_id for item in second] == [12]

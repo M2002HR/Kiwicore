@@ -51,6 +51,16 @@ class Settings:
     telethon_session_path: str
     telethon_poll_batch_size: int
     telethon_proxy_url: str
+    sync_queue_backend: str = "redis"
+    redis_url: str = ""
+    sync_worker_count: int = 4
+    sync_route_max_inflight: int = 1
+    sync_retry_base_sec: float = 2.0
+    sync_lock_ttl_sec: int = 120
+    sync_meta_flush_sec: float = 3.0
+    sync_review_alert_target: str | None = None
+    sync_ledger_db_path: str = "./app_data/sync_ledger.sqlite3"
+    sync_ledger_dsn: str = ""
 
 
 @dataclass(slots=True)
@@ -163,6 +173,16 @@ def load_settings(env_file: str = ".env") -> Settings:
         telethon_session_path=_str("TELETHON_SESSION_PATH", "./app_data/telethon.session").strip(),
         telethon_poll_batch_size=max(1, _int("TELETHON_POLL_BATCH_SIZE", 50)),
         telethon_proxy_url=_str("TELETHON_PROXY_URL", "").strip(),
+        sync_queue_backend=_str("SYNC_QUEUE_BACKEND", "redis").strip().lower() or "redis",
+        redis_url=_str("REDIS_URL", "").strip(),
+        sync_worker_count=max(1, _int("SYNC_WORKER_COUNT", 4)),
+        sync_route_max_inflight=max(1, _int("SYNC_ROUTE_MAX_INFLIGHT", 1)),
+        sync_retry_base_sec=max(0.2, _float("SYNC_RETRY_BASE_SEC", 2.0)),
+        sync_lock_ttl_sec=max(5, _int("SYNC_LOCK_TTL_SEC", 120)),
+        sync_meta_flush_sec=max(0.5, _float("SYNC_META_FLUSH_SEC", 3.0)),
+        sync_review_alert_target=_str("SYNC_REVIEW_ALERT_TARGET", "").strip() or None,
+        sync_ledger_db_path=_str("SYNC_LEDGER_DB_PATH", "./app_data/sync_ledger.sqlite3").strip(),
+        sync_ledger_dsn=_str("SYNC_LEDGER_DSN", "").strip(),
     )
 
     if settings.telegram_source_mode not in {"bot", "telethon", "hybrid"}:
@@ -205,6 +225,12 @@ def load_settings(env_file: str = ".env") -> Settings:
     Path(settings.admin_users_config_path).parent.mkdir(parents=True, exist_ok=True)
     Path(settings.admin_sessions_path).parent.mkdir(parents=True, exist_ok=True)
     Path(settings.telethon_session_path).parent.mkdir(parents=True, exist_ok=True)
+    if settings.sync_ledger_dsn:
+        settings.sync_ledger_db_path = settings.sync_ledger_dsn
+    if not settings.sync_ledger_db_path.startswith("mysql://") and not settings.sync_ledger_db_path.startswith(
+        "mysql+pymysql://"
+    ):
+        Path(settings.sync_ledger_db_path).parent.mkdir(parents=True, exist_ok=True)
 
     return settings
 

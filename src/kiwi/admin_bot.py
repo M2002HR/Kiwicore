@@ -72,6 +72,7 @@ class AdminBotHandler:
 
     def handle(self, inbound: AdminInboundMessage) -> AdminBotResponse:
         text = self._resolve_inbound_text(inbound)
+        normalized_text = self._normalize_user_text(text)
 
         if text.startswith("__route_edit__:"):
             route_name = text.split(":", 1)[1].strip()
@@ -142,7 +143,7 @@ class AdminBotHandler:
                 )
 
         # Menu button path.
-        if text == BTN_LIST_ROUTES:
+        if text == BTN_LIST_ROUTES or normalized_text in {"لیست مسیرها", "لیست مسیر ها", "routes", "route list", "list routes"}:
             return self._finalize_response(inbound, AdminBotResponse(self._routes_text(), self._routes_overview_keyboard()), from_flow=False)
         if text == BTN_ADD_ROUTE:
             self.admin_store.set_flow(inbound.user_id, "route_add_name", {"new_route": {}})
@@ -360,8 +361,6 @@ class AdminBotHandler:
                     "interval_sec": 300,
                     "batch_size": 1,
                     "retry_attempts": 2,
-                    "pending_count": 0,
-                    "processed_count": 0,
                     "seeded": False,
                 }
                 return self._finalize_route_add(inbound.user_id, new_route)
@@ -376,8 +375,6 @@ class AdminBotHandler:
                 "interval_sec": 300,
                 "batch_size": 1,
                 "retry_attempts": 2,
-                "pending_count": 0,
-                "processed_count": 0,
                 "seeded": False,
             }
             flow_data["new_route"] = new_route
@@ -483,7 +480,7 @@ class AdminBotHandler:
                 self.admin_store.set_flow(inbound.user_id, None, {})
                 sync = updated.get("sync") if isinstance(updated.get("sync"), dict) else {}
                 return AdminBotResponse(
-                    f"سینک مسیر شروع شد. pending={int(sync.get('pending_count') or 0)}",
+                    f"سینک مسیر شروع شد. status={sync.get('status') or 'syncing'}",
                     self._main_menu_keyboard(),
                 )
             if text == BTN_EDIT_SYNC_STOP:
@@ -629,8 +626,6 @@ class AdminBotHandler:
                 "interval_sec": 300,
                 "batch_size": 1,
                 "retry_attempts": 2,
-                "pending_count": 0,
-                "processed_count": 0,
                 "seeded": False,
             }
         self.management_api.add_route(new_route)
@@ -720,6 +715,45 @@ class AdminBotHandler:
         if text.startswith("/reload_routes"):
             self.management_api.reload_routes()
             return AdminBotResponse("ریلود شد.", self._main_menu_keyboard())
+        if text.startswith("/sync_stats"):
+            stats = self.management_api.sync_stats_snapshot()
+            lines = [
+                "SYNC stats:",
+                f"queue_depth: {stats.get('queue_depth') if stats.get('queue_depth') is not None else 'n/a'}",
+                f"open_reviews: {int(stats.get('open_reviews') or 0)}",
+                f"status_counts: {json.dumps(stats.get('status_counts') or {}, ensure_ascii=False)}",
+            ]
+            return AdminBotResponse("\n".join(lines), self._main_menu_keyboard())
+        if text.startswith("/sync_review_retry"):
+            parts = text.split(maxsplit=1)
+            if len(parts) != 2:
+                return AdminBotResponse("فرمت درست:\n/sync_review_retry <review_id>", self._main_menu_keyboard())
+            result = self.management_api.sync_review_retry(int(parts[1].strip()))
+            return AdminBotResponse(f"review retry شد: {result.get('id')}", self._main_menu_keyboard())
+        if text.startswith("/sync_review_skip"):
+            parts = text.split(maxsplit=1)
+            if len(parts) != 2:
+                return AdminBotResponse("فرمت درست:\n/sync_review_skip <review_id>", self._main_menu_keyboard())
+            result = self.management_api.sync_review_skip(int(parts[1].strip()))
+            return AdminBotResponse(f"review skip شد: {result.get('id')}", self._main_menu_keyboard())
+        if text.startswith("/sync_review"):
+            parts = text.split()
+            only_open = True
+            limit = 20
+            if len(parts) >= 2:
+                only_open = parts[1].strip().lower() != "all"
+            if len(parts) >= 3:
+                limit = max(1, int(parts[2]))
+            items = self.management_api.sync_review_list(limit=limit, only_open=only_open)
+            if not items:
+                return AdminBotResponse("review queue خالی است.", self._main_menu_keyboard())
+            lines = ["SYNC review queue:"]
+            for item in items:
+                lines.append(
+                    f"#{item.get('id')} | route={item.get('route_name')} | reason={item.get('reason')} | "
+                    f"resolved={item.get('resolved_at') or '-'}"
+                )
+            return AdminBotResponse("\n".join(lines), self._main_menu_keyboard())
 
         return AdminBotResponse("دستور نامعتبر است. /help", self._main_menu_keyboard())
 
@@ -732,7 +766,9 @@ class AdminBotHandler:
             sync_obj = r.get("sync") if isinstance(r.get("sync"), dict) else {}
             sync_enabled = bool(sync_obj.get("enabled", False))
             sync_status = str(sync_obj.get("status", "active"))
-            sync_pending = int(sync_obj.get("pending_count") or 0)
+            sync_pending = 0
+            if self.management_api.sync_ledger is not None:
+                sync_pending = self.management_api.sync_ledger.active_count_for_route(str(r.get("name") or ""))
             enabled_icon = "✅" if bool(r.get("enabled", True)) else "⛔"
             max_mb_text = str(r.get("max_message_mb")) if r.get("max_message_mb") is not None else "نامحدود"
             lines.append(f"{idx}) {enabled_icon} {r.get('name', '-')}")
@@ -758,7 +794,11 @@ class AdminBotHandler:
             "/route_update <name> <json_patch>\n"
             "/route_delete <name>\n"
             "/route_enable <name> <true|false>\n"
-            "/reload_routes"
+            "/reload_routes\n"
+            "/sync_stats\n"
+            "/sync_review [open|all] [limit]\n"
+            "/sync_review_retry <review_id>\n"
+            "/sync_review_skip <review_id>"
         )
 
     @staticmethod
@@ -806,6 +846,13 @@ class AdminBotHandler:
         if not isinstance(parsed, dict):
             raise ValueError("JSON باید آبجکت باشد")
         return parsed
+
+    @staticmethod
+    def _normalize_user_text(value: str) -> str:
+        text = str(value or "").strip().lower()
+        if not text:
+            return ""
+        return " ".join(text.split())
 
     def _resolve_inbound_text(self, inbound: AdminInboundMessage) -> str:
         text = (inbound.text or "").strip()

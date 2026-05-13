@@ -54,6 +54,12 @@ class BotApiClient:
             raise PlatformApiError("getFile response is not an object")
         return response
 
+    async def get_chat_member(self, chat_id: str, user_id: int | str) -> dict:
+        response = await self._post("getChatMember", json={"chat_id": chat_id, "user_id": int(user_id)})
+        if not isinstance(response, dict):
+            raise PlatformApiError("getChatMember response is not an object")
+        return response
+
     async def send_message(self, chat_id: str, text: str, reply_markup: dict | None = None) -> dict:
         retries = 3  # initial attempt + 2 retries
         backoff_sec = 0.7

@@ -6,8 +6,7 @@ Kiwi Bridge is a channel-to-channel relay service:
 2. Downloads message media with a configurable per-message size limit.
 3. Runs a per-route **guard script** (AI moderation).
 4. Runs a per-channel Python script (only if guard allows).
-5. Runs a per-route final script on channel script output.
-6. Publishes final outputs to mapped **Bale channels**.
+5. Publishes channel-script outputs to mapped **Bale channels**.
 
 The project is designed for production use with Docker Compose and for local development with auto-reload watch mode.
 
@@ -19,7 +18,7 @@ The project is designed for production use with Docker Compose and for local dev
 - Per-route and global media size limits
 - Local storage of raw updates, payloads, and downloaded media
 - AI guard stage per route (`gaurd_script`) before script execution
-- Two-stage script pipeline per route (`channel_script` -> `final_script`)
+- Single-stage channel script pipeline per route (`channel_script`)
 - Default passthrough script for near 1:1 forwarding behavior
 - Docker Compose integration with `gemini_server` (Gemini proxy submodule)
 - Delivery to Bale as text/photo/video/voice/audio/document/animation/video_note
@@ -40,7 +39,6 @@ The project is designed for production use with Docker Compose and for local dev
 - `config/channels.json`: Runtime route configuration (ignored from git)
 - `config/channels.example.json`: Versioned route template
 - `scripts/channel_scripts/`: Channel scripts directory
-- `scripts/final_scripts/`: Final scripts directory
 - `scripts/gaurd_scrpts/`: Guard scripts directory
 - `gemini_server/`: Git submodule (Gemini API proxy service)
 
@@ -62,7 +60,6 @@ Route fields (per item):
 - `destination_channel_id`: Destination Bale channel ID (fallback)
 - `gaurd_script`: Guard script filename under `scripts/gaurd_scrpts/` (default: `default_guard.py`)
 - `channel_script`: Script filename under `scripts/channel_scripts/`
-- `final_script`: Script filename under `scripts/final_scripts/` (default: `default_final_script.py`)
 - `max_message_mb`: Optional per-route message media limit
 
 Routing behavior:
@@ -113,29 +110,13 @@ For file-based outputs, `path` may be relative to `output-dir` or `input-dir`, o
 Football AI script environment knobs (`football.py`):
 
 - `FOOTBALL_AI_ENABLED`
-- `FOOTBALL_AI_ENDPOINT` (fallbacks to `SCRIPT_CLEAN_AI_ENDPOINT` / `FINAL_SCRIPT_AI_ENDPOINT` / `GUARD_AI_ENDPOINT`)
+- `FOOTBALL_AI_ENDPOINT` (fallbacks to `SCRIPT_CLEAN_AI_ENDPOINT` / `GUARD_AI_ENDPOINT`)
 - `FOOTBALL_AI_MODEL`
 - `FOOTBALL_AI_TIMEOUT_SEC`
 - `FOOTBALL_AI_RETRY_COUNT`
 - `FOOTBALL_AI_TOTAL_BUDGET_SEC` (global time budget to avoid script timeout)
 - `FOOTBALL_AI_FAIL_OPEN`
 - `FOOTBALL_AI_MAX_IMAGES`
-
-## Final Scripts
-
-All final scripts must be under:
-
-- `scripts/final_scripts/`
-
-Default final script included:
-
-- `scripts/final_scripts/default_final_script.py`
-
-Final script contract:
-
-- Receives `--payload`, `--input-dir`, `--output-dir`
-- Input payload includes `messages` (output of channel script)
-- Must return JSON in same `{"messages":[...]}` shape
 
 ## Guard Scripts
 
@@ -151,7 +132,7 @@ Guard contract:
 
 - Receives `--payload`, `--input-dir`, `--output-dir`
 - Must print `true`/`false` (or `1`/`0`) to stdout
-- `true` means continue to channel/final scripts
+- `true` means continue to channel script
 - `false` means block forwarding for that message
 
 ## Default Passthrough Script
@@ -179,11 +160,9 @@ Important variables:
 - `CHANNELS_CONFIG_PATH`: Default `./config/channels.json`
 - `CHANNEL_SCRIPTS_DIR`: Default `./scripts/channel_scripts`
 - `GAURD_SCRIPTS_DIR`: Default `./scripts/gaurd_scrpts`
-- `FINAL_SCRIPTS_DIR`: Default `./scripts/final_scripts`
 - `DEFAULT_MAX_MESSAGE_MB`: Global per-message media limit
 - `SCRIPT_TIMEOUT_SEC`: Max channel script runtime
 - `GAURD_SCRIPT_TIMEOUT_SEC`: Max guard script runtime
-- `FINAL_SCRIPT_TIMEOUT_SEC`: Max final script runtime
 - `POLL_IDLE_SLEEP_SEC`: Delay when no updates
 - `POLL_ERROR_SLEEP_SEC`: Base retry delay on polling errors
 - `TELETHON_PROXY_URL`: Optional proxy for MTProto (Telethon), e.g. `socks5://127.0.0.1:1080` or `http://127.0.0.1:2080`
@@ -271,7 +250,7 @@ pytest -q
 
 - `config/channels.json` is ignored (runtime/local config)
 - `config/channels.example.json` is versioned
-- `scripts/channel_scripts/`, `scripts/final_scripts/`, and `scripts/gaurd_scrpts/` are versioned
+- `scripts/channel_scripts/` and `scripts/gaurd_scrpts/` are versioned
 
 ## Troubleshooting
 
@@ -281,4 +260,4 @@ pytest -q
   - Verify proxy settings and connectivity.
   - The service retries with backoff automatically.
 - Script not found
-  - Ensure `channel_script` exists under `CHANNEL_SCRIPTS_DIR` and `final_script` exists under `FINAL_SCRIPTS_DIR`.
+  - Ensure `channel_script` exists under `CHANNEL_SCRIPTS_DIR`.

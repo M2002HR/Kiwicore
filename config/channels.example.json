@@ -8,7 +8,6 @@
     "destination_channel_id": "-1002222222222",
     "gaurd_script": "default_guard.py",
     "channel_script": "default_channel_script.py",
-    "final_script": "default_final_script.py",
     "max_message_mb": 50
   }
 ]

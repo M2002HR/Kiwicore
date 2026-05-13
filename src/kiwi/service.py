@@ -42,7 +42,6 @@ class KiwiService:
         storage: StorageManager,
         guard_runner: GuardRunner,
         script_runner: ScriptRunner,
-        final_script_runner: ScriptRunner | None = None,
         state_store: StateStore,
         admin_handler: Any | None = None,
     ) -> None:
@@ -54,7 +53,6 @@ class KiwiService:
         self.storage = storage
         self.guard_runner = guard_runner
         self.script_runner = script_runner
-        self.final_script_runner = final_script_runner or script_runner
         self.state_store = state_store
         self.dispatcher = BaleDispatcher(self.bale_client)
         self.admin_handler = admin_handler
@@ -554,7 +552,6 @@ class KiwiService:
                     "source_channel_username": incoming.source_channel_username,
                     "media_count": len(incoming.medias),
                     "channel_script": route.channel_script,
-                    "final_script": route.final_script,
                     "gaurd_script": route.gaurd_script,
                 }
             },
@@ -578,7 +575,6 @@ class KiwiService:
                 "destination_channel_username": route.destination_channel_username,
                 "destination_target": route.destination_target(),
                 "channel_script": route.channel_script,
-                "final_script": route.final_script,
                 "sync": {
                     "enabled": route.sync_enabled,
                     "status": route.sync_status,
@@ -827,137 +823,8 @@ class KiwiService:
                 },
             )
 
-            final_payload_path = output_dir / "final_payload.json"
-            final_output_dir = output_dir / "final_stage"
-            final_output_dir.mkdir(parents=True, exist_ok=True)
-            final_payload = {
-                "route": payload["route"],
-                "message": payload["message"],
-                "messages": [self._script_message_to_dict(msg) for msg in run_result.messages],
-            }
-            final_payload_path.write_text(json.dumps(final_payload, ensure_ascii=False), encoding="utf-8")
-            logger.info(
-                "Final payload prepared",
-                extra={
-                    "details": {
-                        "trace_id": trace_id,
-                        "route": route.name,
-                        "final_payload_path": str(final_payload_path),
-                        "final_input_messages_count": len(run_result.messages),
-                    }
-                },
-            )
-
-            final_started = time.monotonic()
-            if route.final_script:
-                final_script_path = self.final_script_runner.scripts_dir / route.final_script
-                if final_script_path.exists():
-                    final_result = await self.final_script_runner.run(
-                        route,
-                        payload_path=final_payload_path,
-                        input_dir=output_dir,
-                        output_dir=final_output_dir,
-                        script_name=route.final_script,
-                        stage_name="final_script",
-                        trace_id=trace_id,
-                    )
-                else:
-                    fallback_name = "default_final_script.py"
-                    fallback_path = self.final_script_runner.scripts_dir / fallback_name
-                    if fallback_path.exists():
-                        logger.warning(
-                            "Final script not found; using default final script",
-                            extra={
-                                "details": {
-                                    "route": route.name,
-                                    "trace_id": trace_id,
-                                    "final_script": route.final_script,
-                                    "missing_path": str(final_script_path),
-                                    "fallback_script": fallback_name,
-                                }
-                            },
-                        )
-                        final_result = await self.final_script_runner.run(
-                            route,
-                            payload_path=final_payload_path,
-                            input_dir=output_dir,
-                            output_dir=final_output_dir,
-                            script_name=fallback_name,
-                            stage_name="final_script",
-                            trace_id=trace_id,
-                        )
-                    else:
-                        logger.warning(
-                            "Final script not found; dispatching channel script output as-is",
-                            extra={
-                                "details": {
-                                    "route": route.name,
-                                    "trace_id": trace_id,
-                                    "final_script": route.final_script,
-                                    "missing_path": str(final_script_path),
-                                }
-                            },
-                        )
-                        final_result = run_result
-            else:
-                final_result = run_result
-            stage_timings_ms["final_script"] = round((time.monotonic() - final_started) * 1000.0, 2)
-            logger.info(
-                "Final script stage completed",
-                extra={
-                    "details": {
-                        "trace_id": trace_id,
-                        "route": route.name,
-                        "final_script": route.final_script,
-                        "output_messages_count": len(final_result.messages),
-                        "stage_ms": stage_timings_ms["final_script"],
-                        "passthrough": route.final_script is None,
-                    }
-                },
-            )
-
-            if not final_result.messages:
-                await self._audit_log(
-                    stage="final_script",
-                    status="skipped",
-                    incoming=incoming,
-                    route=route,
-                    reason="خروجی final script خالی بود",
-                    trace_id=trace_id,
-                    stage_timings_ms=stage_timings_ms,
-                )
-                logger.info(
-                    "Final script generated no output messages",
-                    extra={
-                        "details": {
-                            "route": route.name,
-                            "trace_id": trace_id,
-                            "source_channel_id": incoming.source_channel_id,
-                            "update_id": incoming.update_id,
-                            "final_script": route.final_script,
-                            "stage_ms": stage_timings_ms["final_script"],
-                        }
-                    },
-                )
-                return "skipped"
-
-            await self._audit_log(
-                stage="final_script",
-                status="ok",
-                incoming=incoming,
-                route=route,
-                reason=f"فاینال‌اسکریپت اجرا شد ({len(final_result.messages)} پیام خروجی)"
-                if route.final_script
-                else f"فاینال‌اسکریپت تنظیم نشده بود؛ خروجی channel بدون تغییر ارسال شد ({len(final_result.messages)} پیام)",
-                trace_id=trace_id,
-                stage_timings_ms=stage_timings_ms,
-                stage_output={
-                    "stdout": final_result.stdout,
-                    "stderr": final_result.stderr,
-                    "messages": [self._script_message_to_dict(msg) for msg in final_result.messages],
-                },
-            )
-            (final_output_dir / "final_messages.json").write_text(
+            final_result = run_result
+            (output_dir / "channel_messages.json").write_text(
                 json.dumps(
                     {"messages": [self._script_message_to_dict(msg) for msg in final_result.messages]},
                     ensure_ascii=False,
@@ -969,9 +836,9 @@ class KiwiService:
             await self.dispatcher.dispatch(
                 route.destination_target(),
                 final_result.messages,
-                output_dir=final_output_dir,
+                output_dir=output_dir,
                 input_dir=input_dir,
-                extra_input_dirs=[output_dir],
+                extra_input_dirs=[],
             )
             stage_timings_ms["dispatch"] = round((time.monotonic() - dispatch_started) * 1000.0, 2)
             stage_timings_ms["total"] = round((time.monotonic() - started_at) * 1000.0, 2)
@@ -1031,7 +898,7 @@ class KiwiService:
                 status="failed",
                 incoming=incoming,
                 route=route,
-                reason="اجرای channel/final script خطا داد",
+                reason="اجرای channel script خطا داد",
                 trace_id=trace_id,
                 stage_timings_ms=stage_timings_ms,
             )
@@ -1220,7 +1087,6 @@ class KiwiService:
             "guard": "بررسی گارد",
             "script": "اجرای اسکریپت",
             "channel_script": "اجرای channel script",
-            "final_script": "اجرای final script",
             "download": "دانلود فایل",
             "processing": "پردازش پیام",
             "route_match": "تطبیق مسیر",

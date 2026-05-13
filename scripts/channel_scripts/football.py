@@ -116,7 +116,6 @@ def _pick_ai_endpoint() -> str:
     return (
         os.getenv("FOOTBALL_AI_ENDPOINT", "").strip()
         or os.getenv("SCRIPT_CLEAN_AI_ENDPOINT", "").strip()
-        or os.getenv("FINAL_SCRIPT_AI_ENDPOINT", "").strip()
         or os.getenv("GUARD_AI_ENDPOINT", "").strip()
     )
 
@@ -124,7 +123,6 @@ def _pick_ai_endpoint() -> str:
 def _pick_ai_model() -> str:
     return (
         os.getenv("FOOTBALL_AI_MODEL", "").strip()
-        or os.getenv("FINAL_SCRIPT_AI_MODEL", "").strip()
         or os.getenv("SCRIPT_CLEAN_AI_MODEL", "").strip()
         or os.getenv("GUARD_AI_MODEL", "").strip()
     )

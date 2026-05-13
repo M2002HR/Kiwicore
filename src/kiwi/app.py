@@ -50,7 +50,6 @@ async def build_service(env_file: str = ".env") -> KiwiService:
         storage=StorageManager(settings.storage_dir),
         guard_runner=GuardRunner(settings.gaurd_scripts_dir, settings.gaurd_script_timeout_sec),
         script_runner=ScriptRunner(settings.scripts_dir, settings.script_timeout_sec),
-        final_script_runner=ScriptRunner(settings.final_scripts_dir, settings.final_script_timeout_sec),
         state_store=StateStore(settings.state_path),
     )
 
@@ -59,7 +58,6 @@ async def build_service(env_file: str = ".env") -> KiwiService:
         channels_config_path=settings.channels_config_path,
         scripts_dir=settings.scripts_dir,
         gaurd_scripts_dir=settings.gaurd_scripts_dir,
-        final_scripts_dir=settings.final_scripts_dir,
         on_routes_reloaded=service.set_routes,
     )
     service.admin_handler = AdminBotHandler(admin_store=admin_store, management_api=management_api)

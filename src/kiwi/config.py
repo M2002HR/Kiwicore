@@ -33,13 +33,11 @@ class Settings:
     channels_config_path: str
     scripts_dir: str
     gaurd_scripts_dir: str
-    final_scripts_dir: str
     storage_dir: str
     state_path: str
     default_max_message_mb: int
     script_timeout_sec: int
     gaurd_script_timeout_sec: int
-    final_script_timeout_sec: int
     poll_idle_sleep_sec: float
     poll_error_sleep_sec: float
     log_channel_target: str | None
@@ -147,13 +145,11 @@ def load_settings(env_file: str = ".env") -> Settings:
         channels_config_path=_str("CHANNELS_CONFIG_PATH", "./config/channels.json").strip(),
         scripts_dir=_str("CHANNEL_SCRIPTS_DIR", _str("SCRIPTS_DIR", "./scripts/channel_scripts")).strip(),
         gaurd_scripts_dir=_str("GAURD_SCRIPTS_DIR", "./scripts/gaurd_scrpts").strip(),
-        final_scripts_dir=_str("FINAL_SCRIPTS_DIR", "./scripts/final_scripts").strip(),
         storage_dir=_str("STORAGE_DIR", "./app_data").strip(),
         state_path=_str("STATE_PATH", "./app_data/state.json").strip(),
         default_max_message_mb=max(1, _int("DEFAULT_MAX_MESSAGE_MB", 50)),
         script_timeout_sec=max(5, _int("SCRIPT_TIMEOUT_SEC", 120)),
         gaurd_script_timeout_sec=max(5, _int("GAURD_SCRIPT_TIMEOUT_SEC", 60)),
-        final_script_timeout_sec=max(5, _int("FINAL_SCRIPT_TIMEOUT_SEC", 120)),
         poll_idle_sleep_sec=max(0.1, _float("POLL_IDLE_SLEEP_SEC", 1.0)),
         poll_error_sleep_sec=max(0.5, _float("POLL_ERROR_SLEEP_SEC", 5.0)),
         log_channel_target=_str("LOG_CHANNEL_TARGET", "").strip() or None,
@@ -204,7 +200,6 @@ def load_settings(env_file: str = ".env") -> Settings:
     Path(settings.storage_dir).mkdir(parents=True, exist_ok=True)
     Path(settings.scripts_dir).mkdir(parents=True, exist_ok=True)
     Path(settings.gaurd_scripts_dir).mkdir(parents=True, exist_ok=True)
-    Path(settings.final_scripts_dir).mkdir(parents=True, exist_ok=True)
     Path(settings.channels_config_path).parent.mkdir(parents=True, exist_ok=True)
     Path(settings.state_path).parent.mkdir(parents=True, exist_ok=True)
     Path(settings.admin_users_config_path).parent.mkdir(parents=True, exist_ok=True)
@@ -242,15 +237,6 @@ def _default_gaurd_script_name(route_obj: dict) -> str | None:
     return "default_guard.py"
 
 
-def _default_final_script_name(route_obj: dict) -> str | None:
-    if "final_script" in route_obj:
-        script = str(route_obj.get("final_script") or "").strip()
-        if not script:
-            return None
-        return safe_script_name(script)
-    return "default_final_script.py"
-
-
 def load_routes(config_path: str) -> RouteRegistry:
     path = Path(config_path)
     if not path.exists():
@@ -281,7 +267,6 @@ def load_routes(config_path: str) -> RouteRegistry:
 
         channel_script = _default_channel_script_name(obj)
         gaurd_script = _default_gaurd_script_name(obj)
-        final_script = _default_final_script_name(obj)
 
         max_message_mb_raw = obj.get("max_message_mb")
         max_message_mb: int | None
@@ -300,7 +285,6 @@ def load_routes(config_path: str) -> RouteRegistry:
             channel_script=channel_script,
             max_message_mb=max_message_mb,
             gaurd_script=gaurd_script,
-            final_script=final_script,
             sync_enabled=bool((obj.get("sync") or {}).get("enabled", False)) if isinstance(obj.get("sync"), dict) else False,
             sync_status=str((obj.get("sync") or {}).get("status", "active")).strip().lower()
             if isinstance(obj.get("sync"), dict)

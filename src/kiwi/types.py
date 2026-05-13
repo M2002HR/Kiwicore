@@ -64,7 +64,6 @@ class ChannelRoute:
     channel_script: str | None
     max_message_mb: int | None
     gaurd_script: str | None = "default_guard.py"
-    final_script: str | None = "default_final_script.py"
     sync_enabled: bool = False
     sync_status: str = "active"
     sync_backfill_count: int = 100

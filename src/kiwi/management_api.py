@@ -7,6 +7,19 @@ from typing import Callable
 from kiwi.config import RouteRegistry, load_routes
 from kiwi.utils import dump_json
 
+_ROUTE_KEYS = {
+    "name",
+    "enabled",
+    "source_channel_id",
+    "source_channel_username",
+    "destination_channel_id",
+    "destination_channel_username",
+    "channel_script",
+    "gaurd_script",
+    "max_message_mb",
+    "sync",
+}
+
 
 class ManagementApi:
     def __init__(
@@ -15,13 +28,11 @@ class ManagementApi:
         channels_config_path: str,
         scripts_dir: str,
         gaurd_scripts_dir: str,
-        final_scripts_dir: str | None = None,
         on_routes_reloaded: Callable[[RouteRegistry], None],
     ) -> None:
         self.channels_path = Path(channels_config_path)
         self.scripts_dir = Path(scripts_dir)
         self.guards_dir = Path(gaurd_scripts_dir)
-        self.final_scripts_dir = Path(final_scripts_dir or scripts_dir)
         self.on_routes_reloaded = on_routes_reloaded
         self.channels_path.parent.mkdir(parents=True, exist_ok=True)
         if not self.channels_path.exists():
@@ -110,9 +121,6 @@ class ManagementApi:
         # Backward compatibility with older call-sites.
         return self.list_channel_script_files()
 
-    def list_final_script_files(self) -> list[str]:
-        return sorted(p.name for p in self.final_scripts_dir.glob("*.py") if p.is_file())
-
     def list_guard_files(self) -> list[str]:
         return sorted(p.name for p in self.guards_dir.glob("*.py") if p.is_file())
 
@@ -136,11 +144,11 @@ class ManagementApi:
 
     @staticmethod
     def _normalize_route_payload(obj: dict) -> dict:
-        out = dict(obj)
+        out = {k: v for k, v in dict(obj).items() if k in _ROUTE_KEYS or k == "script"}
         if "channel_script" not in out and "script" in out:
             out["channel_script"] = out.get("script")
         out.pop("script", None)
-        for key in ("channel_script", "gaurd_script", "final_script"):
+        for key in ("channel_script", "gaurd_script"):
             if key not in out:
                 continue
             value = out.get(key)

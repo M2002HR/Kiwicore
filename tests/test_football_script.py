@@ -89,23 +89,57 @@ def test_football_script_applies_ai_text_to_caption_and_removes_old_text(tmp_pat
     ]
 
 
-def test_football_script_uses_image_parts_in_ai_request(tmp_path: Path, monkeypatch) -> None:
+def test_football_script_preserves_source_emojis_in_generated_caption(tmp_path: Path, monkeypatch) -> None:
     mod = _load_module()
     monkeypatch.setenv("FOOTBALL_AI_ENABLED", "true")
     monkeypatch.setenv("FOOTBALL_AI_ENDPOINT", "http://fake.local/proxy/gemini")
 
-    input_dir = tmp_path / "input"
-    input_dir.mkdir()
-    (input_dir / "frame.jpg").write_bytes(b"fakejpeg")
+    def fake_call(*, endpoint: str, body: dict, timeout_sec: float):
+        return "تیم با نمایش منظم و حملات سریع، سه امتیاز ارزشمند را گرفت."
 
-    captured: dict[str, object] = {}
-    calls = {"count": 0}
+    monkeypatch.setattr(mod, "_call_gemini_text", fake_call)
+
+    payload = {
+        "route": {"destination_target": "@dest"},
+        "message": {"caption": "برد دلچسب تیم 😍🔥"},
+        "inputs": [{"kind": "photo", "local_name": "a.jpg"}],
+    }
+    out = mod.build_messages(payload, input_dir=tmp_path)
+    caption = str(out[0].get("caption") or "")
+    assert "😍" in caption
+    assert "🔥" in caption
+
+
+def test_football_script_keeps_destination_signature_last_when_injecting_emojis(tmp_path: Path, monkeypatch) -> None:
+    mod = _load_module()
+    monkeypatch.setenv("FOOTBALL_AI_ENABLED", "true")
+    monkeypatch.setenv("FOOTBALL_AI_ENDPOINT", "http://fake.local/proxy/gemini")
 
     def fake_call(*, endpoint: str, body: dict, timeout_sec: float):
-        calls["count"] += 1
+        return "تیم با نمایش خوب بازی را برد.\n@dest"
+
+    monkeypatch.setattr(mod, "_call_gemini_text", fake_call)
+
+    payload = {
+        "route": {"destination_target": "@dest"},
+        "message": {"caption": "برد دلچسب تیم 😍"},
+        "inputs": [{"kind": "photo", "local_name": "a.jpg"}],
+    }
+    out = mod.build_messages(payload, input_dir=tmp_path)
+    caption = str(out[0].get("caption") or "")
+    assert "😍" in caption
+    assert caption.endswith("\n@dest")
+
+
+def test_football_script_ai_request_is_text_only_even_with_photo_input(tmp_path: Path, monkeypatch) -> None:
+    mod = _load_module()
+    monkeypatch.setenv("FOOTBALL_AI_ENABLED", "true")
+    monkeypatch.setenv("FOOTBALL_AI_ENDPOINT", "http://fake.local/proxy/gemini")
+
+    captured: dict[str, object] = {}
+
+    def fake_call(*, endpoint: str, body: dict, timeout_sec: float):
         captured["body"] = body
-        if calls["count"] == 1:
-            return None
         return "یک روایت فوتبالی روان از صحنه بازی"
 
     monkeypatch.setattr(mod, "_call_gemini_text", fake_call)
@@ -116,7 +150,7 @@ def test_football_script_uses_image_parts_in_ai_request(tmp_path: Path, monkeypa
         "inputs": [{"kind": "photo", "local_name": "frame.jpg", "mime_type": "image/jpeg"}],
     }
 
-    out = mod.build_messages(payload, input_dir=input_dir)
+    out = mod.build_messages(payload, input_dir=tmp_path)
     assert out[0]["caption"] == "یک روایت فوتبالی روان از صحنه بازی"
 
     body = captured.get("body")
@@ -125,7 +159,8 @@ def test_football_script_uses_image_parts_in_ai_request(tmp_path: Path, monkeypa
     assert isinstance(contents, list) and contents
     parts = contents[0].get("parts")
     assert isinstance(parts, list)
-    assert any(isinstance(part, dict) and "inlineData" in part for part in parts)
+    assert all(isinstance(part, dict) and "text" in part for part in parts)
+    assert not any(isinstance(part, dict) and "inlineData" in part for part in parts)
 
 
 def test_football_script_refines_low_quality_first_pass(tmp_path: Path, monkeypatch) -> None:
@@ -206,7 +241,7 @@ def test_football_script_postprocess_removes_prompt_leak_and_duplicate_signature
     assert "ساخت فیلم بیوگرافی رسمی ایان رایت در حال توسعه است." in caption
 
 
-def test_football_script_respects_global_budget_and_fails_closed_fast(tmp_path: Path, monkeypatch) -> None:
+def test_football_script_respects_global_budget_and_falls_back_fast(tmp_path: Path, monkeypatch) -> None:
     mod = _load_module()
     monkeypatch.setenv("FOOTBALL_AI_ENABLED", "true")
     monkeypatch.setenv("FOOTBALL_AI_ENDPOINT", "http://fake.local/proxy/gemini")
@@ -223,7 +258,7 @@ def test_football_script_respects_global_budget_and_fails_closed_fast(tmp_path: 
         "inputs": [],
     }
     out = mod.build_messages(payload, input_dir=tmp_path)
-    assert out == []
+    assert out == [{"type": "text", "text": "متن کوتاه"}]
 
 
 def test_football_script_forces_persian_rewrite_when_first_output_is_english(tmp_path: Path, monkeypatch) -> None:
@@ -250,19 +285,13 @@ def test_football_script_forces_persian_rewrite_when_first_output_is_english(tmp
     assert "برونو فرناندس" in (out[0].get("caption") or "")
 
 
-def test_football_script_emergency_caption_for_media_without_caption(tmp_path: Path, monkeypatch) -> None:
+def test_football_script_media_without_caption_passthroughs_without_ai(tmp_path: Path, monkeypatch) -> None:
     mod = _load_module()
     monkeypatch.setenv("FOOTBALL_AI_ENABLED", "true")
     monkeypatch.setenv("FOOTBALL_AI_ENDPOINT", "http://fake.local/proxy/gemini")
 
-    calls = {"count": 0}
-
     def fake_call(*, endpoint: str, body: dict, timeout_sec: float):
-        calls["count"] += 1
-        # first generation fails, emergency caption path succeeds
-        if calls["count"] == 1:
-            return None
-        return "آرسنال با این برد فاصله‌اش تا قهرمانی را کمتر کرد."
+        raise AssertionError("AI should not be called for media-only messages without text/caption")
 
     monkeypatch.setattr(mod, "_call_gemini_text", fake_call)
     payload = {
@@ -271,8 +300,51 @@ def test_football_script_emergency_caption_for_media_without_caption(tmp_path: P
         "inputs": [{"kind": "photo", "local_name": "a.jpg"}],
     }
     out = mod.build_messages(payload, input_dir=tmp_path)
-    assert out and out[0].get("type") == "photo"
-    assert "آرسنال" in str(out[0].get("caption") or "")
+    assert out == [{"type": "photo", "path": "a.jpg"}]
+
+
+def test_football_script_non_photo_without_caption_passthroughs_without_ai(tmp_path: Path, monkeypatch) -> None:
+    mod = _load_module()
+    monkeypatch.setenv("FOOTBALL_AI_ENABLED", "true")
+    monkeypatch.setenv("FOOTBALL_AI_ENDPOINT", "http://fake.local/proxy/gemini")
+
+    def fake_call(*, endpoint: str, body: dict, timeout_sec: float):
+        raise AssertionError("AI should not be called for media-only messages without text/caption")
+
+    monkeypatch.setattr(mod, "_call_gemini_text", fake_call)
+    payload = {
+        "route": {"destination_target": "@dest"},
+        "message": {},
+        "inputs": [{"kind": "video", "local_name": "a.mp4"}],
+    }
+
+    out = mod.build_messages(payload, input_dir=tmp_path)
+    assert out == [{"type": "video", "path": "a.mp4"}]
+
+
+def test_football_script_builds_prompt_even_when_ai_is_disabled(tmp_path: Path, monkeypatch) -> None:
+    mod = _load_module()
+    monkeypatch.setenv("FOOTBALL_AI_ENABLED", "false")
+
+    seen: dict[str, str] = {}
+    original_prompt = mod._football_prompt
+
+    def tracking_prompt(source_text: str, destination: str) -> str:
+        seen["source_text"] = source_text
+        seen["destination"] = destination
+        return original_prompt(source_text, destination)
+
+    monkeypatch.setattr(mod, "_football_prompt", tracking_prompt)
+
+    payload = {
+        "route": {"destination_target": "@dest"},
+        "message": {"text": "Inter Miami won"},
+        "inputs": [],
+    }
+    out = mod.build_messages(payload, input_dir=tmp_path)
+    assert seen["destination"] == "@dest"
+    assert "TEXT:" in seen["source_text"]
+    assert out == [{"type": "text", "text": "Inter Miami won"}]
 
 
 def test_football_script_never_passes_non_persian_caption_in_ai_mode(tmp_path: Path, monkeypatch) -> None:
@@ -289,6 +361,21 @@ def test_football_script_never_passes_non_persian_caption_in_ai_mode(tmp_path: P
         "route": {"destination_target": "@dest"},
         "message": {"caption": "english cap"},
         "inputs": [{"kind": "photo", "local_name": "a.jpg"}],
+    }
+    out = mod.build_messages(payload, input_dir=tmp_path)
+    assert out == [{"type": "photo", "path": "a.jpg", "caption": "english cap"}]
+
+
+def test_football_script_mandatory_mode_skips_empty_source_message(tmp_path: Path, monkeypatch) -> None:
+    mod = _load_module()
+    monkeypatch.setenv("FOOTBALL_AI_ENABLED", "true")
+    monkeypatch.setenv("FOOTBALL_AI_MANDATORY", "true")
+    monkeypatch.setenv("FOOTBALL_AI_ENDPOINT", "http://fake.local/proxy/gemini")
+
+    payload = {
+        "route": {"destination_target": "@dest"},
+        "message": {},
+        "inputs": [],
     }
     out = mod.build_messages(payload, input_dir=tmp_path)
     assert out == []

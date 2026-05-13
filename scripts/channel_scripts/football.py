@@ -25,6 +25,9 @@ PROMPT_LEAK_RE = re.compile(
     re.IGNORECASE,
 )
 MEDIA_OUTPUT_TYPES = {"photo", "video", "voice", "audio", "document", "animation", "video_note"}
+EMOJI_JOINER = "\u200d"
+EMOJI_VARIATION = "\ufe0f"
+EMOJI_KEYCAP = "\u20e3"
 
 try:
     from default_channel_script import build_passthrough_messages as _default_build_passthrough_messages
@@ -131,22 +134,24 @@ def _pick_ai_model() -> str:
 def _ai_timeout_sec() -> float:
     raw = os.getenv("FOOTBALL_AI_TIMEOUT_SEC", "20").strip() or "20"
     try:
-        return max(4.0, min(45.0, float(raw)))
+        return max(8.0, min(60.0, float(raw)))
     except Exception:
         return 20.0
 
 
 def _ai_retry_count() -> int:
-    raw = os.getenv("FOOTBALL_AI_RETRY_COUNT", "1").strip() or "1"
+    raw = os.getenv("FOOTBALL_AI_RETRY_COUNT", "2").strip() or "2"
     try:
-        # Hard cap retries for latency safety in channel-script runtime.
-        return max(0, min(1, int(raw)))
+        retries = max(0, min(3, int(raw)))
     except Exception:
-        return 1
+        retries = 2
+    if _ai_mandatory_mode():
+        return max(2, retries)
+    return retries
 
 
 def _ai_fail_open() -> bool:
-    return os.getenv("FOOTBALL_AI_FAIL_OPEN", "false").strip().lower() in {"1", "true", "yes", "on"}
+    return os.getenv("FOOTBALL_AI_FAIL_OPEN", "true").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _ai_max_images() -> int:
@@ -163,6 +168,13 @@ def _ai_total_budget_sec() -> float:
         return max(15.0, min(110.0, float(raw)))
     except Exception:
         return 75.0
+
+
+def _ai_mandatory_mode() -> bool:
+    forced = os.getenv("FOOTBALL_AI_MANDATORY", "false").strip().lower() in {"1", "true", "yes", "on"}
+    if not forced:
+        return False
+    return _football_ai_enabled()
 
 
 def _destination_signature(payload: dict) -> str:
@@ -190,22 +202,16 @@ def _collect_source_text(payload: dict) -> str:
     if isinstance(caption, str) and caption.strip() and caption.strip() != (text.strip() if isinstance(text, str) else ""):
         parts.append(f"CAPTION:\n{caption.strip()}")
 
-    inputs = payload.get("inputs") or []
-    if isinstance(inputs, list) and inputs:
-        media_lines: list[str] = []
-        for idx, item in enumerate(inputs, start=1):
-            if not isinstance(item, dict):
-                continue
-            kind = str(item.get("kind") or "unknown").strip().lower()
-            file_name = str(item.get("file_name") or item.get("local_name") or "").strip()
-            if file_name:
-                media_lines.append(f"{idx}. {kind}: {file_name}")
-            else:
-                media_lines.append(f"{idx}. {kind}")
-        if media_lines:
-            parts.append("MEDIA:\n" + "\n".join(media_lines))
-
     return "\n\n".join(parts).strip()
+
+
+def _has_textual_source(payload: dict) -> bool:
+    message = payload.get("message")
+    if not isinstance(message, dict):
+        return False
+    text = str(message.get("text") or "").strip()
+    caption = str(message.get("caption") or "").strip()
+    return bool(text or caption)
 
 
 def _is_image_input(item: dict) -> bool:
@@ -276,6 +282,7 @@ def _football_prompt(source_text: str, destination: str) -> str:
         "6) هیچ توضیح فرامتنی، لیست، یا قالب Markdown نده.\n"
         "7) لینک و هشتگ تبلیغی نیاور.\n"
         "8) اگر امضای مقصد داده شده، فقط در خط آخر و فقط یک بار بیاور.\n\n"
+        "9) ایموجی‌های معنادار ورودی را حذف نکن و در خروجی به‌شکل طبیعی حفظ کن.\n\n"
         f"امضای مقصد: {destination or '<none>'}\n\n"
         f"ورودی:\n{source_text or '<empty>'}"
     )
@@ -396,11 +403,15 @@ def _is_latin_heavy_line(line: str) -> bool:
     return (latin_tokens / max(1, len(tokens))) >= 0.6
 
 
-def _strip_prompt_leakage_lines(text: str) -> str:
+def _strip_prompt_leakage_lines(text: str, *, destination: str = "") -> str:
+    destination_line = destination.strip()
     kept: list[str] = []
     for raw in text.splitlines():
         line = raw.strip()
         if not line:
+            continue
+        if destination_line and line == destination_line:
+            kept.append(line)
             continue
         if PROMPT_LEAK_RE.search(line):
             continue
@@ -446,10 +457,134 @@ def _normalize_signature(text: str, destination: str) -> str:
     return out
 
 
+def _is_emoji_base_char(ch: str) -> bool:
+    if not ch:
+        return False
+    cp = ord(ch)
+    return (
+        0x1F300 <= cp <= 0x1FAFF
+        or 0x2600 <= cp <= 0x27BF
+        or cp in {0x00A9, 0x00AE, 0x203C, 0x2049, 0x2122, 0x2139, 0x3030, 0x303D, 0x3297, 0x3299}
+    )
+
+
+def _is_regional_indicator(ch: str) -> bool:
+    if not ch:
+        return False
+    cp = ord(ch)
+    return 0x1F1E6 <= cp <= 0x1F1FF
+
+
+def _is_skin_tone(ch: str) -> bool:
+    if not ch:
+        return False
+    cp = ord(ch)
+    return 0x1F3FB <= cp <= 0x1F3FF
+
+
+def _extract_emoji_tokens(text: str) -> list[str]:
+    out: list[str] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if _is_regional_indicator(ch) and i + 1 < n and _is_regional_indicator(text[i + 1]):
+            out.append(text[i : i + 2])
+            i += 2
+            continue
+
+        if ch in "0123456789#*":
+            if i + 1 < n and text[i + 1] == EMOJI_KEYCAP:
+                out.append(text[i : i + 2])
+                i += 2
+                continue
+            if i + 2 < n and text[i + 1] == EMOJI_VARIATION and text[i + 2] == EMOJI_KEYCAP:
+                out.append(text[i : i + 3])
+                i += 3
+                continue
+
+        if not _is_emoji_base_char(ch):
+            i += 1
+            continue
+
+        start = i
+        i += 1
+        if i < n and text[i] == EMOJI_VARIATION:
+            i += 1
+        if i < n and _is_skin_tone(text[i]):
+            i += 1
+
+        while i + 1 < n and text[i] == EMOJI_JOINER and _is_emoji_base_char(text[i + 1]):
+            i += 2
+            if i < n and text[i] == EMOJI_VARIATION:
+                i += 1
+            if i < n and _is_skin_tone(text[i]):
+                i += 1
+
+        out.append(text[start:i])
+    return out
+
+
+def _source_emoji_tokens(payload: dict) -> list[str]:
+    message = payload.get("message")
+    if not isinstance(message, dict):
+        return []
+
+    source_parts: list[str] = []
+    for key in ("text", "caption"):
+        value = message.get(key)
+        if isinstance(value, str) and value.strip():
+            source_parts.append(value)
+    if not source_parts:
+        return []
+
+    extracted: list[str] = []
+    for part in source_parts:
+        extracted.extend(_extract_emoji_tokens(part))
+
+    unique: list[str] = []
+    seen: set[str] = set()
+    for token in extracted:
+        if token in seen:
+            continue
+        seen.add(token)
+        unique.append(token)
+    return unique
+
+
+def _preserve_source_emojis(text: str, *, destination: str, source_emojis: list[str]) -> str:
+    if not text or not source_emojis:
+        return text
+
+    current = set(_extract_emoji_tokens(text))
+    missing = [token for token in source_emojis if token not in current]
+    if not missing:
+        return text
+
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    bundle = " ".join(missing).strip()
+    if not bundle:
+        return text
+
+    if not lines:
+        return bundle
+
+    if destination and lines[-1] == destination:
+        body = lines[:-1]
+        if body:
+            body[0] = f"{bundle} {body[0]}".strip()
+        else:
+            body = [bundle]
+        return _normalize_text("\n".join([*body, destination]))
+
+    lines[0] = f"{bundle} {lines[0]}".strip()
+    return _normalize_text("\n".join(lines))
+
+
 def _postprocess_generated_text(text: str, *, destination: str) -> str:
     out = _strip_md_fence(text)
     out = _sanitize_ai_output(out)
-    out = _strip_prompt_leakage_lines(out)
+    out = _strip_prompt_leakage_lines(out, destination=destination)
     out = _dedupe_lines(out)
     out = _normalize_signature(out, destination)
     return _normalize_text(out)
@@ -510,13 +645,35 @@ def _fallback_source_caption(payload: dict) -> str | None:
     caption = message.get("caption")
     if isinstance(caption, str) and caption.strip():
         return _normalize_text(caption)
-    text = message.get("text")
-    if isinstance(text, str) and text.strip():
-        return _normalize_text(text)
     return None
 
 
+def _has_meaningful_source(payload: dict) -> bool:
+    message = payload.get("message")
+    if isinstance(message, dict):
+        text = str(message.get("text") or "").strip()
+        caption = str(message.get("caption") or "").strip()
+        if text or caption:
+            return True
+
+    inputs = payload.get("inputs")
+    if not isinstance(inputs, list):
+        return False
+    for item in inputs:
+        if not isinstance(item, dict):
+            continue
+        kind = str(item.get("kind") or "").strip().lower()
+        if kind and kind != "sticker":
+            return True
+    return False
+
+
 def _generate_football_text(*, payload: dict, input_dir: Path, base_messages: list[dict]) -> str | None:
+    source_text = _collect_source_text(payload)
+    destination = _destination_signature(payload)
+    source_emojis = _source_emoji_tokens(payload)
+    prompt = _football_prompt(source_text, destination=destination)
+
     if not _football_ai_enabled():
         return None
 
@@ -524,8 +681,7 @@ def _generate_football_text(*, payload: dict, input_dir: Path, base_messages: li
     if not endpoint:
         return None
 
-    source_text = _collect_source_text(payload)
-    if not source_text and not base_messages:
+    if not source_text:
         return None
 
     deadline = time.monotonic() + _ai_total_budget_sec()
@@ -539,9 +695,6 @@ def _generate_football_text(*, payload: dict, input_dir: Path, base_messages: li
             return None
         call_budget = min(_ai_timeout_sec(), remaining)
         return _call_gemini_text(endpoint=endpoint, body=body, timeout_sec=call_budget)
-
-    destination = _destination_signature(payload)
-    prompt = _football_prompt(source_text, destination=destination)
 
     def _build_body(parts: list[dict], *, temperature: float) -> dict:
         body: dict = {
@@ -557,14 +710,10 @@ def _generate_football_text(*, payload: dict, input_dir: Path, base_messages: li
     text_only_body = _build_body([{"text": prompt}], temperature=0.2)
     first = _call_with_budget(text_only_body)
     if first is None:
-        image_parts = _load_image_parts(payload, input_dir)
-        if image_parts and _remaining_budget() > 5.0:
-            image_body = _build_body([{"text": prompt}, *image_parts], temperature=0.2)
-            first = _call_with_budget(image_body)
-    if first is None:
         return "" if not _ai_fail_open() else None
 
     cleaned = _postprocess_generated_text(first, destination=destination)
+    cleaned = _preserve_source_emojis(cleaned, destination=destination, source_emojis=source_emojis)
 
     if _looks_low_quality(cleaned) and _remaining_budget() > 6.0:
         refine_prompt = (
@@ -572,6 +721,7 @@ def _generate_football_text(*, payload: dict, input_dir: Path, base_messages: li
             "هیچ توضیحی اضافه نکن و فقط نسخه نهایی را بده.\n"
             "غلط املایی/نگارشی نداشته باشد.\n"
             "حداکثر 4 جمله.\n\n"
+            "ایموجی‌های اصلی متن را حذف نکن.\n\n"
             "هیچ خط انگلیسی یا توضیح فرامتنی نیاور.\n"
             "اگر امضای مقصد وجود دارد، فقط یک‌بار در خط آخر بیاور.\n\n"
             f"متن:\n{cleaned or source_text}"
@@ -586,6 +736,7 @@ def _generate_football_text(*, payload: dict, input_dir: Path, base_messages: li
         second = _call_with_budget(refine_body)
         if second:
             candidate = _postprocess_generated_text(second, destination=destination)
+            candidate = _preserve_source_emojis(candidate, destination=destination, source_emojis=source_emojis)
             if candidate:
                 cleaned = candidate
 
@@ -603,6 +754,7 @@ def _generate_football_text(*, payload: dict, input_dir: Path, base_messages: li
                 "هیچ خط انگلیسی نیاور.\n"
                 "معنی تغییر نکند.\n"
                 "حداکثر 4 جمله.\n\n"
+                "ایموجی‌های موجود را حذف نکن.\n\n"
                 f"متن:\n{strict_source}"
             )
             strict_body: dict = {
@@ -615,6 +767,7 @@ def _generate_football_text(*, payload: dict, input_dir: Path, base_messages: li
             if not strict:
                 continue
             strict_clean = _postprocess_generated_text(strict, destination=destination)
+            strict_clean = _preserve_source_emojis(strict_clean, destination=destination, source_emojis=source_emojis)
             if strict_clean:
                 cleaned = strict_clean
             if _is_persian_acceptable(cleaned):
@@ -657,44 +810,24 @@ def _apply_generated_text(base_messages: list[dict], generated_text: str) -> lis
 def build_messages(payload: dict, *, input_dir: Path) -> list[dict]:
     base = _build_base_messages(payload)
     generated = _generate_football_text(payload=payload, input_dir=input_dir, base_messages=base)
-    ai_enabled = _football_ai_enabled()
-    ai_endpoint = _pick_ai_endpoint()
-    ai_fail_open = _ai_fail_open()
-    ai_mandatory = ai_enabled and bool(ai_endpoint) and not ai_fail_open
+    ai_mandatory = _ai_mandatory_mode()
+    has_textual_source = _has_textual_source(payload)
+
+    if ai_mandatory and (generated is None or not generated):
+        if not has_textual_source:
+            # Non-text messages must pass through unchanged.
+            return base
+        raise RuntimeError("football_ai_generation_required_failed")
+
     if generated is None:
-        out = [] if ai_mandatory else base
+        out = base
     elif generated:
         out = _apply_generated_text(base, generated)
     else:
-        out = [] if ai_mandatory else base
+        out = base
 
-    # If media exists without caption, force AI caption generation once more.
-    if (_has_media_without_caption(out) or (not out and _has_any_media(base))) and ai_enabled:
-        endpoint = ai_endpoint
-        if endpoint:
-            source_text = _collect_source_text(payload)
-            destination = _destination_signature(payload)
-            prompt = (
-                "یک کپشن فوتبالی فارسی، طبیعی و کوتاه (حداکثر 2 جمله) تولید کن.\n"
-                "فقط خود کپشن را بده.\n"
-                "هیچ متن انگلیسی نیاور.\n\n"
-                f"ورودی:\n{source_text or '<empty>'}"
-            )
-            body: dict = {
-                "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-                "generationConfig": {"temperature": 0.1},
-            }
-            model = _pick_ai_model()
-            if model:
-                body["model"] = model
-            emergency = _call_gemini_text(endpoint=endpoint, body=body, timeout_sec=min(12.0, _ai_timeout_sec()))
-            if emergency:
-                emergency_clean = _postprocess_generated_text(emergency, destination=destination)
-                if _is_persian_acceptable(emergency_clean):
-                    out = _apply_generated_text(base, emergency_clean)
-
-    # Last safety net: never let media out without caption when source had text/caption.
-    if _has_media_without_caption(out) and not ai_mandatory:
+    # Last safety net: only reuse source caption/text when textual source exists.
+    if _has_media_without_caption(out) and not ai_mandatory and has_textual_source:
         fallback_caption = _fallback_source_caption(payload)
         if fallback_caption:
             injected: list[dict] = []
@@ -719,11 +852,11 @@ def build_messages(payload: dict, *, input_dir: Path) -> list[dict]:
             if msg_type == "text":
                 text = str(item.get("text") or "").strip()
                 if text and not _is_persian_acceptable(text):
-                    return []
+                    raise RuntimeError("football_ai_output_not_persian")
             if msg_type in CAPTION_TYPES:
                 caption = str(item.get("caption") or "").strip()
                 if caption and not _is_persian_acceptable(caption):
-                    return []
+                    raise RuntimeError("football_ai_caption_not_persian")
     return out
 
 
@@ -738,8 +871,11 @@ def main() -> None:
         payload = _load_payload(Path(args.payload))
         messages = build_messages(payload, input_dir=Path(args.input_dir))
     except Exception as exc:
-        # Never break pipeline output format; fail-open with passthrough.
         print(f"[football.py] non-fatal error: {exc}", file=sys.stderr)
+        if _ai_mandatory_mode():
+            # In mandatory mode do not pass source text through;
+            # let upstream sync retry this message.
+            sys.exit(2)
         try:
             payload = _load_payload(Path(args.payload))
             messages = _build_base_messages(payload)

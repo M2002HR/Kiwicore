@@ -33,22 +33,6 @@ AI_META_LINE_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Emojis/symbols that should be removed from outgoing content.
-EMOJI_BLOCKLIST = (
-    "🇮🇱",  # Israel flag
-    "🏳️‍⚧️",  # trans flag
-    "⚧️",
-    "⚧",
-    "🏳️‍🌈",  # rainbow flag
-    "🌈",
-    "👰",
-    "👰‍♀️",
-    "👰‍♂️",
-    "🤵",
-    "🤵‍♀️",
-    "🤵‍♂️",
-)
-
 
 def _load_payload(path: Path) -> dict:
     raw = json.loads(path.read_text(encoding="utf-8"))
@@ -153,8 +137,6 @@ def _sanitize_text(value: str | None, *, payload: dict) -> str | None:
         return None
 
     text = value
-    for token in EMOJI_BLOCKLIST:
-        text = text.replace(token, "")
 
     had_reference = _has_reference(text)
     if had_reference:

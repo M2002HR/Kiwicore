@@ -12,6 +12,7 @@ class FakeBaleClient:
     def __init__(self) -> None:
         self.calls: list[tuple[str, str, str | None]] = []
         self.media_group_calls: list[tuple[str, int]] = []
+        self.media_group_payloads: list[list[dict]] = []
 
     async def send_message(self, chat_id: str, text: str, reply_markup: dict | None = None):
         self.calls.append(("text", chat_id, text))
@@ -51,6 +52,7 @@ class FakeBaleClient:
 
     async def send_media_group(self, chat_id: str, media_group: list[dict]):
         self.media_group_calls.append((chat_id, len(media_group)))
+        self.media_group_payloads.append(list(media_group))
         return [{"ok": True}]
 
 
@@ -71,8 +73,8 @@ def test_dispatcher_sends_text_and_file(tmp_path: Path) -> None:
 
     asyncio.run(dispatcher.dispatch("-200", messages, output_dir=output_dir, input_dir=input_dir))
 
-    assert client.calls[0] == ("text", "-200", "hello")
-    assert client.calls[1] == ("photo", "-200", "cap")
+    assert client.calls[0] == ("text", "-200", "hello\n-200")
+    assert client.calls[1] == ("photo", "-200", "cap\n-200")
 
 
 def test_dispatcher_blocks_sticker_and_sends_video_note(tmp_path: Path) -> None:
@@ -114,6 +116,113 @@ def test_dispatcher_sends_media_group_for_consecutive_items(tmp_path: Path) -> N
     asyncio.run(dispatcher.dispatch("@chan", messages, output_dir=output_dir, input_dir=input_dir))
 
     assert client.media_group_calls == [("@chan", 2)]
+    assert client.media_group_payloads[0][0].get("caption") == "cap\n@chan"
+    assert client.media_group_payloads[0][1].get("caption") in {None, ""}
+    assert client.calls == []
+
+
+def test_dispatcher_keeps_captionless_media_captionless(tmp_path: Path) -> None:
+    client = FakeBaleClient()
+    dispatcher = BaleDispatcher(client)
+
+    input_dir = tmp_path / "input"
+    output_dir = tmp_path / "output"
+    input_dir.mkdir()
+    output_dir.mkdir()
+    (output_dir / "a.jpg").write_bytes(b"1")
+
+    messages = [
+        ScriptOutputMessage(type=OutputMessageKind.PHOTO, path="a.jpg"),
+    ]
+    asyncio.run(dispatcher.dispatch("@chan", messages, output_dir=output_dir, input_dir=input_dir))
+
+    assert client.calls == [("photo", "@chan", None)]
+
+
+def test_dispatcher_promotes_non_first_caption_to_first_in_media_group(tmp_path: Path) -> None:
+    client = FakeBaleClient()
+    dispatcher = BaleDispatcher(client)
+
+    input_dir = tmp_path / "input"
+    output_dir = tmp_path / "output"
+    input_dir.mkdir()
+    output_dir.mkdir()
+    (output_dir / "a.jpg").write_bytes(b"1")
+    (output_dir / "b.jpg").write_bytes(b"2")
+
+    messages = [
+        ScriptOutputMessage(type=OutputMessageKind.PHOTO, path="a.jpg"),
+        ScriptOutputMessage(type=OutputMessageKind.PHOTO, path="b.jpg", caption="cap on second"),
+    ]
+    asyncio.run(dispatcher.dispatch("@chan", messages, output_dir=output_dir, input_dir=input_dir))
+
+    payload = client.media_group_payloads[0]
+    assert payload[0].get("caption") == "cap on second\n@chan"
+    assert payload[1].get("caption") in {None, ""}
+
+
+def test_dispatcher_fallback_preserves_caption_when_first_album_item_fails(tmp_path: Path) -> None:
+    class PartialFallbackClient(FakeBaleClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.first_send = True
+
+        async def send_media_group(self, chat_id: str, media_group: list[dict]):
+            raise PlatformApiError("sendMediaGroup HTTP 400: bad request")
+
+        async def send_photo(self, chat_id: str, photo_path: Path, caption: str | None = None):
+            if self.first_send:
+                self.first_send = False
+                raise PlatformApiError("sendPhoto HTTP 500: failed to upload file bytes")
+            self.calls.append(("photo", chat_id, caption))
+            return {"ok": True}
+
+    client = PartialFallbackClient()
+    dispatcher = BaleDispatcher(client)
+
+    input_dir = tmp_path / "input"
+    output_dir = tmp_path / "output"
+    input_dir.mkdir()
+    output_dir.mkdir()
+    (output_dir / "a.jpg").write_bytes(b"1")
+    (output_dir / "b.jpg").write_bytes(b"2")
+
+    messages = [
+        ScriptOutputMessage(type=OutputMessageKind.PHOTO, path="a.jpg", caption="album caption"),
+        ScriptOutputMessage(type=OutputMessageKind.PHOTO, path="b.jpg"),
+    ]
+    asyncio.run(dispatcher.dispatch("@chan", messages, output_dir=output_dir, input_dir=input_dir))
+
+    assert ("text", "@chan", "album caption\n@chan") in client.calls
+
+
+def test_dispatcher_does_not_fallback_to_single_send_on_transient_media_group_error(tmp_path: Path) -> None:
+    class TransientGroupFailClient(FakeBaleClient):
+        async def send_media_group(self, chat_id: str, media_group: list[dict]):
+            # Simulate ambiguous transport error where album may already be delivered upstream.
+            raise PlatformApiError("sendMediaGroup network error: ReadTimeout")
+
+    client = TransientGroupFailClient()
+    dispatcher = BaleDispatcher(client)
+
+    input_dir = tmp_path / "input"
+    output_dir = tmp_path / "output"
+    input_dir.mkdir()
+    output_dir.mkdir()
+    (output_dir / "a.jpg").write_bytes(b"1")
+    (output_dir / "b.jpg").write_bytes(b"2")
+
+    messages = [
+        ScriptOutputMessage(type=OutputMessageKind.PHOTO, path="a.jpg", caption="cap"),
+        ScriptOutputMessage(type=OutputMessageKind.PHOTO, path="b.jpg"),
+    ]
+
+    try:
+        asyncio.run(dispatcher.dispatch("@chan", messages, output_dir=output_dir, input_dir=input_dir))
+        assert False, "expected PlatformApiError"
+    except PlatformApiError:
+        pass
+    # No single-media fallback should occur on transient/ambiguous media-group error.
     assert client.calls == []
 
 
@@ -158,10 +267,10 @@ def test_dispatcher_does_not_mix_document_and_photo_groups(tmp_path: Path) -> No
     asyncio.run(dispatcher.dispatch("@chan", messages, output_dir=output_dir, input_dir=input_dir))
 
     assert client.media_group_calls == [("@chan", 2)]
-    assert client.calls[0] == ("photo", "@chan", "cap")
+    assert client.calls[0] == ("photo", "@chan", "cap\n@chan")
 
 
-def test_dispatcher_falls_back_to_document_when_send_audio_fails(tmp_path: Path) -> None:
+def test_dispatcher_does_not_fallback_to_document_when_send_audio_fails(tmp_path: Path) -> None:
     class FailingAudioClient(FakeBaleClient):
         async def send_audio(self, chat_id: str, audio_path: Path, caption: str | None = None):
             raise PlatformApiError("sendAudio network error: ReadTimeout")
@@ -178,5 +287,21 @@ def test_dispatcher_falls_back_to_document_when_send_audio_fails(tmp_path: Path)
     messages = [
         ScriptOutputMessage(type=OutputMessageKind.AUDIO, path="x.mp3", caption="c"),
     ]
+    try:
+        asyncio.run(dispatcher.dispatch("@chan", messages, output_dir=output_dir, input_dir=input_dir))
+        assert False, "expected PlatformApiError"
+    except PlatformApiError:
+        pass
+    assert client.calls == []
+
+
+def test_dispatcher_skips_empty_text_message(tmp_path: Path) -> None:
+    client = FakeBaleClient()
+    dispatcher = BaleDispatcher(client)
+    input_dir = tmp_path / "input"
+    output_dir = tmp_path / "output"
+    input_dir.mkdir()
+    output_dir.mkdir()
+    messages = [ScriptOutputMessage(type=OutputMessageKind.TEXT, text="   ")]
     asyncio.run(dispatcher.dispatch("@chan", messages, output_dir=output_dir, input_dir=input_dir))
-    assert client.calls == [("document", "@chan", "c")]
+    assert client.calls == []

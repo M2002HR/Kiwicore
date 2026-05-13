@@ -17,6 +17,7 @@ class BaleDispatcher:
 
     def __init__(self, bale_client) -> None:
         self.bale_client = bale_client
+        self.media_upload_fallback_mode = "none"
 
     async def dispatch(
         self,
@@ -63,7 +64,7 @@ class BaleDispatcher:
                 idx = j
                 continue
 
-            media_group = []
+            resolved_group: list[tuple[ScriptOutputMessage, Path, str | None]] = []
             for item in group:
                 path = self._resolve_path(
                     item.path or "",
@@ -71,25 +72,61 @@ class BaleDispatcher:
                     input_dir=input_dir,
                     extra_input_dirs=extra_input_dirs,
                 )
-                media_group.append({"type": item.type.value, "path": path, "caption": item.caption})
+                caption = item.caption.strip() if isinstance(item.caption, str) and item.caption.strip() else None
+                resolved_group.append((item, path, caption))
+
+            # Album-level caption should be carried by the first media item.
+            # Some clients/platforms ignore captions on non-first items.
+            group_caption_raw = next((cap for _, _, cap in resolved_group if cap), None)
+            group_caption = self._with_destination_footer(
+                group_caption_raw,
+                destination_target=destination_target,
+                ensure_nonempty=False,
+            )
+            media_group = []
+            for index, (item, path, _) in enumerate(resolved_group):
+                media_group.append({"type": item.type.value, "path": path, "caption": group_caption if index == 0 else None})
 
             try:
                 await self._send_media_group_with_retry(destination_target, media_group)
-            except PlatformApiError:
+            except PlatformApiError as exc:
+                # Transient media-group failures are ambiguous: the upstream may have accepted
+                # the album even if the client saw a timeout. Falling back to single sends here
+                # can create duplicates (for example, one extra captionless photo).
+                if self._is_transient_error(exc):
+                    raise
                 sent_any = False
+                sent_first_item = False
                 last_error: PlatformApiError | None = None
-                for item in group:
+                for index, (item, _, _) in enumerate(resolved_group):
+                    dispatch_item = item
+                    if index == 0 and isinstance(group_caption, str) and group_caption.strip():
+                        dispatch_item = ScriptOutputMessage(
+                            type=item.type,
+                            text=item.text,
+                            path=item.path,
+                            caption=group_caption,
+                        )
                     try:
                         sent_any = await self._send_one(
                             destination_target,
-                            item,
+                            dispatch_item,
                             output_dir=output_dir,
                             input_dir=input_dir,
                             extra_input_dirs=extra_input_dirs,
                         ) or sent_any
+                        if index == 0:
+                            sent_first_item = True
                     except PlatformApiError as exc:
                         last_error = exc
                         continue
+                # If fallback sent part of album but missed first item (caption carrier),
+                # deliver caption separately to avoid text loss.
+                if sent_any and not sent_first_item and isinstance(group_caption, str) and group_caption.strip():
+                    try:
+                        await self.bale_client.send_message(destination_target, group_caption.strip())
+                    except PlatformApiError as exc:
+                        last_error = exc
                 if not sent_any and last_error is not None:
                     raise last_error
             idx = j
@@ -104,7 +141,11 @@ class BaleDispatcher:
         extra_input_dirs: list[Path] | None = None,
     ) -> bool:
         if message.type == OutputMessageKind.TEXT:
-            await self.bale_client.send_message(destination_target, message.text or "")
+            raw_text = (message.text or "").strip()
+            if not raw_text:
+                return False
+            text = self._with_destination_footer(raw_text, destination_target=destination_target, ensure_nonempty=False) or raw_text
+            await self.bale_client.send_message(destination_target, text)
             return True
 
         path = self._resolve_path(
@@ -115,42 +156,52 @@ class BaleDispatcher:
         )
 
         if message.type == OutputMessageKind.PHOTO:
-            return await self._send_with_document_fallback(
+            return await self._send_media_with_text_fallback(
                 send_primary=self.bale_client.send_photo,
                 destination_target=destination_target,
                 path=path,
-                caption=message.caption,
+                caption=self._with_destination_footer(message.caption, destination_target=destination_target, ensure_nonempty=False),
+                media_kind=OutputMessageKind.PHOTO.value,
             )
         if message.type == OutputMessageKind.VIDEO:
-            return await self._send_with_document_fallback(
+            return await self._send_media_with_text_fallback(
                 send_primary=self.bale_client.send_video,
                 destination_target=destination_target,
                 path=path,
-                caption=message.caption,
+                caption=self._with_destination_footer(message.caption, destination_target=destination_target, ensure_nonempty=False),
+                media_kind=OutputMessageKind.VIDEO.value,
             )
         if message.type == OutputMessageKind.VOICE:
-            return await self._send_with_document_fallback(
+            return await self._send_media_with_text_fallback(
                 send_primary=self.bale_client.send_voice,
                 destination_target=destination_target,
                 path=path,
-                caption=message.caption,
+                caption=self._with_destination_footer(message.caption, destination_target=destination_target, ensure_nonempty=False),
+                media_kind=OutputMessageKind.VOICE.value,
             )
         if message.type == OutputMessageKind.AUDIO:
-            return await self._send_with_document_fallback(
+            return await self._send_media_with_text_fallback(
                 send_primary=self.bale_client.send_audio,
                 destination_target=destination_target,
                 path=path,
-                caption=message.caption,
+                caption=self._with_destination_footer(message.caption, destination_target=destination_target, ensure_nonempty=False),
+                media_kind=OutputMessageKind.AUDIO.value,
             )
         if message.type == OutputMessageKind.DOCUMENT:
-            await self.bale_client.send_document(destination_target, path, caption=message.caption)
-            return True
+            return await self._send_media_with_text_fallback(
+                send_primary=self.bale_client.send_document,
+                destination_target=destination_target,
+                path=path,
+                caption=self._with_destination_footer(message.caption, destination_target=destination_target, ensure_nonempty=False),
+                media_kind=OutputMessageKind.DOCUMENT.value,
+            )
         if message.type == OutputMessageKind.ANIMATION:
-            return await self._send_with_document_fallback(
+            return await self._send_media_with_text_fallback(
                 send_primary=self.bale_client.send_animation,
                 destination_target=destination_target,
                 path=path,
-                caption=message.caption,
+                caption=self._with_destination_footer(message.caption, destination_target=destination_target, ensure_nonempty=False),
+                media_kind=OutputMessageKind.ANIMATION.value,
             )
         if message.type == OutputMessageKind.STICKER:
             # Global policy: stickers are blocked and never sent.
@@ -208,21 +259,29 @@ class BaleDispatcher:
         assert last_error is not None
         raise last_error
 
-    async def _send_with_document_fallback(
+    async def _send_media_with_text_fallback(
         self,
         *,
         send_primary,
         destination_target: str,
         path: Path,
         caption: str | None,
+        media_kind: str,
     ) -> bool:
         try:
             await send_primary(destination_target, path, caption=caption)
             return True
         except PlatformApiError as exc:
-            if not self._is_transient_error(exc):
+            mode = str(self.media_upload_fallback_mode or "none").strip().lower()
+            if mode not in {"text", "document"} or not self._is_upload_bytes_error(exc):
                 raise
-            await self.bale_client.send_document(destination_target, path, caption=caption)
+            if mode == "document":
+                await self.bale_client.send_document(destination_target, path, caption=caption)
+                return True
+            fallback_text = self._build_media_fallback_text(caption=caption, media_kind=media_kind, path=path)
+            if not fallback_text:
+                return False
+            await self.bale_client.send_message(destination_target, fallback_text)
             return True
 
     @staticmethod
@@ -240,6 +299,18 @@ class BaleDispatcher:
         )
 
     @staticmethod
+    def _is_upload_bytes_error(exc: PlatformApiError) -> bool:
+        return "failed to upload file bytes" in str(exc).lower()
+
+    @staticmethod
+    def _build_media_fallback_text(*, caption: str | None, media_kind: str, path: Path) -> str:
+        base = str(caption or "").strip()
+        if base:
+            return base
+        filename = path.name or "file"
+        return f"ارسال مدیا موقتاً ناموفق بود ({media_kind}: {filename})."
+
+    @staticmethod
     def _group_family(kind: OutputMessageKind) -> str:
         if kind in {OutputMessageKind.PHOTO, OutputMessageKind.VIDEO}:
             return "visual"
@@ -248,3 +319,20 @@ class BaleDispatcher:
         if kind == OutputMessageKind.AUDIO:
             return "audio"
         return kind.value
+
+    @staticmethod
+    def _with_destination_footer(
+        value: str | None,
+        *,
+        destination_target: str,
+        ensure_nonempty: bool,
+    ) -> str | None:
+        footer = str(destination_target or "").strip()
+        base = str(value or "").strip()
+        if not footer:
+            return base or (None if not ensure_nonempty else "")
+        if not base:
+            return footer if ensure_nonempty else None
+        if base.endswith(footer):
+            return base
+        return f"{base}\n{footer}"

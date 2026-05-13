@@ -140,14 +140,14 @@ def test_default_script_keeps_mentions_inside_core_lines(tmp_path: Path) -> None
     assert out == {"messages": [{"type": "text", "text": "⚽️ @jfball - just football\n@dest"}]}
 
 
-def test_default_script_removes_blocklisted_emojis(tmp_path: Path) -> None:
+def test_default_script_preserves_emojis(tmp_path: Path) -> None:
     payload = {
         "route": {"destination_target": "@dest"},
         "message": {"text": "سلام 🇮🇱 🏳️‍⚧️ 🏳️‍🌈 👰 🤵"},
         "inputs": [],
     }
     out = _run_default(payload, tmp_path)
-    assert out == {"messages": [{"type": "text", "text": "سلام"}]}
+    assert out == {"messages": [{"type": "text", "text": "سلام 🇮🇱 🏳️‍⚧️ 🏳️‍🌈 👰 🤵"}]}
 
 
 def test_default_script_removes_reference_context_phrase(tmp_path: Path) -> None:

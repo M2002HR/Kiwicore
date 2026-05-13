@@ -170,7 +170,7 @@ def test_football_script_stdout_stays_json_when_ai_enabled_and_endpoint_fails(tm
             "FOOTBALL_AI_FAIL_OPEN": "true",
         },
     )
-    assert out == {"messages": []}
+    assert out == {"messages": [{"type": "text", "text": "متن تست"}]}
 
 
 def test_football_script_postprocess_removes_prompt_leak_and_duplicate_signature(tmp_path: Path, monkeypatch) -> None:
@@ -210,6 +210,7 @@ def test_football_script_respects_global_budget_and_fails_closed_fast(tmp_path: 
     mod = _load_module()
     monkeypatch.setenv("FOOTBALL_AI_ENABLED", "true")
     monkeypatch.setenv("FOOTBALL_AI_ENDPOINT", "http://fake.local/proxy/gemini")
+    monkeypatch.setenv("FOOTBALL_AI_FAIL_OPEN", "false")
     monkeypatch.setattr(mod, "_ai_total_budget_sec", lambda: 0.1)
 
     def should_not_call(**kwargs):
@@ -278,6 +279,7 @@ def test_football_script_never_passes_non_persian_caption_in_ai_mode(tmp_path: P
     mod = _load_module()
     monkeypatch.setenv("FOOTBALL_AI_ENABLED", "true")
     monkeypatch.setenv("FOOTBALL_AI_ENDPOINT", "http://fake.local/proxy/gemini")
+    monkeypatch.setenv("FOOTBALL_AI_FAIL_OPEN", "false")
 
     def fake_call(*, endpoint: str, body: dict, timeout_sec: float):
         return "Saka dropping these memes on his Instagram story after two huge Arsenal wins last week 😂"

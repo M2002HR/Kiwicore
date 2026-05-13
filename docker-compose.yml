@@ -28,7 +28,7 @@ services:
       FOOTBALL_AI_TIMEOUT_SEC: ${FOOTBALL_AI_TIMEOUT_SEC:-20}
       FOOTBALL_AI_RETRY_COUNT: ${FOOTBALL_AI_RETRY_COUNT:-1}
       FOOTBALL_AI_TOTAL_BUDGET_SEC: ${FOOTBALL_AI_TOTAL_BUDGET_SEC:-75}
-      FOOTBALL_AI_FAIL_OPEN: ${FOOTBALL_AI_FAIL_OPEN:-false}
+      FOOTBALL_AI_FAIL_OPEN: ${FOOTBALL_AI_FAIL_OPEN:-true}
       FOOTBALL_AI_MAX_IMAGES: ${FOOTBALL_AI_MAX_IMAGES:-3}
     volumes:
       - ./config:/app/config
@@ -45,15 +45,15 @@ services:
     env_file:
       - .env
     environment:
-      PROXY_TRUST_ENV_PROXY: "true"
-      HTTP_PROXY: ${GEMINI_HTTP_PROXY:-http://127.0.0.1:2080}
-      HTTPS_PROXY: ${GEMINI_HTTPS_PROXY:-http://127.0.0.1:2080}
-      ALL_PROXY: ${GEMINI_ALL_PROXY:-http://127.0.0.1:2080}
-      NO_PROXY: ${GEMINI_NO_PROXY:-127.0.0.1,localhost}
-      http_proxy: ${gemini_http_proxy:-http://127.0.0.1:2080}
-      https_proxy: ${gemini_https_proxy:-http://127.0.0.1:2080}
-      all_proxy: ${gemini_all_proxy:-http://127.0.0.1:2080}
-      no_proxy: ${gemini_no_proxy:-127.0.0.1,localhost}
+      PROXY_TRUST_ENV_PROXY: ${PROXY_TRUST_ENV_PROXY:-false}
+      HTTP_PROXY: ${GEMINI_HTTP_PROXY-}
+      HTTPS_PROXY: ${GEMINI_HTTPS_PROXY-}
+      ALL_PROXY: ${GEMINI_ALL_PROXY-}
+      NO_PROXY: ${GEMINI_NO_PROXY-127.0.0.1,localhost}
+      http_proxy: ${gemini_http_proxy-}
+      https_proxy: ${gemini_https_proxy-}
+      all_proxy: ${gemini_all_proxy-}
+      no_proxy: ${gemini_no_proxy-127.0.0.1,localhost}
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=5).read()"]
       interval: 15s

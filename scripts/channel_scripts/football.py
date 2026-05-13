@@ -146,7 +146,7 @@ def _ai_retry_count() -> int:
 
 
 def _ai_fail_open() -> bool:
-    return os.getenv("FOOTBALL_AI_FAIL_OPEN", "true").strip().lower() in {"1", "true", "yes", "on"}
+    return os.getenv("FOOTBALL_AI_FAIL_OPEN", "false").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _ai_max_images() -> int:
@@ -657,17 +657,20 @@ def _apply_generated_text(base_messages: list[dict], generated_text: str) -> lis
 def build_messages(payload: dict, *, input_dir: Path) -> list[dict]:
     base = _build_base_messages(payload)
     generated = _generate_football_text(payload=payload, input_dir=input_dir, base_messages=base)
-    ai_mandatory = _football_ai_enabled() and bool(_pick_ai_endpoint())
+    ai_enabled = _football_ai_enabled()
+    ai_endpoint = _pick_ai_endpoint()
+    ai_fail_open = _ai_fail_open()
+    ai_mandatory = ai_enabled and bool(ai_endpoint) and not ai_fail_open
     if generated is None:
         out = [] if ai_mandatory else base
     elif generated:
         out = _apply_generated_text(base, generated)
     else:
-        out = []
+        out = [] if ai_mandatory else base
 
     # If media exists without caption, force AI caption generation once more.
-    if (_has_media_without_caption(out) or (not out and _has_any_media(base))) and _football_ai_enabled():
-        endpoint = _pick_ai_endpoint()
+    if (_has_media_without_caption(out) or (not out and _has_any_media(base))) and ai_enabled:
+        endpoint = ai_endpoint
         if endpoint:
             source_text = _collect_source_text(payload)
             destination = _destination_signature(payload)

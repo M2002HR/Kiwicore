@@ -131,14 +131,6 @@ def _settings(tmp_path: Path, default_max_mb: int = 50) -> Settings:
     gaurd_dir = tmp_path / "gaurds"
     gaurd_dir.mkdir(parents=True, exist_ok=True)
     (gaurd_dir / "default_guard.py").write_text("print('true')", encoding="utf-8")
-    final_dir = tmp_path / "final_scripts"
-    final_dir.mkdir(parents=True, exist_ok=True)
-    (final_dir / "default_final_script.py").write_text(
-        "import json; import argparse; from pathlib import Path; "
-        "p=argparse.ArgumentParser(); p.add_argument('--payload', required=True); p.add_argument('--input-dir', required=True); p.add_argument('--output-dir', required=True); "
-        "a=p.parse_args(); payload=json.loads(Path(a.payload).read_text(encoding='utf-8')); print(json.dumps({'messages': payload.get('messages', [])}))",
-        encoding="utf-8",
-    )
 
     return Settings(
         app_env="test",
@@ -158,13 +150,11 @@ def _settings(tmp_path: Path, default_max_mb: int = 50) -> Settings:
         channels_config_path=str(tmp_path / "channels.json"),
         scripts_dir=str(tmp_path / "scripts"),
         gaurd_scripts_dir=str(gaurd_dir),
-        final_scripts_dir=str(final_dir),
         storage_dir=str(tmp_path / "storage"),
         state_path=str(tmp_path / "storage" / "state.json"),
         default_max_message_mb=default_max_mb,
         script_timeout_sec=5,
         gaurd_script_timeout_sec=5,
-        final_script_timeout_sec=5,
         poll_idle_sleep_sec=0.01,
         poll_error_sleep_sec=0.01,
         log_channel_target=None,
@@ -279,7 +269,6 @@ def test_service_flow_allows_route_without_any_scripts(tmp_path: Path) -> None:
         destination_channel_id="-2001",
         destination_channel_username=None,
         channel_script=None,
-        final_script=None,
         gaurd_script=None,
         max_message_mb=10,
     )
@@ -296,7 +285,6 @@ def test_service_flow_allows_route_without_any_scripts(tmp_path: Path) -> None:
         storage=storage,
         guard_runner=GuardRunner(settings.gaurd_scripts_dir, settings.gaurd_script_timeout_sec),
         script_runner=ScriptRunner(settings.scripts_dir, settings.script_timeout_sec),
-        final_script_runner=ScriptRunner(settings.final_scripts_dir, settings.final_script_timeout_sec),
         state_store=StateStore(settings.state_path),
     )
 
@@ -1371,7 +1359,6 @@ print(json.dumps({"messages":[{"type":"text","text":"sample out"}]}))
         destination_channel_id=None,
         destination_channel_username="@kiwi_kiwi_test",
         channel_script="stage_script.py",
-        final_script="default_final_script.py",
         max_message_mb=10,
     )
 
@@ -1385,7 +1372,6 @@ print(json.dumps({"messages":[{"type":"text","text":"sample out"}]}))
         storage=StorageManager(settings.storage_dir),
         guard_runner=GuardRunner(settings.gaurd_scripts_dir, timeout_sec=5),
         script_runner=ScriptRunner(settings.scripts_dir, timeout_sec=5),
-        final_script_runner=ScriptRunner(settings.final_scripts_dir, timeout_sec=5),
         state_store=StateStore(settings.state_path),
     )
 
@@ -1396,6 +1382,5 @@ print(json.dumps({"messages":[{"type":"text","text":"sample out"}]}))
     stage_logs = [text for chat, text in tg.audit_messages if chat == "@logchan"]
     assert any("بررسی گارد | موفق" in text for text in stage_logs)
     assert any("اجرای channel script | موفق" in text for text in stage_logs)
-    assert any("اجرای final script | موفق" in text for text in stage_logs)
     assert any("stage_output:" in text for text in stage_logs)
     assert any("sample out" in text for text in stage_logs)

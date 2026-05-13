@@ -12,7 +12,6 @@ from kiwi.admin_bot import (
     BTN_EDIT_SRC_ID,
     BTN_ENABLED_OFF,
     BTN_ENABLED_ON,
-    BTN_FINAL_SCRIPTS,
     BTN_GUARDS,
     BTN_LOGIN,
     BTN_MAX_DEFAULT,
@@ -47,13 +46,10 @@ def _build_bot(tmp_path: Path) -> AdminBotHandler:
     channels_path.parent.mkdir(parents=True, exist_ok=True)
     channels_path.write_text("[]", encoding="utf-8")
     scripts_dir = tmp_path / "scripts"
-    final_scripts_dir = tmp_path / "final_scripts"
     guards_dir = tmp_path / "guards"
     scripts_dir.mkdir()
-    final_scripts_dir.mkdir()
     guards_dir.mkdir()
     (scripts_dir / "default_channel_script.py").write_text("# x", encoding="utf-8")
-    (final_scripts_dir / "default_final_script.py").write_text("# x", encoding="utf-8")
     (guards_dir / "default_guard.py").write_text("# x", encoding="utf-8")
 
     store = AdminStore(str(tmp_path / "config" / "admins.json"), str(tmp_path / "data" / "sessions.json"))
@@ -61,7 +57,6 @@ def _build_bot(tmp_path: Path) -> AdminBotHandler:
         channels_config_path=str(channels_path),
         scripts_dir=str(scripts_dir),
         gaurd_scripts_dir=str(guards_dir),
-        final_scripts_dir=str(final_scripts_dir),
         on_routes_reloaded=lambda *_: None,
     )
     return AdminBotHandler(admin_store=store, management_api=api)
@@ -102,7 +97,6 @@ def test_admin_bot_login_and_button_menus(tmp_path: Path) -> None:
     assert BTN_ADD_ROUTE in main_buttons
     assert BTN_EDIT_ROUTE in main_buttons
     assert BTN_SCRIPTS in main_buttons
-    assert BTN_FINAL_SCRIPTS in main_buttons
     assert BTN_GUARDS in main_buttons
 
 
@@ -119,7 +113,6 @@ def test_admin_bot_add_and_edit_route_by_buttons(tmp_path: Path) -> None:
     bot.handle(_inbound(BTN_DST_ID))
     bot.handle(_inbound("-2001"))
     bot.handle(_inbound("default_channel_script.py"))
-    bot.handle(_inbound("default_final_script.py"))
     bot.handle(_inbound("default_guard.py"))
     bot.handle(_inbound(BTN_MAX_DEFAULT))
     bot.handle(_inbound(BTN_ENABLED_ON))

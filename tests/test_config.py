@@ -155,7 +155,6 @@ def test_load_routes_allows_null_scripts(tmp_path: Path) -> None:
                     "destination_channel_id": "-2001",
                     "channel_script": None,
                     "gaurd_script": None,
-                    "final_script": None,
                 }
             ]
         ),
@@ -166,7 +165,6 @@ def test_load_routes_allows_null_scripts(tmp_path: Path) -> None:
     assert route is not None
     assert route.channel_script is None
     assert route.gaurd_script is None
-    assert route.final_script is None
 
 
 def test_load_settings_adds_private_updates_for_admin_bot(tmp_path: Path) -> None:

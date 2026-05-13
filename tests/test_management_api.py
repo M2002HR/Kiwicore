@@ -11,13 +11,10 @@ def test_management_api_crud_and_reload(tmp_path: Path) -> None:
     channels_path.parent.mkdir(parents=True, exist_ok=True)
     channels_path.write_text("[]", encoding="utf-8")
     scripts_dir = tmp_path / "scripts"
-    final_scripts_dir = tmp_path / "final_scripts"
     guards_dir = tmp_path / "guards"
     scripts_dir.mkdir()
-    final_scripts_dir.mkdir()
     guards_dir.mkdir()
     (scripts_dir / "default_channel_script.py").write_text("# x", encoding="utf-8")
-    (final_scripts_dir / "default_final_script.py").write_text("# x", encoding="utf-8")
     (guards_dir / "default_guard.py").write_text("# x", encoding="utf-8")
 
     seen = {"count": 0}
@@ -30,7 +27,6 @@ def test_management_api_crud_and_reload(tmp_path: Path) -> None:
         channels_config_path=str(channels_path),
         scripts_dir=str(scripts_dir),
         gaurd_scripts_dir=str(guards_dir),
-        final_scripts_dir=str(final_scripts_dir),
         on_routes_reloaded=_reloaded,
     )
 
@@ -41,7 +37,6 @@ def test_management_api_crud_and_reload(tmp_path: Path) -> None:
             "source_channel_id": "-1001",
             "destination_channel_id": "-2001",
             "channel_script": "default_channel_script.py",
-            "final_script": "default_final_script.py",
             "gaurd_script": "default_guard.py",
         }
     )
@@ -56,7 +51,6 @@ def test_management_api_crud_and_reload(tmp_path: Path) -> None:
     assert seen["count"] >= 3
 
     assert api.list_script_files() == ["default_channel_script.py"]
-    assert api.list_final_script_files() == ["default_final_script.py"]
     assert api.list_guard_files() == ["default_guard.py"]
 
     sync_started = api.start_route_sync("r1")

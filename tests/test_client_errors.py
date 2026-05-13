@@ -34,6 +34,19 @@ class SequencedHttpClient:
         return None
 
 
+class RecordingHttpClient:
+    def __init__(self, response: httpx.Response) -> None:
+        self.response = response
+        self.calls: list[dict] = []
+
+    async def post(self, *args, **kwargs):
+        self.calls.append(kwargs)
+        return self.response
+
+    async def aclose(self):
+        return None
+
+
 def _ok_response(result: dict) -> httpx.Response:
     return httpx.Response(200, json={"ok": True, "result": result})
 
@@ -157,3 +170,38 @@ def test_send_media_group_retries_on_transient_upload_error(tmp_path: Path, monk
     )
     assert isinstance(result, list)
     assert client.client.calls == 2
+
+
+def test_send_message_sets_markdown_parse_mode_for_inline_links() -> None:
+    client = BotApiClient(
+        token="t",
+        api_base_url="https://api.telegram.org",
+        file_base_url="https://api.telegram.org/file",
+    )
+    recorder = RecordingHttpClient(_ok_response({"message_id": 1}))
+    client.client = recorder
+
+    asyncio.run(client.send_message("@dest", "خبر [بارسا](https://ble.ir/barcelona_fa)"))
+    assert recorder.calls
+    payload = recorder.calls[0].get("json")
+    assert isinstance(payload, dict)
+    assert payload.get("parse_mode") == "Markdown"
+
+
+def test_send_photo_sets_markdown_parse_mode_for_inline_link_caption(tmp_path: Path) -> None:
+    client = BotApiClient(
+        token="t",
+        api_base_url="https://api.telegram.org",
+        file_base_url="https://api.telegram.org/file",
+    )
+    recorder = RecordingHttpClient(_ok_response({"message_id": 2}))
+    client.client = recorder
+
+    photo_path = tmp_path / "x.jpg"
+    photo_path.write_bytes(b"abc")
+
+    asyncio.run(client.send_photo("@dest", photo_path, caption="برو [اینجا](https://ble.ir/barcelona_fa)"))
+    assert recorder.calls
+    data = recorder.calls[0].get("data")
+    assert isinstance(data, dict)
+    assert data.get("parse_mode") == "Markdown"

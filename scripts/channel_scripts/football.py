@@ -151,7 +151,7 @@ def _ai_retry_count() -> int:
 
 
 def _ai_fail_open() -> bool:
-    return os.getenv("FOOTBALL_AI_FAIL_OPEN", "true").strip().lower() in {"1", "true", "yes", "on"}
+    return os.getenv("FOOTBALL_AI_FAIL_OPEN", "false").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _ai_max_images() -> int:
@@ -171,10 +171,8 @@ def _ai_total_budget_sec() -> float:
 
 
 def _ai_mandatory_mode() -> bool:
-    forced = os.getenv("FOOTBALL_AI_MANDATORY", "false").strip().lower() in {"1", "true", "yes", "on"}
-    if not forced:
-        return False
-    return _football_ai_enabled()
+    forced = os.getenv("FOOTBALL_AI_MANDATORY", "true").strip().lower() in {"1", "true", "yes", "on"}
+    return forced and _football_ai_enabled()
 
 
 def _destination_signature(payload: dict) -> str:

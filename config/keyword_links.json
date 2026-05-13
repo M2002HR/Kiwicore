@@ -1,0 +1,157 @@
+[
+  {
+    "destination": "@Espnfc_news",
+    "link": "https://ble.ir/Espnfc_news",
+    "keywords": ["ای‌اس‌پی‌ان", "ای اس پی ان", "ای‌اس‌پی‌ان اف‌سی", "ای اس پی ان اف سی"]
+  },
+  {
+    "destination": "@al_nassr",
+    "link": "https://ble.ir/al_nassr",
+    "keywords": ["النصر", "باشگاه النصر", "تیم النصر", "نصری‌ها"]
+  },
+  {
+    "destination": "@arsenal_fa",
+    "link": "https://ble.ir/arsenal_fa",
+    "keywords": ["آرسنال", "باشگاه آرسنال", "توپچی‌ها", "گانرز"]
+  },
+  {
+    "destination": "@barcelona_fa",
+    "link": "https://ble.ir/barcelona_fa",
+    "keywords": ["بارسلونا", "بارسا", "باشگاه بارسلونا", "آبی‌اناری‌ها", "کاتالان‌ها"]
+  },
+  {
+    "destination": "@bayern_munich_ir",
+    "link": "https://ble.ir/bayern_munich_ir",
+    "keywords": ["بایرن", "بایرن مونیخ", "باشگاه بایرن", "مونیخی‌ها"]
+  },
+  {
+    "destination": "@borussia_dortmund",
+    "link": "https://ble.ir/borussia_dortmund",
+    "keywords": ["دورتموند", "بروسیا دورتموند", "باشگاه دورتموند", "زنبورها"]
+  },
+  {
+    "destination": "@bundesliga_ir",
+    "link": "https://ble.ir/bundesliga_ir",
+    "keywords": ["بوندسلیگا", "لیگ آلمان", "بوندس لیگا"]
+  },
+  {
+    "destination": "@chelsea_ir",
+    "link": "https://ble.ir/chelsea_ir",
+    "keywords": ["چلسی", "باشگاه چلسی", "آبی‌های لندن", "بلوها"]
+  },
+  {
+    "destination": "@cristiano_ir",
+    "link": "https://ble.ir/cristiano_ir",
+    "keywords": ["کریستیانو", "کریستیانو رونالدو", "رونالدو", "کریس رونالدو", "سی آر سون"]
+  },
+  {
+    "destination": "@erling_haaland_ir",
+    "link": "https://ble.ir/erling_haaland_ir",
+    "keywords": ["هالند", "ارلینگ هالند", "ارلینگ", "هالان"]
+  },
+  {
+    "destination": "@herewegoclub",
+    "link": "https://ble.ir/herewegoclub",
+    "keywords": ["هیر وی گو", "هیر‌وی‌گو", "اینجا وی گو", "هیرویگو"]
+  },
+  {
+    "destination": "@hilal_al",
+    "link": "https://ble.ir/hilal_al",
+    "keywords": ["الهلال", "باشگاه الهلال", "تیم الهلال", "آبی‌های ریاض"]
+  },
+  {
+    "destination": "@inter_miami_ir",
+    "link": "https://ble.ir/inter_miami_ir",
+    "keywords": ["اینتر میامی", "باشگاه اینتر میامی", "میامی", "صورتی‌پوشان میامی"]
+  },
+  {
+    "destination": "@inter_milan_ir",
+    "link": "https://ble.ir/inter_milan_ir",
+    "keywords": ["اینتر میلان", "اینتر", "باشگاه اینتر", "نراتزوری"]
+  },
+  {
+    "destination": "@juventus_fa",
+    "link": "https://ble.ir/juventus_fa",
+    "keywords": ["یوونتوس", "یووه", "باشگاه یوونتوس", "بیانکونری"]
+  },
+  {
+    "destination": "@kiwi_kiwi_test",
+    "link": "https://ble.ir/kiwi_kiwi_test",
+    "keywords": ["کیوی", "کیوی تست", "کانال کیوی"]
+  },
+  {
+    "destination": "@kylian_mbappe_ir",
+    "link": "https://ble.ir/kylian_mbappe_ir",
+    "keywords": ["امباپه", "کیلیان امباپه", "کیلین امباپه", "کیلیان"]
+  },
+  {
+    "destination": "@lamine_yamal_official",
+    "link": "https://ble.ir/lamine_yamal_official",
+    "keywords": ["لامین یامال", "یامال", "لامین", "ستاره لاماسیا"]
+  },
+  {
+    "destination": "@liverpool_fa",
+    "link": "https://ble.ir/liverpool_fa",
+    "keywords": ["لیورپول", "باشگاه لیورپول", "قرمزهای مرسی‌ساید", "ردز"]
+  },
+  {
+    "destination": "@madrid_atletico",
+    "link": "https://ble.ir/madrid_atletico",
+    "keywords": ["اتلتیکو", "اتلتیکو مادرید", "باشگاه اتلتیکو", "روخی‌بلانکوس"]
+  },
+  {
+    "destination": "@manchester_city_ir",
+    "link": "https://ble.ir/manchester_city_ir",
+    "keywords": ["منچستر سیتی", "من سیتی", "منچسترسیتی", "سیتیزن‌ها", "سیتی"]
+  },
+  {
+    "destination": "@manchesterunited_fa",
+    "link": "https://ble.ir/manchesterunited_fa",
+    "keywords": ["منچستر یونایتد", "منچستریونایتد", "یونایتد", "شیاطین سرخ", "باشگاه منچستر یونایتد"]
+  },
+  {
+    "destination": "@messi_fa",
+    "link": "https://ble.ir/messi_fa",
+    "keywords": ["مسی", "لیونل مسی", "لئو مسی", "لیو مسی"]
+  },
+  {
+    "destination": "@milan_ir",
+    "link": "https://ble.ir/milan_ir",
+    "keywords": ["میلان", "آث میلان", "آ سی میلان", "روسونری"]
+  },
+  {
+    "destination": "@neymar_fa",
+    "link": "https://ble.ir/neymar_fa",
+    "keywords": ["نیمار", "نیمار جونیور", "نیمار ژونیور"]
+  },
+  {
+    "destination": "@paris_saint_germain_ir",
+    "link": "https://ble.ir/paris_saint_germain_ir",
+    "keywords": ["پاری سن ژرمن", "پاریس سن ژرمن", "پاری‌سن‌ژرمن", "پی اس جی"]
+  },
+  {
+    "destination": "@real_madrid_fa",
+    "link": "https://ble.ir/real_madrid_fa",
+    "keywords": ["رئال مادرید", "رئال", "باشگاه رئال", "کهکشانی‌ها"]
+  },
+  {
+    "destination": "@serie_a_ir",
+    "link": "https://ble.ir/serie_a_ir",
+    "keywords": ["سری آ", "سری‌آ", "لیگ ایتالیا"]
+  },
+  {
+    "destination": "@soccer_memes",
+    "link": "https://ble.ir/soccer_memes",
+    "keywords": ["میم فوتبال", "میم فوتبالی", "طنز فوتبالی"]
+  },
+  {
+    "destination": "@tottenham_ir",
+    "link": "https://ble.ir/tottenham_ir",
+    "keywords": ["تاتنهام", "تاتنهام هاتسپر", "اسپرز", "باشگاه تاتنهام"]
+  },
+  {
+    "destination": "@uefa_champ_league",
+    "link": "https://ble.ir/uefa_champ_league",
+    "keywords": ["لیگ قهرمانان", "چمپیونز لیگ", "جام باشگاه‌های اروپا"]
+  }
+]

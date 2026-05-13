@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import json
 import logging
 import os
@@ -14,6 +15,7 @@ from kiwi.config import RouteRegistry, Settings
 from kiwi.dispatcher import BaleDispatcher
 from kiwi.errors import GuardExecutionError, MessageTooLargeError, PlatformApiError, ScriptExecutionError
 from kiwi.guard_runner import GuardRunner
+from kiwi.keyword_links import KeywordLinker
 from kiwi.platforms.parser import parse_telegram_channel_update, parse_telegram_private_message_update
 from kiwi.script_runner import ScriptRunner
 from kiwi.state import StateStore
@@ -50,6 +52,7 @@ class KiwiService:
         sync_ledger: SyncLedger | None = None,
         sync_queue: SyncQueueBackend | None = None,
         admin_handler: Any | None = None,
+        route_patch_callback: Any | None = None,
     ) -> None:
         self.settings = settings
         self.routes = routes
@@ -63,6 +66,7 @@ class KiwiService:
         self.sync_ledger = sync_ledger or SyncLedger(str(Path(settings.storage_dir) / "sync_ledger.sqlite3"))
         self.sync_queue = sync_queue or InMemorySyncQueue()
         self.dispatcher = BaleDispatcher(self.bale_client)
+        self.keyword_linker = KeywordLinker(channels_config_path=settings.channels_config_path)
         fallback_mode = os.getenv("BALE_MEDIA_UPLOAD_FALLBACK_MODE", "none").strip().lower()
         if fallback_mode not in {"none", "text", "document"}:
             fallback_mode = "none"
@@ -71,6 +75,7 @@ class KiwiService:
         self._dispatch_permission_cache_ttl_sec = max(60.0, float(os.getenv("DISPATCH_PERMISSION_CACHE_TTL_SEC", "300")))
         self._dispatch_permission_cache: dict[str, tuple[float, bool, str | None]] = {}
         self.admin_handler = admin_handler
+        self._route_patch_callback = route_patch_callback
 
         self._offset: int | None = self.state_store.load_offset()
         self._stop_event = asyncio.Event()
@@ -168,6 +173,7 @@ class KiwiService:
                 await self._process_route_message(incoming, route)
                 processed += 1
             processed += await self._tick_sync_drain()
+            await self._auto_activate_ready_routes()
             return processed
 
         matched_messages: list[tuple[IncomingChannelMessage, ChannelRoute]] = []
@@ -219,7 +225,86 @@ class KiwiService:
             processed += 1
 
         processed += await self._tick_sync_drain()
+        await self._auto_activate_ready_routes()
         return processed
+
+    def set_route_patch_callback(self, callback: Any | None) -> None:
+        self._route_patch_callback = callback
+
+    async def _auto_activate_ready_routes(self) -> None:
+        for route in list(self.routes.routes):
+            await self._maybe_auto_activate_route(route)
+
+    async def _maybe_auto_activate_route(self, route: ChannelRoute) -> None:
+        if not route.is_syncing():
+            return
+
+        pending = self.sync_ledger.active_count_for_route(route.name)
+        route.sync_pending_count = max(0, int(pending))
+        if pending > 0:
+            return
+
+        checkpoint = int(self.sync_ledger.get_route_checkpoint(route.name) or 0)
+        latest = checkpoint
+        latest_func = getattr(self.source_client, "latest_message_id_for_route", None)
+        if callable(latest_func):
+            try:
+                latest = max(0, int(await latest_func(route)))
+            except Exception:
+                logger.exception(
+                    "Failed to fetch latest source message id for sync auto activation",
+                    extra={"details": {"route": route.name}},
+                )
+                return
+
+        if latest > checkpoint:
+            return
+
+        if route.sync_status == "active" and route.enabled:
+            return
+
+        route.sync_status = "active"
+        route.sync_enabled = False
+        route.sync_seeded = True
+        route.sync_pending_count = 0
+        route.enabled = True
+
+        logger.info(
+            "Route sync completed and auto-activated",
+            extra={
+                "details": {
+                    "route": route.name,
+                    "checkpoint": checkpoint,
+                    "latest_source_message_id": latest,
+                }
+            },
+        )
+        await self._persist_route_patch(
+            route.name,
+            {
+                "enabled": True,
+                "sync": {
+                    "enabled": False,
+                    "status": "active",
+                    "seeded": True,
+                    "pending_count": 0,
+                },
+            },
+        )
+
+    async def _persist_route_patch(self, route_name: str, patch: dict[str, Any]) -> None:
+        callback = self._route_patch_callback
+        if callback is None:
+            return
+        try:
+            result = callback(route_name, patch)
+            if inspect.isawaitable(result):
+                await result
+        except Exception:
+            logger.exception(
+                "Failed to persist route patch",
+                extra={"details": {"route": route_name, "patch": patch}},
+            )
 
     async def _tick_sync_drain(self) -> int:
         processed = 0
@@ -1130,7 +1215,7 @@ class KiwiService:
                 return "skipped", "channel_script_output_size_limit"
 
             final_result = ScriptRunResult(
-                messages=filtered_messages,
+                messages=self.keyword_linker.apply(route.destination_target(), filtered_messages),
                 stdout=run_result.stdout,
                 stderr=run_result.stderr,
             )
@@ -1237,14 +1322,30 @@ class KiwiService:
                 },
             )
             return status, str(exc)
-        except ScriptExecutionError:
+        except ScriptExecutionError as exc:
+            error_text = "script_execution_error"
+            status = "failed"
+            if stage_name == "channel_script":
+                msg = ""
+                try:
+                    msg = str(exc)
+                except Exception:
+                    msg = ""
+                lowered = msg.lower()
+                if "football_ai_generation_required_failed" in lowered:
+                    status = "ambiguous"
+                    error_text = "football_ai_generation_required_failed"
             stage_timings_ms["total"] = round((time.monotonic() - started_at) * 1000.0, 2)
             await self._audit_log(
                 stage="processing",
-                status="failed",
+                status=status,
                 incoming=incoming,
                 route=route,
-                reason="اجرای channel script خطا داد",
+                reason=(
+                    "channel script نیازمند تولید AI بود اما تولید نشد (برای retry نگه داشته شد)"
+                    if status == "ambiguous"
+                    else "اجرای channel script خطا داد"
+                ),
                 trace_id=trace_id,
                 stage_timings_ms=stage_timings_ms,
             )
@@ -1260,7 +1361,7 @@ class KiwiService:
                     }
                 },
             )
-            return "failed", "script_execution_error"
+            return status, error_text
         except GuardExecutionError:
             stage_timings_ms["total"] = round((time.monotonic() - started_at) * 1000.0, 2)
             await self._audit_log(

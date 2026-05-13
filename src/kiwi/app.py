@@ -71,5 +71,6 @@ async def build_service(env_file: str = ".env") -> KiwiService:
         sync_queue=sync_queue,
         on_routes_reloaded=service.set_routes,
     )
+    service.set_route_patch_callback(management_api.update_route)
     service.admin_handler = AdminBotHandler(admin_store=admin_store, management_api=management_api)
     return service

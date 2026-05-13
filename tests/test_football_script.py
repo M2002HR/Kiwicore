@@ -200,6 +200,7 @@ def test_football_script_stdout_stays_json_when_ai_enabled_and_endpoint_fails(tm
         env_patch={
             "FOOTBALL_AI_ENABLED": "true",
             "FOOTBALL_AI_ENDPOINT": "http://127.0.0.1:9/nowhere",
+            "FOOTBALL_AI_MANDATORY": "false",
             "FOOTBALL_AI_RETRY_COUNT": "0",
             "FOOTBALL_AI_TIMEOUT_SEC": "0.2",
             "FOOTBALL_AI_FAIL_OPEN": "true",
@@ -245,6 +246,7 @@ def test_football_script_respects_global_budget_and_falls_back_fast(tmp_path: Pa
     mod = _load_module()
     monkeypatch.setenv("FOOTBALL_AI_ENABLED", "true")
     monkeypatch.setenv("FOOTBALL_AI_ENDPOINT", "http://fake.local/proxy/gemini")
+    monkeypatch.setenv("FOOTBALL_AI_MANDATORY", "false")
     monkeypatch.setenv("FOOTBALL_AI_FAIL_OPEN", "false")
     monkeypatch.setattr(mod, "_ai_total_budget_sec", lambda: 0.1)
 
@@ -347,7 +349,7 @@ def test_football_script_builds_prompt_even_when_ai_is_disabled(tmp_path: Path, 
     assert out == [{"type": "text", "text": "Inter Miami won"}]
 
 
-def test_football_script_never_passes_non_persian_caption_in_ai_mode(tmp_path: Path, monkeypatch) -> None:
+def test_football_script_rejects_non_persian_caption_in_mandatory_mode(tmp_path: Path, monkeypatch) -> None:
     mod = _load_module()
     monkeypatch.setenv("FOOTBALL_AI_ENABLED", "true")
     monkeypatch.setenv("FOOTBALL_AI_ENDPOINT", "http://fake.local/proxy/gemini")
@@ -362,8 +364,11 @@ def test_football_script_never_passes_non_persian_caption_in_ai_mode(tmp_path: P
         "message": {"caption": "english cap"},
         "inputs": [{"kind": "photo", "local_name": "a.jpg"}],
     }
-    out = mod.build_messages(payload, input_dir=tmp_path)
-    assert out == [{"type": "photo", "path": "a.jpg", "caption": "english cap"}]
+    try:
+        mod.build_messages(payload, input_dir=tmp_path)
+        assert False, "expected RuntimeError"
+    except RuntimeError as exc:
+        assert "football_ai_generation_required_failed" in str(exc)
 
 
 def test_football_script_mandatory_mode_skips_empty_source_message(tmp_path: Path, monkeypatch) -> None:

@@ -183,3 +183,4 @@ def test_default_script_filters_noisy_ai_output_lines() -> None:
     )
     cleaned = mod._sanitize_ai_output(noisy, original=original)
     assert cleaned == "🏴 Rangers v Red Star Belgrade 🇷🇸\n@kiwi_kiwi_test"
+

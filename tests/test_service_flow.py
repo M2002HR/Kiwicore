@@ -50,6 +50,17 @@ class FakeTelegramClient:
         return None
 
 
+class FakeTelegramSequenceClient(FakeTelegramClient):
+    def __init__(self, update_batches: list[list[dict]], file_bytes: bytes) -> None:
+        super().__init__([], file_bytes)
+        self._batches = list(update_batches)
+
+    async def get_updates(self, offset, timeout, allowed_updates):
+        if not self._batches:
+            return []
+        return list(self._batches.pop(0))
+
+
 class MissingSourceFileTelegramClient(FakeTelegramClient):
     async def download_file(self, file_path: str, output_path: Path, max_bytes: int) -> int:  # noqa: ARG002
         raise FileNotFoundError(file_path)
@@ -465,6 +476,215 @@ print(json.dumps({'messages': [{'type': 'text', 'text': 'OUT:' + text}]}))
     assert bale.sent == [("-2001", "OUT:hello\n-2001")]
 
 
+def test_service_applies_keyword_links_after_channel_script(tmp_path: Path) -> None:
+    scripts_dir = tmp_path / "scripts"
+    scripts_dir.mkdir()
+    (scripts_dir / "emit_text.py").write_text(
+        """
+import json
+print(json.dumps({"messages":[{"type":"text","text":"Barcelona و بارسا آماده‌اند."}]}))
+""".strip(),
+        encoding="utf-8",
+    )
+
+    (tmp_path / "keyword_links.json").write_text(
+        json.dumps(
+            [
+                {
+                    "destination": "@barcelona_fa",
+                    "link": "https://ble.ir/barcelona_fa",
+                    "keywords": ["Barcelona", "بارسا"],
+                }
+            ],
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    update = {
+        "update_id": 112,
+        "channel_post": {
+            "message_id": 12,
+            "chat": {"id": -1001, "type": "channel"},
+            "text": "x",
+        },
+    }
+
+    settings = _settings(tmp_path)
+    route = ChannelRoute(
+        name="r-link",
+        enabled=True,
+        source_channel_id="-1001",
+        source_channel_username=None,
+        destination_channel_id=None,
+        destination_channel_username="@barcelona_fa",
+        channel_script="emit_text.py",
+        max_message_mb=10,
+    )
+    tg = FakeTelegramClient([update], b"")
+    bale = FakeBaleClient()
+    service = KiwiService(
+        settings=settings,
+        routes=_route_registry(route),
+        telegram_client=tg,
+        bale_client=bale,
+        storage=StorageManager(settings.storage_dir),
+        guard_runner=GuardRunner(settings.gaurd_scripts_dir, timeout_sec=5),
+        script_runner=ScriptRunner(settings.scripts_dir, timeout_sec=5),
+        state_store=StateStore(settings.state_path),
+    )
+
+    processed = asyncio.run(service.run_once())
+    assert processed == 1
+    assert bale.sent == [
+        (
+            "@barcelona_fa",
+            "[Barcelona](https://ble.ir/barcelona_fa) و [بارسا](https://ble.ir/barcelona_fa) آماده‌اند.\n@barcelona_fa",
+        )
+    ]
+
+
+def test_service_applies_global_keyword_links_for_multiple_channels(tmp_path: Path) -> None:
+    scripts_dir = tmp_path / "scripts"
+    scripts_dir.mkdir()
+    (scripts_dir / "emit_text.py").write_text(
+        """
+import json
+print(json.dumps({"messages":[{"type":"text","text":"لامین یامال و نیمار در این آمار کنار هم هستند."}]}))
+""".strip(),
+        encoding="utf-8",
+    )
+
+    (tmp_path / "keyword_links.json").write_text(
+        json.dumps(
+            [
+                {
+                    "destination": "@lamine_yamal_official",
+                    "link": "https://ble.ir/lamine_yamal_official",
+                    "keywords": ["لامین یامال"],
+                },
+                {
+                    "destination": "@neymar_fa",
+                    "link": "https://ble.ir/neymar_fa",
+                    "keywords": ["نیمار"],
+                },
+            ],
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    update = {
+        "update_id": 113,
+        "channel_post": {
+            "message_id": 13,
+            "chat": {"id": -1001, "type": "channel"},
+            "text": "x",
+        },
+    }
+
+    settings = _settings(tmp_path)
+    route = ChannelRoute(
+        name="r-link-global",
+        enabled=True,
+        source_channel_id="-1001",
+        source_channel_username=None,
+        destination_channel_id=None,
+        destination_channel_username="@lamine_yamal_official",
+        channel_script="emit_text.py",
+        max_message_mb=10,
+    )
+    tg = FakeTelegramClient([update], b"")
+    bale = FakeBaleClient()
+    service = KiwiService(
+        settings=settings,
+        routes=_route_registry(route),
+        telegram_client=tg,
+        bale_client=bale,
+        storage=StorageManager(settings.storage_dir),
+        guard_runner=GuardRunner(settings.gaurd_scripts_dir, timeout_sec=5),
+        script_runner=ScriptRunner(settings.scripts_dir, timeout_sec=5),
+        state_store=StateStore(settings.state_path),
+    )
+
+    processed = asyncio.run(service.run_once())
+    assert processed == 1
+    assert bale.sent == [
+        (
+            "@lamine_yamal_official",
+            "[لامین یامال](https://ble.ir/lamine_yamal_official) و [نیمار](https://ble.ir/neymar_fa) در این آمار کنار هم هستند.\n@lamine_yamal_official",
+        )
+    ]
+
+
+def test_service_links_keywords_with_space_halfspace_and_no_space(tmp_path: Path) -> None:
+    scripts_dir = tmp_path / "scripts"
+    scripts_dir.mkdir()
+    (scripts_dir / "emit_text.py").write_text(
+        """
+import json
+print(json.dumps({"messages":[{"type":"text","text":"نیکو اورایلی در منچسترسیتی درخشید و برای منچستر‌سیتی فصل بزرگی ساخت."}]}))
+""".strip(),
+        encoding="utf-8",
+    )
+
+    (tmp_path / "keyword_links.json").write_text(
+        json.dumps(
+            [
+                {
+                    "destination": "@manchester_city_ir",
+                    "link": "https://ble.ir/manchester_city_ir",
+                    "keywords": ["منچستر سیتی"],
+                }
+            ],
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    update = {
+        "update_id": 114,
+        "channel_post": {
+            "message_id": 14,
+            "chat": {"id": -1001, "type": "channel"},
+            "text": "x",
+        },
+    }
+
+    settings = _settings(tmp_path)
+    route = ChannelRoute(
+        name="r-link-spacing",
+        enabled=True,
+        source_channel_id="-1001",
+        source_channel_username=None,
+        destination_channel_id=None,
+        destination_channel_username="@herewegoclub",
+        channel_script="emit_text.py",
+        max_message_mb=10,
+    )
+    tg = FakeTelegramClient([update], b"")
+    bale = FakeBaleClient()
+    service = KiwiService(
+        settings=settings,
+        routes=_route_registry(route),
+        telegram_client=tg,
+        bale_client=bale,
+        storage=StorageManager(settings.storage_dir),
+        guard_runner=GuardRunner(settings.gaurd_scripts_dir, timeout_sec=5),
+        script_runner=ScriptRunner(settings.scripts_dir, timeout_sec=5),
+        state_store=StateStore(settings.state_path),
+    )
+
+    processed = asyncio.run(service.run_once())
+    assert processed == 1
+    assert bale.sent == [
+        (
+            "@herewegoclub",
+            "نیکو اورایلی در [منچسترسیتی](https://ble.ir/manchester_city_ir) درخشید و برای [منچستر‌سیتی](https://ble.ir/manchester_city_ir) فصل بزرگی ساخت.\n@herewegoclub",
+        )
+    ]
+
+
 def test_service_flow_skips_missing_source_media_without_unexpected_error(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
     route = ChannelRoute(
@@ -516,6 +736,63 @@ def test_service_flow_skips_missing_source_media_without_unexpected_error(tmp_pa
     status, error = asyncio.run(service._process_route_message_detailed(incoming, route))  # noqa: SLF001
     assert status == "skipped"
     assert error == "source_media_unavailable"
+
+
+def test_service_marks_football_ai_generation_required_as_ambiguous(tmp_path: Path) -> None:
+    scripts_dir = tmp_path / "scripts"
+    scripts_dir.mkdir()
+    (scripts_dir / "football.py").write_text(
+        """
+import sys
+print("", end="")
+print("football_ai_generation_required_failed", file=sys.stderr)
+sys.exit(2)
+""".strip(),
+        encoding="utf-8",
+    )
+
+    settings = _settings(tmp_path)
+    route = ChannelRoute(
+        name="r-ai-required",
+        enabled=True,
+        source_channel_id="-1001",
+        source_channel_username="@srcchan",
+        destination_channel_id="-2001",
+        destination_channel_username=None,
+        channel_script="football.py",
+        max_message_mb=10,
+    )
+
+    tg = FakeTelegramClient([], b"")
+    bale = FakeBaleClient()
+    service = KiwiService(
+        settings=settings,
+        routes=_route_registry(route),
+        telegram_client=tg,
+        bale_client=bale,
+        storage=StorageManager(settings.storage_dir),
+        guard_runner=GuardRunner(settings.gaurd_scripts_dir, timeout_sec=5),
+        script_runner=ScriptRunner(settings.scripts_dir, timeout_sec=5),
+        state_store=StateStore(settings.state_path),
+    )
+
+    incoming = IncomingChannelMessage(
+        update_id=702,
+        source_channel_id="-1001",
+        source_channel_username="@srcchan",
+        message_id=78,
+        date=None,
+        text="english text",
+        caption=None,
+        medias=[],
+        raw={},
+        media_group_id=None,
+    )
+
+    status, error = asyncio.run(service._process_route_message_detailed(incoming, route))  # noqa: SLF001
+    assert status == "ambiguous"
+    assert error == "football_ai_generation_required_failed"
+    assert bale.sent == []
 
 
 def test_service_flow_allows_route_without_any_scripts(tmp_path: Path) -> None:
@@ -1376,7 +1653,7 @@ print(json.dumps({'messages': [{'type': 'text', 'text': 'SYNC:' + text}]}))
         encoding="utf-8",
     )
 
-    update = {
+    update1 = {
         "update_id": 801,
         "channel_post": {
             "message_id": 88,
@@ -1384,12 +1661,20 @@ print(json.dumps({'messages': [{'type': 'text', 'text': 'SYNC:' + text}]}))
             "text": "hello",
         },
     }
+    update3 = {
+        "update_id": 803,
+        "channel_post": {
+            "message_id": 90,
+            "chat": {"id": -1001, "type": "channel"},
+            "text": "live",
+        },
+    }
 
     settings = _settings(tmp_path)
     settings.channels_config_path = str(channels_path)
     settings.scripts_dir = str(scripts_dir)
     settings.gaurd_scripts_dir = str(guards_dir)
-    tg = FakeTelegramClient([update], b"")
+    tg = FakeTelegramSequenceClient([[update1]], b"")
     bale = FakeBaleClient()
     service = KiwiService(
         settings=settings,
@@ -1401,16 +1686,44 @@ print(json.dumps({'messages': [{'type': 'text', 'text': 'SYNC:' + text}]}))
         script_runner=ScriptRunner(settings.scripts_dir, timeout_sec=5),
         state_store=StateStore(settings.state_path),
     )
+    api = ManagementApi(
+        channels_config_path=str(channels_path),
+        scripts_dir=str(scripts_dir),
+        gaurd_scripts_dir=str(guards_dir),
+        sync_ledger=service.sync_ledger,
+        sync_queue=service.sync_queue,
+        on_routes_reloaded=service.set_routes,
+    )
+    service.set_route_patch_callback(api.update_route)
 
-    processed = asyncio.run(service.run_once())
-    assert processed == 1
-    assert bale.sent == [("-2001", "SYNC:hello\n-2001")]
+    async def _drive() -> None:
+        for _ in range(20):
+            await service.run_once()
+            await asyncio.sleep(0.03)
+            saved_now = json.loads(channels_path.read_text(encoding="utf-8"))
+            sync_now = saved_now[0]["sync"]
+            if sync_now.get("status") == "active":
+                break
+        tg._batches.append([update3])  # noqa: SLF001
+        tg._batches.append([])  # noqa: SLF001
+        await service.run_once()
+        await asyncio.sleep(0.03)
+        await service.run_once()
+
+    asyncio.run(_drive())
+    assert bale.sent == [
+        ("-2001", "SYNC:hello\n-2001"),
+        ("-2001", "SYNC:live\n-2001"),
+    ]
+    key_live = service.sync_ledger.dedupe_key("sync-route", "-1001", 90, None)
+    assert service.sync_ledger.get_record(key_live) is None
 
     saved = json.loads(channels_path.read_text(encoding="utf-8"))
     sync = saved[0]["sync"]
     assert sync["pending_count"] == 0
-    assert sync["status"] == "syncing"
-    assert saved[0]["enabled"] is False
+    assert sync["status"] == "active"
+    assert sync["enabled"] is False
+    assert saved[0]["enabled"] is True
 
 
 def test_service_syncing_retries_non_guard_failures(tmp_path: Path) -> None:

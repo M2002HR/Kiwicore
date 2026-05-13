@@ -24,6 +24,8 @@ The project is designed for production use with Docker Compose and for local dev
 - Delivery to Bale as text/photo/video/voice/audio/document/animation/video_note
 - Global sticker-block policy (stickers are never sent)
 - Resilient polling loop with retry/backoff on network/API errors
+- Persistent sync dedupe ledger in SQLite + runtime queue in Redis
+- Route-level sync lock (max 1 in-flight per route) + review queue for ambiguous deliveries
 - Dev watcher mode (`kiwi.dev`) and Dockerized production mode
 
 ## Project Structure
@@ -166,6 +168,16 @@ Important variables:
 - `POLL_IDLE_SLEEP_SEC`: Delay when no updates
 - `POLL_ERROR_SLEEP_SEC`: Base retry delay on polling errors
 - `TELETHON_PROXY_URL`: Optional proxy for MTProto (Telethon), e.g. `socks5://127.0.0.1:1080` or `http://127.0.0.1:2080`
+- `SYNC_QUEUE_BACKEND`: `redis` (default) or `memory`
+- `REDIS_URL`: Redis DSN for sync due-queue
+- `SYNC_WORKER_COUNT`: Global sync worker concurrency (default `4`)
+- `SYNC_ROUTE_MAX_INFLIGHT`: Per-route concurrency lock target (recommended `1`)
+- `SYNC_RETRY_BASE_SEC`: Retry base delay for transient sync failures
+- `SYNC_LOCK_TTL_SEC`: Route lock TTL in seconds
+- `SYNC_REVIEW_ALERT_TARGET`: Optional Telegram chat/channel for ambiguous sync alerts
+- `SYNC_LEDGER_DB_PATH`: SQLite path for sync ledger/checkpoints/review queue
+- `SYNC_LEDGER_DSN`: Optional DSN (e.g. `mysql://kiwi_admin:kiwiKIWI@127.0.0.1:3306/kiwi_sync?charset=utf8mb4`) to replace SQLite ledger
+- `MYSQL_ROOT_PASSWORD`, `MYSQL_DATABASE`, `MYSQL_USER`, `MYSQL_PASSWORD`: Local MySQL container credentials
 
 Guard AI (used by `default_guard.py`):
 
@@ -237,6 +249,25 @@ Stop:
 
 ```bash
 docker compose down
+
+### Local MySQL + phpMyAdmin
+
+Bring up local DB stack:
+
+```bash
+docker-compose up -d mysql phpmyadmin redis
+```
+
+Access:
+
+- MySQL: `127.0.0.1:3306`
+- Redis: `127.0.0.1:6380`
+- phpMyAdmin: `http://127.0.0.1:8081`
+
+Default admin DB user (created with full privileges by init SQL):
+
+- user: `kiwi_admin`
+- password: `kiwiKIWI`
 ```
 
 ## Testing

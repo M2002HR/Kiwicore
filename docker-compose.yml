@@ -1,4 +1,47 @@
 services:
+  redis:
+    image: redis:7.4-alpine
+    restart: unless-stopped
+    ports:
+      - "6380:6379"
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+
+  mysql:
+    image: mysql:8.4
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-kiwiKIWI}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-kiwi_sync}
+      MYSQL_USER: ${MYSQL_USER:-kiwi_admin}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-kiwiKIWI}
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./docker/mysql/init:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-p${MYSQL_ROOT_PASSWORD:-kiwiKIWI}"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  phpmyadmin:
+    image: phpmyadmin:5.2-apache
+    restart: unless-stopped
+    depends_on:
+      mysql:
+        condition: service_healthy
+    environment:
+      PMA_HOST: mysql
+      PMA_PORT: 3306
+      PMA_USER: ${MYSQL_USER:-kiwi_admin}
+      PMA_PASSWORD: ${MYSQL_PASSWORD:-kiwiKIWI}
+      UPLOAD_LIMIT: 256M
+    ports:
+      - "8081:80"
+
   kiwi:
     build:
       context: .
@@ -16,6 +59,10 @@ services:
     restart: unless-stopped
     network_mode: host
     depends_on:
+      redis:
+        condition: service_started
+      mysql:
+        condition: service_healthy
       gemini_server:
         condition: service_healthy
     env_file:
@@ -60,3 +107,7 @@ services:
       timeout: 6s
       retries: 8
       start_period: 20s
+
+volumes:
+  mysql_data:
+  redis_data:

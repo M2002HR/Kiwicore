@@ -87,7 +87,7 @@
   {
     "destination": "@lamine_yamal_official",
     "link": "https://ble.ir/lamine_yamal_official",
-    "keywords": ["لامین یامال", "یامال", "لامین", "ستاره لاماسیا"]
+    "keywords": ["یامال", "لامین", "لامین یامال"]
   },
   {
     "destination": "@liverpool_fa",
@@ -102,7 +102,7 @@
   {
     "destination": "@manchester_city_ir",
     "link": "https://ble.ir/manchester_city_ir",
-    "keywords": ["منچستر سیتی", "من سیتی", "منچسترسیتی", "سیتیزن‌ها", "سیتی"]
+    "keywords": ["سیتی", "منچستر سیتی", "من سیتی", "منچسترسیتی", "سیتیزن‌ها"]
   },
   {
     "destination": "@manchesterunited_fa",
@@ -152,6 +152,6 @@
   {
     "destination": "@uefa_champ_league",
     "link": "https://ble.ir/uefa_champ_league",
-    "keywords": ["لیگ قهرمانان", "چمپیونز لیگ", "جام باشگاه‌های اروپا"]
+    "keywords": ["لیگ قهرمانان", "چمپیونز لیگ", "جام باشگاه‌های اروپا", "لیگ قهرمانان اروپا"]
   }
 ]

@@ -28,6 +28,7 @@ class ScriptRunner:
         script_name: str | None = None,
         stage_name: str = "script",
         trace_id: str | None = None,
+        timeout_sec_override: int | None = None,
     ) -> ScriptRunResult:
         selected_script = script_name or route.channel_script
         if not selected_script:
@@ -80,8 +81,9 @@ class ScriptRunner:
             stderr=asyncio.subprocess.PIPE,
         )
 
+        effective_timeout_sec = max(1, int(timeout_sec_override or self.timeout_sec))
         try:
-            stdout_bytes, stderr_bytes = await asyncio.wait_for(proc.communicate(), timeout=self.timeout_sec)
+            stdout_bytes, stderr_bytes = await asyncio.wait_for(proc.communicate(), timeout=effective_timeout_sec)
         except asyncio.TimeoutError:
             proc.kill()
             await proc.communicate()
@@ -93,12 +95,12 @@ class ScriptRunner:
                         "stage": stage_name,
                         "route": route.name,
                         "script_name": selected_script,
-                        "timeout_sec": self.timeout_sec,
+                        "timeout_sec": effective_timeout_sec,
                         "duration_ms": round((time.monotonic() - start) * 1000.0, 2),
                     }
                 },
             )
-            raise ScriptExecutionError(f"{stage_name} timeout after {self.timeout_sec}s: {script_path.name}")
+            raise ScriptExecutionError(f"{stage_name} timeout after {effective_timeout_sec}s: {script_path.name}")
 
         stdout = stdout_bytes.decode("utf-8", errors="replace").strip()
         stderr = stderr_bytes.decode("utf-8", errors="replace").strip()

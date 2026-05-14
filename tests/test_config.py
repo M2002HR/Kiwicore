@@ -272,8 +272,6 @@ def test_load_routes_reads_sync_settings_and_allows_syncing_when_disabled(tmp_pa
                         "interval_sec": 120,
                         "batch_size": 3,
                         "retry_attempts": 4,
-                        "pending_count": 9,
-                        "processed_count": 6,
                         "seeded": True,
                     },
                 }
@@ -289,8 +287,6 @@ def test_load_routes_reads_sync_settings_and_allows_syncing_when_disabled(tmp_pa
     assert matched.sync_interval_sec == 120
     assert matched.sync_batch_size == 3
     assert matched.sync_retry_attempts == 4
-    assert matched.sync_pending_count == 9
-    assert matched.sync_processed_count == 6
     assert matched.sync_seeded is True
 
 

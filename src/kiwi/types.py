@@ -70,8 +70,6 @@ class ChannelRoute:
     sync_interval_sec: int = 300
     sync_batch_size: int = 1
     sync_retry_attempts: int = 2
-    sync_pending_count: int = 0
-    sync_processed_count: int = 0
     sync_seeded: bool = False
 
     def destination_target(self) -> str:

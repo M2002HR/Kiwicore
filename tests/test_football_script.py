@@ -30,7 +30,7 @@ def _run_script(payload: dict, tmp_path: Path, *, env_patch: dict[str, str] | No
     payload_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
 
     env = os.environ.copy()
-    env["FOOTBALL_AI_ENABLED"] = "false"
+    env["CHANNEL_SCRIPT_AI_ENABLED"] = "false"
     if env_patch:
         env.update(env_patch)
 
@@ -64,9 +64,9 @@ def test_football_script_keeps_default_passthrough_when_ai_disabled(tmp_path: Pa
 
 def test_football_script_applies_ai_text_to_caption_and_removes_old_text(tmp_path: Path, monkeypatch) -> None:
     mod = _load_module()
-    monkeypatch.setenv("FOOTBALL_AI_ENABLED", "true")
-    monkeypatch.setenv("FOOTBALL_AI_ENDPOINT", "http://fake.local/proxy/gemini")
-    monkeypatch.setenv("FOOTBALL_AI_FAIL_OPEN", "true")
+    monkeypatch.setenv("CHANNEL_SCRIPT_AI_ENABLED", "true")
+    monkeypatch.setenv("CHANNEL_SCRIPT_AI_ENDPOINT", "http://fake.local/proxy/gemini")
+    monkeypatch.setenv("CHANNEL_SCRIPT_AI_FAIL_OPEN", "true")
 
     def fake_call(*, endpoint: str, body: dict, timeout_sec: float):
         assert endpoint == "http://fake.local/proxy/gemini"
@@ -91,8 +91,8 @@ def test_football_script_applies_ai_text_to_caption_and_removes_old_text(tmp_pat
 
 def test_football_script_preserves_source_emojis_in_generated_caption(tmp_path: Path, monkeypatch) -> None:
     mod = _load_module()
-    monkeypatch.setenv("FOOTBALL_AI_ENABLED", "true")
-    monkeypatch.setenv("FOOTBALL_AI_ENDPOINT", "http://fake.local/proxy/gemini")
+    monkeypatch.setenv("CHANNEL_SCRIPT_AI_ENABLED", "true")
+    monkeypatch.setenv("CHANNEL_SCRIPT_AI_ENDPOINT", "http://fake.local/proxy/gemini")
 
     def fake_call(*, endpoint: str, body: dict, timeout_sec: float):
         return "تیم با نمایش منظم و حملات سریع، سه امتیاز ارزشمند را گرفت."
@@ -112,8 +112,8 @@ def test_football_script_preserves_source_emojis_in_generated_caption(tmp_path: 
 
 def test_football_script_keeps_destination_signature_last_when_injecting_emojis(tmp_path: Path, monkeypatch) -> None:
     mod = _load_module()
-    monkeypatch.setenv("FOOTBALL_AI_ENABLED", "true")
-    monkeypatch.setenv("FOOTBALL_AI_ENDPOINT", "http://fake.local/proxy/gemini")
+    monkeypatch.setenv("CHANNEL_SCRIPT_AI_ENABLED", "true")
+    monkeypatch.setenv("CHANNEL_SCRIPT_AI_ENDPOINT", "http://fake.local/proxy/gemini")
 
     def fake_call(*, endpoint: str, body: dict, timeout_sec: float):
         return "تیم با نمایش خوب بازی را برد.\n@dest"
@@ -133,8 +133,8 @@ def test_football_script_keeps_destination_signature_last_when_injecting_emojis(
 
 def test_football_script_ai_request_is_text_only_even_with_photo_input(tmp_path: Path, monkeypatch) -> None:
     mod = _load_module()
-    monkeypatch.setenv("FOOTBALL_AI_ENABLED", "true")
-    monkeypatch.setenv("FOOTBALL_AI_ENDPOINT", "http://fake.local/proxy/gemini")
+    monkeypatch.setenv("CHANNEL_SCRIPT_AI_ENABLED", "true")
+    monkeypatch.setenv("CHANNEL_SCRIPT_AI_ENDPOINT", "http://fake.local/proxy/gemini")
 
     captured: dict[str, object] = {}
 
@@ -165,8 +165,8 @@ def test_football_script_ai_request_is_text_only_even_with_photo_input(tmp_path:
 
 def test_football_script_refines_low_quality_first_pass(tmp_path: Path, monkeypatch) -> None:
     mod = _load_module()
-    monkeypatch.setenv("FOOTBALL_AI_ENABLED", "true")
-    monkeypatch.setenv("FOOTBALL_AI_ENDPOINT", "http://fake.local/proxy/gemini")
+    monkeypatch.setenv("CHANNEL_SCRIPT_AI_ENABLED", "true")
+    monkeypatch.setenv("CHANNEL_SCRIPT_AI_ENDPOINT", "http://fake.local/proxy/gemini")
 
     calls = {"count": 0}
 
@@ -198,12 +198,12 @@ def test_football_script_stdout_stays_json_when_ai_enabled_and_endpoint_fails(tm
         payload,
         tmp_path,
         env_patch={
-            "FOOTBALL_AI_ENABLED": "true",
-            "FOOTBALL_AI_ENDPOINT": "http://127.0.0.1:9/nowhere",
-            "FOOTBALL_AI_MANDATORY": "false",
-            "FOOTBALL_AI_RETRY_COUNT": "0",
-            "FOOTBALL_AI_TIMEOUT_SEC": "0.2",
-            "FOOTBALL_AI_FAIL_OPEN": "true",
+            "CHANNEL_SCRIPT_AI_ENABLED": "true",
+            "CHANNEL_SCRIPT_AI_ENDPOINT": "http://127.0.0.1:9/nowhere",
+            "CHANNEL_SCRIPT_AI_MANDATORY": "false",
+            "CHANNEL_SCRIPT_AI_RETRY_COUNT": "0",
+            "CHANNEL_SCRIPT_AI_TIMEOUT_SEC": "0.2",
+            "CHANNEL_SCRIPT_AI_FAIL_OPEN": "true",
         },
     )
     assert out == {"messages": [{"type": "text", "text": "متن تست"}]}
@@ -211,8 +211,8 @@ def test_football_script_stdout_stays_json_when_ai_enabled_and_endpoint_fails(tm
 
 def test_football_script_postprocess_removes_prompt_leak_and_duplicate_signature(tmp_path: Path, monkeypatch) -> None:
     mod = _load_module()
-    monkeypatch.setenv("FOOTBALL_AI_ENABLED", "true")
-    monkeypatch.setenv("FOOTBALL_AI_ENDPOINT", "http://fake.local/proxy/gemini")
+    monkeypatch.setenv("CHANNEL_SCRIPT_AI_ENABLED", "true")
+    monkeypatch.setenv("CHANNEL_SCRIPT_AI_ENDPOINT", "http://fake.local/proxy/gemini")
 
     leaked = (
         "Professional Persian football content writer.\n"
@@ -244,10 +244,10 @@ def test_football_script_postprocess_removes_prompt_leak_and_duplicate_signature
 
 def test_football_script_respects_global_budget_and_falls_back_fast(tmp_path: Path, monkeypatch) -> None:
     mod = _load_module()
-    monkeypatch.setenv("FOOTBALL_AI_ENABLED", "true")
-    monkeypatch.setenv("FOOTBALL_AI_ENDPOINT", "http://fake.local/proxy/gemini")
-    monkeypatch.setenv("FOOTBALL_AI_MANDATORY", "false")
-    monkeypatch.setenv("FOOTBALL_AI_FAIL_OPEN", "false")
+    monkeypatch.setenv("CHANNEL_SCRIPT_AI_ENABLED", "true")
+    monkeypatch.setenv("CHANNEL_SCRIPT_AI_ENDPOINT", "http://fake.local/proxy/gemini")
+    monkeypatch.setenv("CHANNEL_SCRIPT_AI_MANDATORY", "false")
+    monkeypatch.setenv("CHANNEL_SCRIPT_AI_FAIL_OPEN", "false")
     monkeypatch.setattr(mod, "_ai_total_budget_sec", lambda: 0.1)
 
     def should_not_call(**kwargs):
@@ -265,8 +265,8 @@ def test_football_script_respects_global_budget_and_falls_back_fast(tmp_path: Pa
 
 def test_football_script_forces_persian_rewrite_when_first_output_is_english(tmp_path: Path, monkeypatch) -> None:
     mod = _load_module()
-    monkeypatch.setenv("FOOTBALL_AI_ENABLED", "true")
-    monkeypatch.setenv("FOOTBALL_AI_ENDPOINT", "http://fake.local/proxy/gemini")
+    monkeypatch.setenv("CHANNEL_SCRIPT_AI_ENABLED", "true")
+    monkeypatch.setenv("CHANNEL_SCRIPT_AI_ENDPOINT", "http://fake.local/proxy/gemini")
 
     calls = {"count": 0}
 
@@ -289,8 +289,8 @@ def test_football_script_forces_persian_rewrite_when_first_output_is_english(tmp
 
 def test_football_script_media_without_caption_passthroughs_without_ai(tmp_path: Path, monkeypatch) -> None:
     mod = _load_module()
-    monkeypatch.setenv("FOOTBALL_AI_ENABLED", "true")
-    monkeypatch.setenv("FOOTBALL_AI_ENDPOINT", "http://fake.local/proxy/gemini")
+    monkeypatch.setenv("CHANNEL_SCRIPT_AI_ENABLED", "true")
+    monkeypatch.setenv("CHANNEL_SCRIPT_AI_ENDPOINT", "http://fake.local/proxy/gemini")
 
     def fake_call(*, endpoint: str, body: dict, timeout_sec: float):
         raise AssertionError("AI should not be called for media-only messages without text/caption")
@@ -307,8 +307,8 @@ def test_football_script_media_without_caption_passthroughs_without_ai(tmp_path:
 
 def test_football_script_non_photo_without_caption_passthroughs_without_ai(tmp_path: Path, monkeypatch) -> None:
     mod = _load_module()
-    monkeypatch.setenv("FOOTBALL_AI_ENABLED", "true")
-    monkeypatch.setenv("FOOTBALL_AI_ENDPOINT", "http://fake.local/proxy/gemini")
+    monkeypatch.setenv("CHANNEL_SCRIPT_AI_ENABLED", "true")
+    monkeypatch.setenv("CHANNEL_SCRIPT_AI_ENDPOINT", "http://fake.local/proxy/gemini")
 
     def fake_call(*, endpoint: str, body: dict, timeout_sec: float):
         raise AssertionError("AI should not be called for media-only messages without text/caption")
@@ -326,7 +326,7 @@ def test_football_script_non_photo_without_caption_passthroughs_without_ai(tmp_p
 
 def test_football_script_builds_prompt_even_when_ai_is_disabled(tmp_path: Path, monkeypatch) -> None:
     mod = _load_module()
-    monkeypatch.setenv("FOOTBALL_AI_ENABLED", "false")
+    monkeypatch.setenv("CHANNEL_SCRIPT_AI_ENABLED", "false")
 
     seen: dict[str, str] = {}
     original_prompt = mod._football_prompt
@@ -351,9 +351,9 @@ def test_football_script_builds_prompt_even_when_ai_is_disabled(tmp_path: Path, 
 
 def test_football_script_rejects_non_persian_caption_in_mandatory_mode(tmp_path: Path, monkeypatch) -> None:
     mod = _load_module()
-    monkeypatch.setenv("FOOTBALL_AI_ENABLED", "true")
-    monkeypatch.setenv("FOOTBALL_AI_ENDPOINT", "http://fake.local/proxy/gemini")
-    monkeypatch.setenv("FOOTBALL_AI_FAIL_OPEN", "false")
+    monkeypatch.setenv("CHANNEL_SCRIPT_AI_ENABLED", "true")
+    monkeypatch.setenv("CHANNEL_SCRIPT_AI_ENDPOINT", "http://fake.local/proxy/gemini")
+    monkeypatch.setenv("CHANNEL_SCRIPT_AI_FAIL_OPEN", "false")
 
     def fake_call(*, endpoint: str, body: dict, timeout_sec: float):
         return "Saka dropping these memes on his Instagram story after two huge Arsenal wins last week 😂"
@@ -368,14 +368,14 @@ def test_football_script_rejects_non_persian_caption_in_mandatory_mode(tmp_path:
         mod.build_messages(payload, input_dir=tmp_path)
         assert False, "expected RuntimeError"
     except RuntimeError as exc:
-        assert "football_ai_generation_required_failed" in str(exc)
+        assert "ai_generation_required_failed" in str(exc)
 
 
 def test_football_script_mandatory_mode_skips_empty_source_message(tmp_path: Path, monkeypatch) -> None:
     mod = _load_module()
-    monkeypatch.setenv("FOOTBALL_AI_ENABLED", "true")
-    monkeypatch.setenv("FOOTBALL_AI_MANDATORY", "true")
-    monkeypatch.setenv("FOOTBALL_AI_ENDPOINT", "http://fake.local/proxy/gemini")
+    monkeypatch.setenv("CHANNEL_SCRIPT_AI_ENABLED", "true")
+    monkeypatch.setenv("CHANNEL_SCRIPT_AI_MANDATORY", "true")
+    monkeypatch.setenv("CHANNEL_SCRIPT_AI_ENDPOINT", "http://fake.local/proxy/gemini")
 
     payload = {
         "route": {"destination_target": "@dest"},

@@ -112,12 +112,13 @@ def _build_base_messages(payload: dict) -> list[dict]:
 
 
 def _football_ai_enabled() -> bool:
-    return os.getenv("FOOTBALL_AI_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+    raw = os.getenv("CHANNEL_SCRIPT_AI_ENABLED", "true").strip()
+    return raw.lower() in {"1", "true", "yes", "on"}
 
 
 def _pick_ai_endpoint() -> str:
     return (
-        os.getenv("FOOTBALL_AI_ENDPOINT", "").strip()
+        os.getenv("CHANNEL_SCRIPT_AI_ENDPOINT", "").strip()
         or os.getenv("SCRIPT_CLEAN_AI_ENDPOINT", "").strip()
         or os.getenv("GUARD_AI_ENDPOINT", "").strip()
     )
@@ -125,14 +126,14 @@ def _pick_ai_endpoint() -> str:
 
 def _pick_ai_model() -> str:
     return (
-        os.getenv("FOOTBALL_AI_MODEL", "").strip()
+        os.getenv("CHANNEL_SCRIPT_AI_MODEL", "").strip()
         or os.getenv("SCRIPT_CLEAN_AI_MODEL", "").strip()
         or os.getenv("GUARD_AI_MODEL", "").strip()
     )
 
 
 def _ai_timeout_sec() -> float:
-    raw = os.getenv("FOOTBALL_AI_TIMEOUT_SEC", "20").strip() or "20"
+    raw = os.getenv("CHANNEL_SCRIPT_AI_TIMEOUT_SEC", "20").strip() or "20"
     try:
         return max(8.0, min(60.0, float(raw)))
     except Exception:
@@ -140,7 +141,7 @@ def _ai_timeout_sec() -> float:
 
 
 def _ai_retry_count() -> int:
-    raw = os.getenv("FOOTBALL_AI_RETRY_COUNT", "2").strip() or "2"
+    raw = os.getenv("CHANNEL_SCRIPT_AI_RETRY_COUNT", "2").strip() or "2"
     try:
         retries = max(0, min(3, int(raw)))
     except Exception:
@@ -151,11 +152,12 @@ def _ai_retry_count() -> int:
 
 
 def _ai_fail_open() -> bool:
-    return os.getenv("FOOTBALL_AI_FAIL_OPEN", "false").strip().lower() in {"1", "true", "yes", "on"}
+    raw = os.getenv("CHANNEL_SCRIPT_AI_FAIL_OPEN", "false").strip()
+    return raw.lower() in {"1", "true", "yes", "on"}
 
 
 def _ai_max_images() -> int:
-    raw = os.getenv("FOOTBALL_AI_MAX_IMAGES", "3").strip() or "3"
+    raw = os.getenv("CHANNEL_SCRIPT_AI_MAX_IMAGES", "3").strip() or "3"
     try:
         return max(0, min(6, int(raw)))
     except Exception:
@@ -163,7 +165,7 @@ def _ai_max_images() -> int:
 
 
 def _ai_total_budget_sec() -> float:
-    raw = os.getenv("FOOTBALL_AI_TOTAL_BUDGET_SEC", "75").strip() or "75"
+    raw = os.getenv("CHANNEL_SCRIPT_AI_TOTAL_BUDGET_SEC", "75").strip() or "75"
     try:
         return max(15.0, min(110.0, float(raw)))
     except Exception:
@@ -171,7 +173,8 @@ def _ai_total_budget_sec() -> float:
 
 
 def _ai_mandatory_mode() -> bool:
-    forced = os.getenv("FOOTBALL_AI_MANDATORY", "true").strip().lower() in {"1", "true", "yes", "on"}
+    raw = os.getenv("CHANNEL_SCRIPT_AI_MANDATORY", "true").strip()
+    forced = raw.lower() in {"1", "true", "yes", "on"}
     return forced and _football_ai_enabled()
 
 
@@ -815,7 +818,7 @@ def build_messages(payload: dict, *, input_dir: Path) -> list[dict]:
         if not has_textual_source:
             # Non-text messages must pass through unchanged.
             return base
-        raise RuntimeError("football_ai_generation_required_failed")
+        raise RuntimeError("ai_generation_required_failed")
 
     if generated is None:
         out = base
@@ -850,11 +853,11 @@ def build_messages(payload: dict, *, input_dir: Path) -> list[dict]:
             if msg_type == "text":
                 text = str(item.get("text") or "").strip()
                 if text and not _is_persian_acceptable(text):
-                    raise RuntimeError("football_ai_output_not_persian")
+                    raise RuntimeError("ai_output_not_acceptable")
             if msg_type in CAPTION_TYPES:
                 caption = str(item.get("caption") or "").strip()
                 if caption and not _is_persian_acceptable(caption):
-                    raise RuntimeError("football_ai_caption_not_persian")
+                    raise RuntimeError("ai_output_not_acceptable")
     return out
 
 

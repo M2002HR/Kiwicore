@@ -61,6 +61,10 @@ class Settings:
     sync_review_alert_target: str | None = None
     sync_ledger_db_path: str = "./app_data/sync_ledger.sqlite3"
     sync_ledger_dsn: str = ""
+    admin_web_enabled: bool = True
+    admin_web_host: str = "127.0.0.1"
+    admin_web_port: int = 8787
+    admin_web_session_ttl_sec: int = 28800
 
 
 @dataclass(slots=True)
@@ -183,6 +187,10 @@ def load_settings(env_file: str = ".env") -> Settings:
         sync_review_alert_target=_str("SYNC_REVIEW_ALERT_TARGET", "").strip() or None,
         sync_ledger_db_path=_str("SYNC_LEDGER_DB_PATH", "./app_data/sync_ledger.sqlite3").strip(),
         sync_ledger_dsn=_str("SYNC_LEDGER_DSN", "").strip(),
+        admin_web_enabled=_bool("ADMIN_WEB_ENABLED", True),
+        admin_web_host=_str("ADMIN_WEB_HOST", "127.0.0.1").strip() or "127.0.0.1",
+        admin_web_port=max(1, min(65535, _int("ADMIN_WEB_PORT", 8787))),
+        admin_web_session_ttl_sec=max(300, _int("ADMIN_WEB_SESSION_TTL_SEC", 28800)),
     )
 
     if settings.telegram_source_mode not in {"bot", "telethon", "hybrid"}:
@@ -327,12 +335,6 @@ def load_routes(config_path: str) -> RouteRegistry:
             sync_retry_attempts=max(0, int((obj.get("sync") or {}).get("retry_attempts", 2)))
             if isinstance(obj.get("sync"), dict)
             else 2,
-            sync_pending_count=max(0, int((obj.get("sync") or {}).get("pending_count", 0)))
-            if isinstance(obj.get("sync"), dict)
-            else 0,
-            sync_processed_count=max(0, int((obj.get("sync") or {}).get("processed_count", 0)))
-            if isinstance(obj.get("sync"), dict)
-            else 0,
             sync_seeded=bool((obj.get("sync") or {}).get("seeded", False)) if isinstance(obj.get("sync"), dict) else False,
         )
         if route.sync_status not in {"active", "syncing", "disabled"}:

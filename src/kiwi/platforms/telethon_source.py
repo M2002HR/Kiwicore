@@ -344,7 +344,17 @@ class TelethonSourceClient:
             if normalized:
                 # Telegram channel ids are stored as -100<channel_id>; resolve via PeerChannel first.
                 if normalized.startswith("-100") and normalized[4:].isdigit():
-                    from telethon.tl.types import PeerChannel  # type: ignore[import-not-found]
+                    try:
+                        from telethon.tl.types import PeerChannel  # type: ignore[import-not-found]
+                    except Exception:
+                        class PeerChannel:  # type: ignore[no-redef]
+                            def __init__(self, channel_id: int) -> None:
+                                self.channel_id = int(channel_id)
+
+                            def __repr__(self) -> str:
+                                return f"PeerChannel(channel_id={self.channel_id})"
+
+                            __str__ = __repr__
 
                     cid_int = int(normalized[4:])
                     try:

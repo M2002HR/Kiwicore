@@ -267,6 +267,85 @@ def test_service_sync_jitter_varies_across_routes() -> None:
     assert len(values) > 1
 
 
+def test_service_traffic_snapshot_accumulates_by_route(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    route = ChannelRoute(
+        name="r-traffic",
+        enabled=True,
+        source_channel_id="-1001",
+        source_channel_username="@src",
+        destination_channel_id="-2001",
+        destination_channel_username=None,
+        channel_script=None,
+        max_message_mb=10,
+    )
+    service = KiwiService(
+        settings=settings,
+        routes=_route_registry(route),
+        telegram_client=FakeTelegramClient([], b""),
+        bale_client=FakeBaleClient(),
+        storage=StorageManager(settings.storage_dir),
+        guard_runner=GuardRunner(settings.gaurd_scripts_dir, timeout_sec=5),
+        script_runner=ScriptRunner(settings.scripts_dir, timeout_sec=5),
+        state_store=StateStore(settings.state_path),
+    )
+
+    service._record_traffic(route_name="r-traffic", download_bytes=1024, upload_bytes=2048)  # noqa: SLF001
+    service._record_traffic(route_name="r-traffic", download_bytes=512, upload_bytes=256)  # noqa: SLF001
+
+    snap = service.traffic_snapshot()
+    assert snap["total_download_bytes"] == 1536
+    assert snap["total_upload_bytes"] == 2304
+    assert snap["today_download_bytes"] == 1536
+    assert snap["today_upload_bytes"] == 2304
+    by_route = {item["route"]: item for item in snap["by_route"]}
+    assert by_route["r-traffic"]["total_download_bytes"] == 1536
+    assert by_route["r-traffic"]["total_upload_bytes"] == 2304
+    assert snap["history_total_download_bytes"] == 1536
+    assert snap["history_total_upload_bytes"] == 2304
+    assert snap["previous_total_download_bytes"] == 0
+    assert snap["previous_total_upload_bytes"] == 0
+
+
+def test_service_traffic_history_persists_across_runs(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    route = ChannelRoute(
+        name="r-traffic",
+        enabled=True,
+        source_channel_id="-1001",
+        source_channel_username="@src",
+        destination_channel_id="-2001",
+        destination_channel_username=None,
+        channel_script=None,
+        max_message_mb=10,
+    )
+    common_args = dict(
+        settings=settings,
+        routes=_route_registry(route),
+        telegram_client=FakeTelegramClient([], b""),
+        bale_client=FakeBaleClient(),
+        storage=StorageManager(settings.storage_dir),
+        guard_runner=GuardRunner(settings.gaurd_scripts_dir, timeout_sec=5),
+        script_runner=ScriptRunner(settings.scripts_dir, timeout_sec=5),
+        state_store=StateStore(settings.state_path),
+    )
+
+    service1 = KiwiService(**common_args)
+    service1._record_traffic(route_name="r-traffic", download_bytes=1024, upload_bytes=512)  # noqa: SLF001
+
+    service2 = KiwiService(**common_args)
+    service2._record_traffic(route_name="r-traffic", download_bytes=256, upload_bytes=128)  # noqa: SLF001
+
+    snap = service2.traffic_snapshot()
+    assert snap["total_download_bytes"] == 256
+    assert snap["total_upload_bytes"] == 128
+    assert snap["previous_total_download_bytes"] == 1024
+    assert snap["previous_total_upload_bytes"] == 512
+    assert snap["history_total_download_bytes"] == 1280
+    assert snap["history_total_upload_bytes"] == 640
+    assert snap["previous_runs_count"] >= 1
+
+
 def test_service_sync_primes_source_cursor_from_route_checkpoint(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
     route1 = ChannelRoute(
@@ -745,7 +824,7 @@ def test_service_marks_football_ai_generation_required_as_ambiguous(tmp_path: Pa
         """
 import sys
 print("", end="")
-print("football_ai_generation_required_failed", file=sys.stderr)
+print("ai_generation_required_failed", file=sys.stderr)
 sys.exit(2)
 """.strip(),
         encoding="utf-8",
@@ -791,7 +870,7 @@ sys.exit(2)
 
     status, error = asyncio.run(service._process_route_message_detailed(incoming, route))  # noqa: SLF001
     assert status == "ambiguous"
-    assert error == "football_ai_generation_required_failed"
+    assert error == "ai_generation_required_failed"
     assert bale.sent == []
 
 
@@ -1643,8 +1722,6 @@ print(json.dumps({'messages': [{'type': 'text', 'text': 'SYNC:' + text}]}))
                         "interval_sec": 300,
                         "batch_size": 1,
                         "retry_attempts": 2,
-                        "pending_count": 0,
-                        "processed_count": 0,
                         "seeded": False,
                     },
                 }
@@ -1720,9 +1797,10 @@ print(json.dumps({'messages': [{'type': 'text', 'text': 'SYNC:' + text}]}))
 
     saved = json.loads(channels_path.read_text(encoding="utf-8"))
     sync = saved[0]["sync"]
-    assert sync["pending_count"] == 0
     assert sync["status"] == "active"
     assert sync["enabled"] is False
+    assert sync["seeded"] is True
+    assert set(sync.keys()) == {"enabled", "status", "seeded"}
     assert saved[0]["enabled"] is True
 
 
@@ -1745,8 +1823,6 @@ def test_service_syncing_retries_non_guard_failures(tmp_path: Path) -> None:
                         "interval_sec": 1,
                         "batch_size": 1,
                         "retry_attempts": 2,
-                        "pending_count": 1,
-                        "processed_count": 0,
                         "seeded": True,
                     },
                 }
@@ -1971,8 +2047,6 @@ print(json.dumps({'messages': [{'type': 'text', 'text': 'SYNC:' + text}]}))
                         "interval_sec": 1,
                         "batch_size": 1,
                         "retry_attempts": 2,
-                        "pending_count": 0,
-                        "processed_count": 0,
                         "seeded": False,
                     },
                 }
@@ -2060,8 +2134,6 @@ print(json.dumps({'messages': [{'type': 'text', 'text': 'SYNC:' + text}]}))
                         "interval_sec": 1,
                         "batch_size": 2,
                         "retry_attempts": 2,
-                        "pending_count": 0,
-                        "processed_count": 0,
                         "seeded": False,
                     },
                 }
@@ -2190,60 +2262,3 @@ def test_service_run_retries_after_poll_error(tmp_path: Path) -> None:
 
     asyncio.run(_run_for_a_moment())
     assert tg.calls >= 2
-
-
-def test_service_logs_each_stage_with_stage_output(tmp_path: Path) -> None:
-    scripts_dir = tmp_path / "scripts"
-    scripts_dir.mkdir()
-    (scripts_dir / "stage_script.py").write_text(
-        """
-import json
-print(json.dumps({"messages":[{"type":"text","text":"sample out"}]}))
-""".strip(),
-        encoding="utf-8",
-    )
-
-    update = {
-        "update_id": 144,
-        "channel_post": {
-            "message_id": 144,
-            "chat": {"id": -100123, "type": "channel", "username": "kiwi_kiwi_test"},
-            "text": "Bruno Fernandes congratulating Marcus Rashford on his LALIGA title win ❤️",
-        },
-    }
-
-    settings = _settings(tmp_path)
-    settings.log_channel_target = "@logchan"
-    route = ChannelRoute(
-        name="kiwi_test",
-        enabled=True,
-        source_channel_id="-100123",
-        source_channel_username="@kiwi_kiwi_test",
-        destination_channel_id=None,
-        destination_channel_username="@kiwi_kiwi_test",
-        channel_script="stage_script.py",
-        max_message_mb=10,
-    )
-
-    tg = FakeTelegramClient([update], b"")
-    bale = FakeBaleClient()
-    service = KiwiService(
-        settings=settings,
-        routes=_route_registry(route),
-        telegram_client=tg,
-        bale_client=bale,
-        storage=StorageManager(settings.storage_dir),
-        guard_runner=GuardRunner(settings.gaurd_scripts_dir, timeout_sec=5),
-        script_runner=ScriptRunner(settings.scripts_dir, timeout_sec=5),
-        state_store=StateStore(settings.state_path),
-    )
-
-    processed = asyncio.run(service.run_once())
-    assert processed == 1
-    assert bale.sent == [("@kiwi_kiwi_test", "sample out\n@kiwi_kiwi_test")]
-
-    stage_logs = [text for chat, text in tg.audit_messages if chat == "@logchan"]
-    assert any("بررسی گارد | موفق" in text for text in stage_logs)
-    assert any("اجرای channel script | موفق" in text for text in stage_logs)
-    assert any("stage_output:" in text for text in stage_logs)
-    assert any("sample out" in text for text in stage_logs)

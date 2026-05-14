@@ -6,10 +6,13 @@ import inspect
 import json
 import logging
 import os
+import threading
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 from kiwi.config import RouteRegistry, Settings
 from kiwi.dispatcher import BaleDispatcher
@@ -22,6 +25,7 @@ from kiwi.state import StateStore
 from kiwi.storage import StorageManager
 from kiwi.sync_ledger import SyncLedger, TERMINAL_STATUSES
 from kiwi.sync_queue import InMemorySyncQueue, SyncQueueBackend, payload_hash_from_json
+from kiwi.traffic_history import TrafficHistory
 from kiwi.types import (
     AdminInboundMessage,
     ChannelRoute,
@@ -84,6 +88,26 @@ class KiwiService:
         self._retry_queue_hydrated = False
         self._sync_drain_task: asyncio.Task[int] | None = None
         self._sync_next_due_at: dict[str, float] = {}
+        self._started_at_ts = time.time()
+        self._run_id = str(uuid4())
+        self._run_once_calls = 0
+        self._processed_messages_total = 0
+        self._last_run_once_ts: float | None = None
+        self._consecutive_poll_errors = 0
+        self._last_poll_error: str | None = None
+        self._traffic_lock = threading.RLock()
+        self._traffic_total_download_bytes = 0
+        self._traffic_total_upload_bytes = 0
+        self._traffic_today_download_bytes = 0
+        self._traffic_today_upload_bytes = 0
+        self._traffic_by_route_total: dict[str, dict[str, int]] = {}
+        self._traffic_by_route_today: dict[str, dict[str, int]] = {}
+        self._traffic_day = self._current_traffic_day()
+        self._traffic_history = TrafficHistory(
+            Path(self.settings.storage_dir) / "traffic_history.json",
+            run_id=self._run_id,
+            started_at_ts=self._started_at_ts,
+        )
 
     async def stop(self) -> None:
         self._stop_event.set()
@@ -98,44 +122,50 @@ class KiwiService:
 
     async def run(self) -> None:
         logger.info("Kiwi service started")
-        consecutive_poll_errors = 0
         try:
             while not self._stop_event.is_set():
                 try:
                     updates_count = await self.run_once()
-                    consecutive_poll_errors = 0
+                    self._run_once_calls += 1
+                    self._processed_messages_total += max(0, int(updates_count))
+                    self._last_run_once_ts = time.time()
+                    self._consecutive_poll_errors = 0
+                    self._last_poll_error = None
                     if updates_count == 0:
                         await asyncio.sleep(self.settings.poll_idle_sleep_sec)
                 except asyncio.CancelledError:
                     raise
                 except PlatformApiError as exc:
-                    consecutive_poll_errors += 1
-                    delay = min(self.settings.poll_error_sleep_sec * consecutive_poll_errors, 60.0)
+                    self._consecutive_poll_errors += 1
+                    self._last_poll_error = str(exc)
+                    delay = min(self.settings.poll_error_sleep_sec * self._consecutive_poll_errors, 60.0)
                     logger.warning(
                         "Polling failed; retrying",
                         extra={
                             "details": {
                                 "error": str(exc),
                                 "retry_in_sec": delay,
-                                "consecutive_errors": consecutive_poll_errors,
+                                "consecutive_errors": self._consecutive_poll_errors,
                             }
                         },
                     )
                     await asyncio.sleep(delay)
                 except Exception:
-                    consecutive_poll_errors += 1
-                    delay = min(self.settings.poll_error_sleep_sec * consecutive_poll_errors, 60.0)
+                    self._consecutive_poll_errors += 1
+                    self._last_poll_error = "unexpected_error"
+                    delay = min(self.settings.poll_error_sleep_sec * self._consecutive_poll_errors, 60.0)
                     logger.exception(
                         "Unexpected error in polling loop; retrying",
                         extra={
                             "details": {
                                 "retry_in_sec": delay,
-                                "consecutive_errors": consecutive_poll_errors,
+                                "consecutive_errors": self._consecutive_poll_errors,
                             }
                         },
                     )
                     await asyncio.sleep(delay)
         finally:
+            self._close_traffic_history()
             await self.aclose()
             logger.info("Kiwi service stopped")
 
@@ -240,7 +270,6 @@ class KiwiService:
             return
 
         pending = self.sync_ledger.active_count_for_route(route.name)
-        route.sync_pending_count = max(0, int(pending))
         if pending > 0:
             return
 
@@ -266,7 +295,6 @@ class KiwiService:
         route.sync_status = "active"
         route.sync_enabled = False
         route.sync_seeded = True
-        route.sync_pending_count = 0
         route.enabled = True
 
         logger.info(
@@ -287,7 +315,6 @@ class KiwiService:
                     "enabled": False,
                     "status": "active",
                     "seeded": True,
-                    "pending_count": 0,
                 },
             },
         )
@@ -632,6 +659,12 @@ class KiwiService:
             )
             if status in {"ok", "blocked", "skipped"}:
                 return status, err
+            if self._is_retryable_channel_script_error_text(err):
+                if idx < attempts - 1:
+                    await asyncio.sleep(0.8 * (idx + 1))
+                    continue
+                # Exhausted retry policy for this route; skip and continue sync queue.
+                return "skipped", "channel_script_retry_exhausted_skipped"
             if status == "ambiguous":
                 if idx < attempts - 1 and self._is_transient_error_text(err):
                     await asyncio.sleep(0.8 * (idx + 1))
@@ -733,12 +766,25 @@ class KiwiService:
         )
 
     @staticmethod
+    def _is_retryable_channel_script_error_text(error_text: str | None) -> bool:
+        text = str(error_text or "").lower().strip()
+        if not text:
+            return False
+        return (
+            "ai_generation_required_failed" in text
+            or "ai_output_not_acceptable" in text
+            or "channel_script_timeout" in text
+        )
+
+    @staticmethod
     def _classify_local_processing_error(stage_name: str, exc: Exception) -> tuple[str, str] | None:
         stage = str(stage_name or "").strip().lower()
         text = str(exc or "").strip()
         lowered = text.lower()
 
         if stage == "download":
+            if isinstance(exc, PermissionError):
+                return "failed", "storage_permission_denied"
             if isinstance(exc, FileNotFoundError):
                 return "skipped", "source_media_unavailable"
             if isinstance(exc, ValueError) and "source_ref" in lowered:
@@ -914,8 +960,61 @@ class KiwiService:
             )
             return "blocked", permission_block_reason
 
-        paths = self.storage.prepare_message_paths(incoming)
-        self.storage.write_raw_update(paths, incoming.raw)
+        try:
+            paths = self.storage.prepare_message_paths(incoming)
+            self.storage.write_raw_update(paths, incoming.raw)
+        except Exception as exc:
+            classified = self._classify_local_processing_error(stage_name, exc)
+            if classified is not None:
+                status, error_code = classified
+                stage_timings_ms["total"] = round((time.monotonic() - started_at) * 1000.0, 2)
+                await self._audit_log(
+                    stage=stage_name,
+                    status=status,
+                    incoming=incoming,
+                    route=route,
+                    reason=f"Storage preparation error at stage {stage_name}: {exc}",
+                    trace_id=trace_id,
+                    stage_timings_ms=stage_timings_ms,
+                )
+                logger.info(
+                    "Route processing failed during storage preparation",
+                    extra={
+                        "details": {
+                            "route": route.name,
+                            "trace_id": trace_id,
+                            "stage": stage_name,
+                            "status": status,
+                            "error_code": error_code,
+                            "error": str(exc),
+                            "timings_ms": stage_timings_ms,
+                        }
+                    },
+                )
+                return status, error_code
+            stage_timings_ms["total"] = round((time.monotonic() - started_at) * 1000.0, 2)
+            await self._audit_log(
+                stage="processing",
+                status="failed",
+                incoming=incoming,
+                route=route,
+                reason="Unexpected error during storage preparation",
+                trace_id=trace_id,
+                stage_timings_ms=stage_timings_ms,
+            )
+            logger.exception(
+                "Unexpected error during storage preparation",
+                extra={
+                    "details": {
+                        "route": route.name,
+                        "trace_id": trace_id,
+                        "source_channel_id": incoming.source_channel_id,
+                        "update_id": incoming.update_id,
+                        "timings_ms": stage_timings_ms,
+                    }
+                },
+            )
+            return "failed", "storage_prepare_unexpected_error"
 
         input_dir = Path(paths.input_dir)
         output_dir = Path(paths.output_dir)
@@ -939,8 +1038,6 @@ class KiwiService:
                     "interval_sec": route.sync_interval_sec,
                     "batch_size": route.sync_batch_size,
                     "retry_attempts": route.sync_retry_attempts,
-                    "pending_count": route.sync_pending_count,
-                    "processed_count": route.sync_processed_count,
                 },
             },
             "message": {
@@ -1035,6 +1132,7 @@ class KiwiService:
             payload["downloaded_total_bytes"] = downloaded_total
             payload["max_total_bytes"] = max_total_bytes
             self.storage.write_payload(paths, payload)
+            self._record_traffic(route_name=route.name, download_bytes=downloaded_total, upload_bytes=0)
             stage_timings_ms["download"] = round((time.monotonic() - download_started) * 1000.0, 2)
             logger.info(
                 "Inputs prepared for scripts",
@@ -1095,7 +1193,7 @@ class KiwiService:
                 status="ok",
                 incoming=incoming,
                 route=route,
-                reason=f"گارد عبور داد ({route.gaurd_script})" if route.gaurd_script else "گارد تنظیم نشده بود؛ عبور مستقیم",
+                reason=f"Guard passed ({route.gaurd_script})" if route.gaurd_script else "No guard configured; passed through",
                 trace_id=trace_id,
                 stage_timings_ms=stage_timings_ms,
                 stage_output={
@@ -1111,6 +1209,13 @@ class KiwiService:
             channel_started = time.monotonic()
             stage_name = "channel_script"
             if route.channel_script:
+                timeout_override: int | None = None
+                raw_timeout = os.getenv("CHANNEL_SCRIPT_TIMEOUT_SEC", "").strip()
+                if raw_timeout:
+                    try:
+                        timeout_override = max(30, min(600, int(raw_timeout)))
+                    except Exception:
+                        timeout_override = None
                 run_result = await self.script_runner.run(
                     route,
                     payload_path=Path(paths.payload_path),
@@ -1119,6 +1224,7 @@ class KiwiService:
                     script_name=route.channel_script,
                     stage_name="channel_script",
                     trace_id=trace_id,
+                    timeout_sec_override=timeout_override,
                 )
             else:
                 run_result = ScriptRunResult(
@@ -1147,7 +1253,7 @@ class KiwiService:
                     status="skipped",
                     incoming=incoming,
                     route=route,
-                    reason="خروجی channel script خالی بود",
+                    reason="Channel script output was empty",
                     trace_id=trace_id,
                     stage_timings_ms=stage_timings_ms,
                 )
@@ -1170,9 +1276,9 @@ class KiwiService:
                 status="ok",
                 incoming=incoming,
                 route=route,
-                reason=f"channel script اجرا شد ({len(run_result.messages)} پیام خروجی)"
+                reason=f"Channel script executed ({len(run_result.messages)} output messages)"
                 if route.channel_script
-                else f"channel script تنظیم نشده بود؛ خروجی مستقیم از پیام ورودی ({len(run_result.messages)} پیام)",
+                else f"No channel script configured; direct passthrough from input message ({len(run_result.messages)} messages)",
                 trace_id=trace_id,
                 stage_timings_ms=stage_timings_ms,
                 stage_output={
@@ -1208,7 +1314,7 @@ class KiwiService:
                     status="skipped",
                     incoming=incoming,
                     route=route,
-                    reason="همه خروجی‌های channel script به‌دلیل سقف حجم حذف شدند",
+                    reason="All channel script outputs were dropped due to size limits",
                     trace_id=trace_id,
                     stage_timings_ms=stage_timings_ms,
                 )
@@ -1218,6 +1324,12 @@ class KiwiService:
                 messages=self.keyword_linker.apply(route.destination_target(), filtered_messages),
                 stdout=run_result.stdout,
                 stderr=run_result.stderr,
+            )
+            upload_total_bytes = self._estimate_output_messages_bytes(
+                final_result.messages,
+                output_dir=output_dir,
+                input_dir=input_dir,
+                extra_input_dirs=[],
             )
             (output_dir / "channel_messages.json").write_text(
                 json.dumps(
@@ -1236,6 +1348,7 @@ class KiwiService:
                 input_dir=input_dir,
                 extra_input_dirs=[],
             )
+            self._record_traffic(route_name=route.name, download_bytes=0, upload_bytes=upload_total_bytes)
             stage_timings_ms["dispatch"] = round((time.monotonic() - dispatch_started) * 1000.0, 2)
             stage_timings_ms["total"] = round((time.monotonic() - started_at) * 1000.0, 2)
             await self._audit_log(
@@ -1243,7 +1356,7 @@ class KiwiService:
                 status="ok",
                 incoming=incoming,
                 route=route,
-                reason=f"ارسال شد ({len(final_result.messages)} پیام خروجی)",
+                reason=f"Dispatched ({len(final_result.messages)} output messages)",
                 trace_id=trace_id,
                 stage_timings_ms=stage_timings_ms,
             )
@@ -1268,7 +1381,7 @@ class KiwiService:
                 status="failed",
                 incoming=incoming,
                 route=route,
-                reason=f"حجم پیام از حد مجاز بیشتر بود: {exc}",
+                reason=f"Message size exceeded allowed limit: {exc}",
                 trace_id=trace_id,
                 stage_timings_ms=stage_timings_ms,
             )
@@ -1303,7 +1416,7 @@ class KiwiService:
                 status=status,
                 incoming=incoming,
                 route=route,
-                reason=("عدم دسترسی ارسال به مقصد (permission_denied)" if is_permission else f"خطای پلتفرم: {exc}"),
+                reason=("Destination permission denied (permission_denied)" if is_permission else f"Platform error: {exc}"),
                 trace_id=trace_id,
                 stage_timings_ms=stage_timings_ms,
             )
@@ -1332,9 +1445,15 @@ class KiwiService:
                 except Exception:
                     msg = ""
                 lowered = msg.lower()
-                if "football_ai_generation_required_failed" in lowered:
+                if "ai_generation_required_failed" in lowered:
                     status = "ambiguous"
-                    error_text = "football_ai_generation_required_failed"
+                    error_text = "ai_generation_required_failed"
+                elif "ai_output_not_acceptable" in lowered:
+                    status = "failed"
+                    error_text = "ai_output_not_acceptable"
+                elif "timeout after" in lowered:
+                    status = "failed"
+                    error_text = "channel_script_timeout"
             stage_timings_ms["total"] = round((time.monotonic() - started_at) * 1000.0, 2)
             await self._audit_log(
                 stage="processing",
@@ -1342,9 +1461,9 @@ class KiwiService:
                 incoming=incoming,
                 route=route,
                 reason=(
-                    "channel script نیازمند تولید AI بود اما تولید نشد (برای retry نگه داشته شد)"
+                    "Channel script required AI generation but no AI output was produced (kept for retry)"
                     if status == "ambiguous"
-                    else "اجرای channel script خطا داد"
+                    else "Channel script execution failed"
                 ),
                 trace_id=trace_id,
                 stage_timings_ms=stage_timings_ms,
@@ -1369,7 +1488,7 @@ class KiwiService:
                 status="failed",
                 incoming=incoming,
                 route=route,
-                reason=f"اجرای گارد خطا داد ({route.gaurd_script})",
+                reason=f"Guard execution failed ({route.gaurd_script})",
                 trace_id=trace_id,
                 stage_timings_ms=stage_timings_ms,
             )
@@ -1392,7 +1511,7 @@ class KiwiService:
             if classified is not None:
                 status, error_code = classified
                 stage_timings_ms["total"] = round((time.monotonic() - started_at) * 1000.0, 2)
-                reason = f"خطای منبع در مرحله {stage_name}: {exc}"
+                reason = f"Source/input error at stage {stage_name}: {exc}"
                 await self._audit_log(
                     stage=stage_name,
                     status=status,
@@ -1423,7 +1542,7 @@ class KiwiService:
                 status="failed",
                 incoming=incoming,
                 route=route,
-                reason="خطای غیرمنتظره در پردازش",
+                reason="Unexpected processing error",
                 trace_id=trace_id,
                 stage_timings_ms=stage_timings_ms,
             )
@@ -1518,6 +1637,105 @@ class KiwiService:
     def set_routes(self, routes: RouteRegistry) -> None:
         self.routes = routes
 
+    def runtime_snapshot(self) -> dict[str, object]:
+        return {
+            "started_at_ts": self._started_at_ts,
+            "uptime_sec": max(0.0, time.time() - self._started_at_ts),
+            "run_once_calls": int(self._run_once_calls),
+            "processed_messages_total": int(self._processed_messages_total),
+            "last_run_once_ts": self._last_run_once_ts,
+            "consecutive_poll_errors": int(self._consecutive_poll_errors),
+            "last_poll_error": self._last_poll_error,
+            "stop_requested": bool(self._stop_event.is_set()),
+            "route_count": len(self.routes.routes),
+            "pending_media_groups": len(self._pending_media_groups),
+            "retry_queue_hydrated": bool(self._retry_queue_hydrated),
+            "sync_seeded_routes_count": len(self._sync_seeded_routes),
+            "sync_drain_task_running": bool(self._sync_drain_task is not None and not self._sync_drain_task.done()),
+            "traffic": self.traffic_snapshot(),
+        }
+
+    def traffic_snapshot(self) -> dict[str, object]:
+        with self._traffic_lock:
+            self._ensure_traffic_day()
+            by_route: list[dict[str, object]] = []
+            all_route_names = set(self._traffic_by_route_total.keys()) | set(self._traffic_by_route_today.keys())
+            for route_name in sorted(all_route_names):
+                total_obj = self._traffic_by_route_total.get(route_name) or {}
+                today_obj = self._traffic_by_route_today.get(route_name) or {}
+                by_route.append(
+                    {
+                        "route": route_name,
+                        "total_download_bytes": int(total_obj.get("download_bytes", 0) or 0),
+                        "total_upload_bytes": int(total_obj.get("upload_bytes", 0) or 0),
+                        "today_download_bytes": int(today_obj.get("download_bytes", 0) or 0),
+                        "today_upload_bytes": int(today_obj.get("upload_bytes", 0) or 0),
+                    }
+                )
+            history = self._traffic_history.snapshot()
+            return {
+                "day": self._traffic_day,
+                "run_id": self._run_id,
+                "total_download_bytes": int(self._traffic_total_download_bytes),
+                "total_upload_bytes": int(self._traffic_total_upload_bytes),
+                "today_download_bytes": int(self._traffic_today_download_bytes),
+                "today_upload_bytes": int(self._traffic_today_upload_bytes),
+                "by_route": by_route,
+                "current_run": history.get("current_run"),
+                "runs": history.get("runs", []),
+                "previous_runs": history.get("previous_runs", []),
+                "runs_count": int(history.get("runs_count", 0) or 0),
+                "previous_runs_count": int(history.get("previous_runs_count", 0) or 0),
+                "history_total_download_bytes": int(history.get("history_total_download_bytes", 0) or 0),
+                "history_total_upload_bytes": int(history.get("history_total_upload_bytes", 0) or 0),
+                "previous_total_download_bytes": int(history.get("previous_total_download_bytes", 0) or 0),
+                "previous_total_upload_bytes": int(history.get("previous_total_upload_bytes", 0) or 0),
+            }
+
+    def _current_traffic_day(self) -> str:
+        tz_name = str(self.settings.tz or "").strip() or "UTC"
+        try:
+            tz = ZoneInfo(tz_name)
+        except Exception:
+            tz = timezone.utc
+        return datetime.now(tz=tz).date().isoformat()
+
+    def _ensure_traffic_day(self) -> None:
+        day = self._current_traffic_day()
+        if day == self._traffic_day:
+            return
+        self._traffic_day = day
+        self._traffic_today_download_bytes = 0
+        self._traffic_today_upload_bytes = 0
+        self._traffic_by_route_today = {}
+
+    def _record_traffic(self, *, route_name: str, download_bytes: int = 0, upload_bytes: int = 0) -> None:
+        with self._traffic_lock:
+            self._ensure_traffic_day()
+            d = max(0, int(download_bytes))
+            u = max(0, int(upload_bytes))
+            if d <= 0 and u <= 0:
+                return
+            self._traffic_total_download_bytes += d
+            self._traffic_total_upload_bytes += u
+            self._traffic_today_download_bytes += d
+            self._traffic_today_upload_bytes += u
+
+            total_obj = self._traffic_by_route_total.setdefault(route_name, {"download_bytes": 0, "upload_bytes": 0})
+            total_obj["download_bytes"] = int(total_obj.get("download_bytes", 0) or 0) + d
+            total_obj["upload_bytes"] = int(total_obj.get("upload_bytes", 0) or 0) + u
+
+            today_obj = self._traffic_by_route_today.setdefault(route_name, {"download_bytes": 0, "upload_bytes": 0})
+            today_obj["download_bytes"] = int(today_obj.get("download_bytes", 0) or 0) + d
+            today_obj["upload_bytes"] = int(today_obj.get("upload_bytes", 0) or 0) + u
+            self._traffic_history.add_traffic(route_name=route_name, download_bytes=d, upload_bytes=u)
+
+    def _close_traffic_history(self) -> None:
+        try:
+            self._traffic_history.close_current_run(stopped_at_ts=time.time())
+        except Exception:
+            logger.exception("Failed to close traffic history run")
+
     async def _audit_log(
         self,
         *,
@@ -1561,48 +1779,48 @@ class KiwiService:
             return
 
         stage_title = {
-            "dispatch": "ارسال به مقصد",
-            "guard": "بررسی گارد",
-            "script": "اجرای اسکریپت",
-            "channel_script": "اجرای channel script",
-            "download": "دانلود فایل",
-            "processing": "پردازش پیام",
-            "route_match": "تطبیق مسیر",
-            "media_group_merge": "تجمیع آلبوم",
+            "dispatch": "🚀 Dispatch",
+            "guard": "🛡 Guard Check",
+            "script": "🧩 Script",
+            "channel_script": "⚙️ Channel Script",
+            "download": "📥 Download",
+            "processing": "🧠 Processing",
+            "route_match": "🧭 Route Match",
+            "media_group_merge": "🖼 Media Group Merge",
         }.get(stage, stage)
         status_title = {
-            "ok": "موفق",
-            "failed": "خطا",
-            "blocked": "مسدود",
-            "skipped": "متوقف",
+            "ok": "✅ Success",
+            "failed": "❌ Failed",
+            "blocked": "⛔ Blocked",
+            "skipped": "⏭ Skipped",
         }.get(status, status)
 
         lines = [
-            f"کیوی | {stage_title} | {status_title}",
+            f"🧾 Kiwi | {stage_title} | {status_title}",
         ]
         if route:
-            lines.append(f"مسیر: {route.name}")
+            lines.append(f"🛣 Route: {route.name}")
         if incoming:
             lines.extend(
                 [
-                    f"update_id: {incoming.update_id}",
-                    f"message_id: {incoming.message_id}",
-                    f"trace_id: {trace_id or '-'}",
-                    f"مبدا: {incoming.source_channel_username or incoming.source_channel_id}",
-                    f"تعداد مدیا: {len(incoming.medias)}",
+                    f"🆔 update_id: {incoming.update_id}",
+                    f"💬 message_id: {incoming.message_id}",
+                    f"🔎 trace_id: {trace_id or '-'}",
+                    f"📡 Source: {incoming.source_channel_username or incoming.source_channel_id}",
+                    f"🧷 Media Count: {len(incoming.medias)}",
                 ]
             )
             source_link = self._source_message_link(incoming)
             if source_link:
-                lines.append(f"لینک پیام: {source_link}")
+                lines.append(f"🔗 Message Link: {source_link}")
             if incoming.media_group_id:
-                lines.append(f"media_group_id: {incoming.media_group_id}")
+                lines.append(f"🗂 media_group_id: {incoming.media_group_id}")
         if reason:
-            lines.append(f"توضیح: {reason}")
+            lines.append(f"📝 Details: {reason}")
         if stage_timings_ms:
-            lines.append(f"timings_ms: {json.dumps(stage_timings_ms, ensure_ascii=False)}")
+            lines.append(f"⏱ timings_ms: {json.dumps(stage_timings_ms, ensure_ascii=False)}")
         if stage_output_text:
-            lines.append(f"stage_output: {stage_output_text}")
+            lines.append(f"📤 stage_output: {stage_output_text}")
 
         message = "\n".join(lines)
         if len(message) > 3900:
@@ -1933,3 +2151,32 @@ class KiwiService:
             kept.append(message)
 
         return kept, dropped
+
+    def _estimate_output_messages_bytes(
+        self,
+        messages: list[ScriptOutputMessage],
+        *,
+        output_dir: Path,
+        input_dir: Path,
+        extra_input_dirs: list[Path] | None = None,
+    ) -> int:
+        total = 0
+        for message in messages:
+            if message.type == OutputMessageKind.TEXT:
+                continue
+            raw_path = str(message.path or "").strip()
+            if not raw_path:
+                continue
+            resolved = self._resolve_output_message_path(
+                raw_path,
+                output_dir=output_dir,
+                input_dir=input_dir,
+                extra_input_dirs=extra_input_dirs,
+            )
+            if resolved is None:
+                continue
+            try:
+                total += max(0, int(resolved.stat().st_size))
+            except OSError:
+                continue
+        return int(total)

@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 from typing import Any
 
 from kiwi.utils import dump_json
+
+logger = logging.getLogger(__name__)
 
 
 class AdminStore:
@@ -57,7 +60,13 @@ class AdminStore:
             info = sessions.get(user_id) or {}
             if str(info.get("username") or "") == username_n:
                 sessions.pop(user_id, None)
-        dump_json(self.sessions_path, sessions)
+        try:
+            dump_json(self.sessions_path, sessions)
+        except PermissionError:
+            logger.warning(
+                "Admin removed but failed to update admin sessions file (permission denied)",
+                extra={"details": {"sessions_path": str(self.sessions_path)}},
+            )
 
     def is_logged_in(self, user_id: str) -> bool:
         sessions = self._load_sessions()

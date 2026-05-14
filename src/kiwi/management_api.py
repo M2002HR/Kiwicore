@@ -12,7 +12,7 @@ from typing import Callable
 from kiwi.config import RouteRegistry, load_routes
 from kiwi.sync_ledger import SyncLedger
 from kiwi.sync_queue import SyncQueueBackend
-from kiwi.utils import dump_json
+from kiwi.utils import dump_json, safe_script_name
 
 _ROUTE_KEYS = {
     "name",
@@ -135,6 +135,98 @@ class ManagementApi:
     def list_guard_files(self) -> list[str]:
         return sorted(p.name for p in self.guards_dir.glob("*.py") if p.is_file())
 
+    def read_channel_script_file(self, name: str) -> str:
+        file_name = safe_script_name(str(name or "").strip())
+        path = self.scripts_dir / file_name
+        if not path.exists():
+            raise ValueError("channel script not found")
+        return path.read_text(encoding="utf-8")
+
+    def write_channel_script_file(self, name: str, content: str) -> dict[str, object]:
+        file_name = safe_script_name(str(name or "").strip())
+        path = self.scripts_dir / file_name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _atomic_write_text(path, str(content or ""))
+        return {
+            "name": file_name,
+            "path": str(path),
+            "size_bytes": path.stat().st_size,
+            "updated_at": int(path.stat().st_mtime),
+        }
+
+    def read_guard_script_file(self, name: str) -> str:
+        file_name = safe_script_name(str(name or "").strip())
+        path = self.guards_dir / file_name
+        if not path.exists():
+            raise ValueError("guard script not found")
+        return path.read_text(encoding="utf-8")
+
+    def write_guard_script_file(self, name: str, content: str) -> dict[str, object]:
+        file_name = safe_script_name(str(name or "").strip())
+        path = self.guards_dir / file_name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _atomic_write_text(path, str(content or ""))
+        return {
+            "name": file_name,
+            "path": str(path),
+            "size_bytes": path.stat().st_size,
+            "updated_at": int(path.stat().st_mtime),
+        }
+
+    def keyword_links_path(self) -> Path:
+        raw = os.getenv("KEYWORD_LINKS_CONFIG_PATH", "").strip()
+        if raw:
+            return Path(raw)
+        return self.channels_path.parent / "keyword_links.json"
+
+    def get_keyword_links(self) -> list[dict]:
+        path = self.keyword_links_path()
+        if not path.exists():
+            return []
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(raw, list):
+            raise ValueError("keyword links config must be list")
+        out: list[dict] = []
+        for item in raw:
+            if isinstance(item, dict):
+                out.append(item)
+        return out
+
+    def save_keyword_links(self, payload: list[dict]) -> dict[str, object]:
+        if not isinstance(payload, list):
+            raise ValueError("keyword links payload must be list")
+        cleaned: list[dict[str, object]] = []
+        for item in payload:
+            if not isinstance(item, dict):
+                continue
+            destination = str(item.get("destination") or "").strip()
+            link = str(item.get("link") or "").strip()
+            keywords_raw = item.get("keywords")
+            if not destination:
+                continue
+            keywords: list[str] = []
+            if isinstance(keywords_raw, list):
+                for kw in keywords_raw:
+                    if isinstance(kw, str) and kw.strip():
+                        keywords.append(kw.strip())
+            if not keywords:
+                continue
+            cleaned.append(
+                {
+                    "destination": destination,
+                    "link": link,
+                    "keywords": keywords,
+                }
+            )
+        path = self.keyword_links_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _atomic_dump_json(path, cleaned)
+        return {
+            "path": str(path),
+            "count": len(cleaned),
+            "updated_at": int(path.stat().st_mtime),
+        }
+
     def sync_stats_snapshot(self) -> dict:
         queue_depth: int | None
         if self.sync_queue is None:
@@ -162,19 +254,23 @@ class ManagementApi:
         queue_depth = await self.sync_queue.depth() if self.sync_queue is not None else 0
         open_reviews = self.sync_ledger.open_review_count() if self.sync_ledger is not None else 0
         per_route: dict[str, dict[str, int]] = {}
+        per_route_metrics: dict[str, dict[str, int | float]] = {}
         for route in self._load_routes_raw():
             name = str(route.get("name") or "").strip()
             if not name:
                 continue
             if self.sync_ledger is None:
-                per_route[name] = {}
+                counts: dict[str, int] = {}
             else:
-                per_route[name] = self.sync_ledger.get_route_status_counts(name)
+                counts = self.sync_ledger.get_route_status_counts(name)
+            per_route[name] = counts
+            per_route_metrics[name] = _build_route_sync_metrics(counts)
         return {
             "queue_depth": int(queue_depth),
             "open_reviews": int(open_reviews),
             "status_counts": status_counts,
             "routes": per_route,
+            "route_metrics": per_route_metrics,
         }
 
     def sync_review_list(self, *, limit: int = 50, only_open: bool = True) -> list[dict]:
@@ -294,3 +390,49 @@ def _atomic_dump_json(path: Path, payload: object) -> None:
                 os.unlink(temp_path)
         except Exception:
             pass
+
+
+def _atomic_write_text(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_path = tempfile.mkstemp(prefix=path.name, suffix=".tmp", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(str(content))
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(temp_path, path)
+    finally:
+        try:
+            if os.path.exists(temp_path):
+                os.unlink(temp_path)
+        except Exception:
+            pass
+
+
+def _build_route_sync_metrics(counts: dict[str, int]) -> dict[str, int | float]:
+    sent = int(counts.get("sent", 0) or 0)
+    blocked = int(counts.get("blocked", 0) or 0)
+    skipped = int(counts.get("skipped", 0) or 0)
+    queued = int(counts.get("queued", 0) or 0)
+    processing = int(counts.get("processing", 0) or 0)
+    failed = int(counts.get("failed", 0) or 0)
+    ambiguous = int(counts.get("ambiguous", 0) or 0)
+
+    done = sent + blocked + skipped
+    remaining = queued + processing + failed + ambiguous
+    total_seen = done + remaining
+    progress_pct = 100.0 if total_seen <= 0 else round((done * 100.0) / total_seen, 1)
+
+    return {
+        "total_seen": int(total_seen),
+        "done": int(done),
+        "remaining_unsynced": int(remaining),
+        "progress_pct": float(progress_pct),
+        "sent": int(sent),
+        "blocked": int(blocked),
+        "skipped": int(skipped),
+        "queued": int(queued),
+        "processing": int(processing),
+        "failed": int(failed),
+        "ambiguous": int(ambiguous),
+    }

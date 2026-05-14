@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="en" dir="ltr">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Kiwi Admin Console</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Vazirmatn:wght@400;500;700;800&family=Space+Grotesk:wght@500;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <div class="bg-glow bg-glow-a"></div>
+  <div class="bg-glow bg-glow-b"></div>
+
+  <main id="app" class="app-shell hidden">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-dot"></div>
+        <div>
+          <h1>Kiwi Control</h1>
+          <p>Management Console</p>
+        </div>
+      </div>
+
+      <nav class="menu" id="menu"></nav>
+
+      <div class="sidebar-foot">
+        <div id="meInfo" class="me-info">-</div>
+        <button id="logoutBtn" class="btn icon-only" title="Logout" aria-label="Logout">↪</button>
+      </div>
+    </aside>
+
+    <section class="content">
+      <header class="topbar glass">
+        <div>
+          <h2 id="pageTitle">Dashboard</h2>
+          <p id="pageDesc">Service overview and health</p>
+        </div>
+        <div class="topbar-actions">
+          <span id="autoRefreshInfo" class="muted">Auto: 5s</span>
+          <button id="toggleAutoRefreshBtn" class="btn icon-only" title="Pause auto refresh" aria-label="Pause auto refresh">⏸</button>
+          <button id="reloadBtn" class="btn icon-only" title="Reload" aria-label="Reload">↻</button>
+          <button id="stopServiceBtn" class="btn btn-danger icon-only" title="Stop service" aria-label="Stop service">■</button>
+        </div>
+      </header>
+
+      <section id="page-dashboard" class="page"></section>
+      <section id="page-routes" class="page hidden"></section>
+      <section id="page-scripts" class="page hidden"></section>
+      <section id="page-keywords" class="page hidden"></section>
+      <section id="page-sync" class="page hidden"></section>
+      <section id="page-logs" class="page hidden"></section>
+      <section id="page-traffic" class="page hidden"></section>
+      <section id="page-workers" class="page hidden"></section>
+      <section id="page-storage" class="page hidden"></section>
+      <section id="page-system" class="page hidden"></section>
+      <section id="page-admins" class="page hidden"></section>
+    </section>
+  </main>
+
+  <div id="toastRoot" class="toast-root" aria-live="polite" aria-atomic="false"></div>
+
+  <div id="modalOverlay" class="modal-overlay hidden" aria-hidden="true">
+    <div class="modal-shell glass" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
+      <div class="modal-head">
+        <h3 id="modalTitle">Modal</h3>
+        <button id="modalCloseBtn" class="btn icon-only subtle-icon" title="Close" aria-label="Close">✕</button>
+      </div>
+      <div id="modalBody" class="modal-body"></div>
+    </div>
+  </div>
+
+  <section id="loginView" class="login-view">
+    <div class="login-card glass">
+      <h2>Admin Login</h2>
+      <p>Sign in with your Kiwi admin account.</p>
+      <form id="loginForm" class="stack">
+        <label>Username
+          <input id="loginUser" type="text" autocomplete="username" required />
+        </label>
+        <label>Password
+          <input id="loginPass" type="password" autocomplete="current-password" required />
+        </label>
+        <button type="submit" class="btn btn-wide">Sign in</button>
+      </form>
+      <div id="loginError" class="error-text"></div>
+    </div>
+  </section>
+
+  <script src="/app.js" defer></script>
+</body>
+</html>

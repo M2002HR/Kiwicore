@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import asyncio
 from pathlib import Path
 
 from kiwi.management_api import ManagementApi
+from kiwi.sync_ledger import SyncLedger
 
 
 def test_management_api_crud_and_reload(tmp_path: Path) -> None:
@@ -66,3 +68,58 @@ def test_management_api_crud_and_reload(tmp_path: Path) -> None:
 
     api.delete_route("r1")
     assert api.list_routes() == []
+
+
+def test_sync_stats_includes_route_progress_and_remaining(tmp_path: Path) -> None:
+    channels_path = tmp_path / "config" / "channels.json"
+    channels_path.parent.mkdir(parents=True, exist_ok=True)
+    channels_path.write_text(
+        json.dumps(
+            [
+                {
+                    "name": "r1",
+                    "enabled": True,
+                    "source_channel_id": "-1001",
+                    "destination_channel_id": "-2001",
+                    "channel_script": "default_channel_script.py",
+                    "gaurd_script": "default_guard.py",
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    scripts_dir = tmp_path / "scripts"
+    guards_dir = tmp_path / "guards"
+    scripts_dir.mkdir()
+    guards_dir.mkdir()
+    (scripts_dir / "default_channel_script.py").write_text("# x", encoding="utf-8")
+    (guards_dir / "default_guard.py").write_text("# x", encoding="utf-8")
+
+    ledger = SyncLedger(str(tmp_path / "app_data" / "sync_ledger.sqlite3"))
+    payload = {"source_channel_id": "-1001", "message_id": 1}
+
+    _, key1, _ = ledger.register_message(route_name="r1", source_channel_id="-1001", message_id=1, media_group_id=None, payload=payload)
+    ledger.mark_status(key1, status="sent")
+    ledger.register_message(route_name="r1", source_channel_id="-1001", message_id=2, media_group_id=None, payload=payload)
+    _, key3, _ = ledger.register_message(route_name="r1", source_channel_id="-1001", message_id=3, media_group_id=None, payload=payload)
+    ledger.mark_processing(key3)
+    _, key4, _ = ledger.register_message(route_name="r1", source_channel_id="-1001", message_id=4, media_group_id=None, payload=payload)
+    ledger.mark_status(key4, status="failed")
+    _, key5, _ = ledger.register_message(route_name="r1", source_channel_id="-1001", message_id=5, media_group_id=None, payload=payload)
+    ledger.mark_status(key5, status="skipped")
+
+    api = ManagementApi(
+        channels_config_path=str(channels_path),
+        scripts_dir=str(scripts_dir),
+        gaurd_scripts_dir=str(guards_dir),
+        sync_ledger=ledger,
+        sync_queue=None,
+        on_routes_reloaded=lambda _registry: None,
+    )
+
+    stats = asyncio.run(api.sync_stats())
+    metrics = stats["route_metrics"]["r1"]
+    assert metrics["remaining_unsynced"] == 3
+    assert metrics["done"] == 2
+    assert metrics["total_seen"] == 5
+    assert metrics["progress_pct"] == 40.0

@@ -232,6 +232,9 @@ def _is_obvious_advertisement(payload: dict) -> bool:
     if cta_hits >= 3:
         return True
 
+    if _is_obvious_gambling_advertisement(combined):
+        return True
+
     # Channel-promo bundles: only block when multiple promo rows exist.
     list_lines = [ln.strip().lower() for ln in combined.splitlines() if ln.strip()]
     promo_line_hits = 0
@@ -248,6 +251,97 @@ def _is_obvious_advertisement(payload: dict) -> bool:
     if promo_line_hits >= 4:
         return True
     if has_bundle_header and promo_line_hits >= 2:
+        return True
+
+    return False
+
+
+def _is_obvious_gambling_advertisement(combined: str) -> bool:
+    strong_brand_signals = (
+        "1xbet",
+        "1x bet",
+        "bet365",
+        "betway",
+        "mostbet",
+        "melbet",
+        "parimatch",
+        "favbet",
+        "22bet",
+        "linebet",
+        "betwinner",
+        "ggbet",
+        "1win",
+        "pin-up",
+        "pinnacle",
+        "stake.com",
+        "casino",
+        "online casino",
+        "sportsbook",
+        "bookmaker",
+        "bookie",
+        "gambling",
+        "roulette",
+        "blackjack",
+        "poker",
+        "slot",
+        "slots",
+        "jackpot",
+        "شرط بندی",
+        "شرط‌بندی",
+        "قمار",
+        "کازینو",
+        "بوک میکر",
+        "بوک‌میکر",
+        "کازینو",
+    )
+    if any(token in combined for token in strong_brand_signals):
+        # Brand/site names are strong enough to block on their own.
+        return True
+
+    generic_gambling_signals = (
+        "bet",
+        "bets",
+        "betting",
+        "wager",
+        "odds",
+        "promo code",
+        "bonus",
+        "welcome bonus",
+        "deposit",
+        "withdraw",
+        "predictions",
+        "prediction",
+        "پیش بینی",
+        "پیش‌بینی",
+        "ضرایب",
+        "برد شرط",
+        "کد بونوس",
+        "بونوس",
+    )
+    if not any(token in combined for token in generic_gambling_signals):
+        return False
+
+    has_link = bool(re.search(r"(https?://|t\.me/|telegram\.me/|instagram\.com/|bit\.ly/)", combined))
+    cta_signals = (
+        "join now",
+        "register now",
+        "sign up",
+        "claim",
+        "promo",
+        "bonus",
+        "کلیک",
+        "ثبت نام",
+        "عضویت",
+        "همین حالا",
+        "از لینک",
+        "لینک",
+        "واریز",
+    )
+    cta_hits = sum(1 for token in cta_signals if token in combined)
+    promo_code = bool(re.search(r"\b(code|promo|ref|referral)\b", combined))
+    if has_link and (cta_hits >= 1 or promo_code):
+        return True
+    if cta_hits >= 2:
         return True
 
     return False

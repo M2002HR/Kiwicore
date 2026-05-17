@@ -89,6 +89,7 @@ services:
     build:
       context: ./gemini_server
       dockerfile: Dockerfile
+      network: host
     image: ${GEMINI_SERVER_IMAGE_TAG:-gemini-server:latest}
     restart: unless-stopped
     network_mode: host

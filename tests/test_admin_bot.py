@@ -115,8 +115,7 @@ def test_admin_bot_add_and_edit_route_by_buttons(tmp_path: Path) -> None:
     bot.handle(_inbound("default_channel_script.py"))
     bot.handle(_inbound("default_guard.py"))
     bot.handle(_inbound(BTN_MAX_DEFAULT))
-    bot.handle(_inbound(BTN_ENABLED_ON))
-    add_result = bot.handle(_inbound(BTN_SYNC_OFF))
+    add_result = bot.handle(_inbound(BTN_ENABLED_ON))
     assert "اضافه شد" in add_result.text
 
     routes = bot.handle(_inbound("/routes"))
@@ -147,7 +146,7 @@ def test_admin_bot_add_and_edit_route_by_buttons(tmp_path: Path) -> None:
     assert "سینک" in started.text
 
     routes3 = bot.handle(_inbound("/routes"))
-    assert "سینک: syncing" in routes3.text
+    assert ("وضعیت: syncing" in routes3.text) or ("وضعیت: synced" in routes3.text)
 
     bot.handle(_inbound(BTN_EDIT_ROUTE))
     bot.handle(_inbound("r1"))

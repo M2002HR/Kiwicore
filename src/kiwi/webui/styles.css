@@ -257,13 +257,27 @@ textarea { min-height: 140px; resize: vertical; }
 }
 table { width: 100%; border-collapse: collapse; min-width: 860px; }
 th, td { padding: 7px 10px; border-bottom: 1px solid rgba(19,45,66,.12); text-align: left; vertical-align: middle; font-size: 13px; line-height: 1.35; }
-th { background: rgba(15,157,143,.08); position: sticky; top: 0; z-index: 1; }
+th { background: #dce7ea; position: sticky; top: 0; z-index: 1; }
 tbody tr:hover { background: rgba(15,157,143,.05); }
 .actions-cell { width: 140px; white-space: nowrap; }
+.routes-table {
+  table-layout: fixed;
+  min-width: 980px;
+}
+.routes-table .route-col-name { width: 110px; min-width: 110px; max-width: 110px; }
+.routes-table .route-col-source { width: 150px; min-width: 150px; max-width: 150px; }
+.routes-table .route-col-destination { width: 170px; min-width: 170px; max-width: 170px; }
+.routes-table td.route-col-name,
+.routes-table td.route-col-source,
+.routes-table td.route-col-destination {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
 .th-sort {
   appearance: none;
   border: 0;
-  background: transparent;
+  background: #dce7ea;
   color: inherit;
   font: inherit;
   font-weight: 700;

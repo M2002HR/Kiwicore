@@ -123,6 +123,8 @@ class SyncLedger:
         trace_id: str | None = None,
     ) -> None:
         normalized = str(status or "").strip().lower()
+        if normalized == "skipped":
+            normalized = "blocked"
         sent_at = _utc_now_iso() if normalized == "sent" else None
         with self._lock:
             conn = self._connect()
@@ -160,6 +162,8 @@ class SyncLedger:
             finally:
                 conn.close()
         if row is None:
+            return None
+        if str(row[5] or "").strip().lower() == "sent":
             return None
         payload = json.loads(str(row[7] or "{}"))
         return LedgerRecord(
@@ -276,7 +280,7 @@ class SyncLedger:
                 elif resolution == "skip":
                     self._execute(
                         conn,
-                        "UPDATE sync_message_ledger SET status = 'skipped' WHERE dedupe_key = ?",
+                        "UPDATE sync_message_ledger SET status = 'blocked', last_error = COALESCE(last_error, 'manually_skipped') WHERE dedupe_key = ?",
                         (dedupe_key,),
                     )
 
@@ -347,6 +351,31 @@ class SyncLedger:
                 conn.close()
         return int((row[0] if row else 0) or 0)
 
+    def min_active_message_id_for_route(self, route_name: str, *, above_checkpoint: int = 0) -> int | None:
+        placeholders = ",".join("?" for _ in ACTIVE_STATUSES)
+        params: list[Any] = [route_name]
+        params.extend(sorted(ACTIVE_STATUSES))
+        params.append(max(0, int(above_checkpoint)))
+        with self._lock:
+            conn = self._connect()
+            try:
+                row = self._fetchone(
+                    conn,
+                    f"""
+                    SELECT MIN(message_id)
+                    FROM sync_message_ledger
+                    WHERE route_name = ?
+                      AND status IN ({placeholders})
+                      AND message_id > ?
+                    """,
+                    tuple(params),
+                )
+            finally:
+                conn.close()
+        if row is None or row[0] is None:
+            return None
+        return int(row[0])
+
     def set_route_checkpoint(self, route_name: str, last_source_message_id: int) -> None:
         now = _utc_now_iso()
         with self._lock:
@@ -359,7 +388,7 @@ class SyncLedger:
                         INSERT INTO sync_route_checkpoint(route_name, last_source_message_id, updated_at)
                         VALUES (?, ?, ?)
                         ON DUPLICATE KEY UPDATE
-                            last_source_message_id = VALUES(last_source_message_id),
+                            last_source_message_id = GREATEST(last_source_message_id, VALUES(last_source_message_id)),
                             updated_at = VALUES(updated_at)
                         """,
                         (route_name, int(last_source_message_id), now),
@@ -371,7 +400,13 @@ class SyncLedger:
                         INSERT INTO sync_route_checkpoint(route_name, last_source_message_id, updated_at)
                         VALUES (?, ?, ?)
                         ON CONFLICT(route_name)
-                        DO UPDATE SET last_source_message_id = excluded.last_source_message_id, updated_at = excluded.updated_at
+                        DO UPDATE SET
+                            last_source_message_id = CASE
+                                WHEN excluded.last_source_message_id > sync_route_checkpoint.last_source_message_id
+                                THEN excluded.last_source_message_id
+                                ELSE sync_route_checkpoint.last_source_message_id
+                            END,
+                            updated_at = excluded.updated_at
                         """,
                         (route_name, int(last_source_message_id), now),
                     )
@@ -576,6 +611,13 @@ class SyncLedger:
                         "CREATE INDEX IF NOT EXISTS idx_sync_review_open ON sync_review_queue(resolved_at, id DESC)",
                         (),
                     )
+                # Legacy compatibility: we no longer emit `skipped` in automatic flow.
+                # Normalize historical rows so dashboards and counters stay consistent.
+                self._execute(
+                    conn,
+                    "UPDATE sync_message_ledger SET status = 'blocked' WHERE status = 'skipped'",
+                    (),
+                )
                 conn.commit()
             finally:
                 conn.close()

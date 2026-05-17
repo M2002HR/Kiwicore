@@ -1,13 +1,16 @@
 [
   {
     "name": "example-route",
-    "enabled": true,
+    "status": "synced",
     "source_channel_username": "@source_channel",
-    "source_channel_id": "-1001111111111",
     "destination_channel_username": "@destination_channel",
     "destination_channel_id": "-1002222222222",
     "gaurd_script": "default_guard.py",
     "channel_script": "default_channel_script.py",
-    "max_message_mb": 50
+    "max_message_mb": 50,
+    "backfill_count": 100,
+    "interval_sec": 1,
+    "batch_size": 1,
+    "retry_attempts": 2
   }
 ]

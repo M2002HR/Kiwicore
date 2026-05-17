@@ -89,12 +89,14 @@ class RouteRegistry:
                 seen.add(key)
                 out.append(route)
 
-        for route in self.by_channel_id.get(source_channel_id, []):
-            key = id(route)
-            if key in seen:
-                continue
-            seen.add(key)
-            out.append(route)
+        normalized_id = normalize_channel_id(source_channel_id)
+        if normalized_id:
+            for route in self.by_channel_id.get(normalized_id, []):
+                key = id(route)
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append(route)
 
         return out
 
@@ -254,12 +256,10 @@ def _default_channel_script_name(route_obj: dict) -> str | None:
     source_username = normalize_channel_username(route_obj.get("source_channel_username"))
     if source_username:
         return f"{source_username.lstrip('@')}.py"
-
     source_id = normalize_channel_id(route_obj.get("source_channel_id"))
     if source_id:
         return f"{source_id}.py"
-
-    raise ValueError("Route must define either source_channel_id or source_channel_username")
+    raise ValueError("Route must define source_channel_username")
 
 
 def _default_gaurd_script_name(route_obj: dict) -> str | None:
@@ -288,10 +288,22 @@ def load_routes(config_path: str) -> RouteRegistry:
         if not isinstance(obj, dict):
             raise ValueError(f"Route at index {idx} must be an object")
 
+        raw_source_username = str(obj.get("source_channel_username") or "").strip()
         source_channel_id = normalize_channel_id(obj.get("source_channel_id"))
-        source_channel_username = normalize_channel_username(obj.get("source_channel_username"))
-
-        if not source_channel_id and not source_channel_username:
+        source_channel_username: str | None = None
+        if raw_source_username:
+            if not raw_source_username.startswith("@"):
+                lowered = raw_source_username.lower()
+                if raw_source_username.lstrip("-").isdigit() and not lowered.startswith("https://t.me/") and not lowered.startswith(
+                    "http://t.me/"
+                ):
+                    inline_source_id = normalize_channel_id(raw_source_username)
+                    source_channel_id = inline_source_id
+                else:
+                    source_channel_username = normalize_channel_username(raw_source_username)
+            else:
+                source_channel_username = normalize_channel_username(raw_source_username)
+        if not source_channel_username and not source_channel_id:
             raise ValueError(f"Route at index {idx} has no source channel id/username")
 
         destination_channel_username = normalize_channel_username(obj.get("destination_channel_username"))
@@ -309,9 +321,29 @@ def load_routes(config_path: str) -> RouteRegistry:
         else:
             max_message_mb = max(1, int(max_message_mb_raw))
 
+        raw_status = str(obj.get("status") or "").strip().lower()
+        if raw_status not in {"deactive", "syncing", "synced"}:
+            legacy_enabled = bool(obj.get("enabled", True))
+            sync_obj_legacy = obj.get("sync") if isinstance(obj.get("sync"), dict) else {}
+            legacy_sync_enabled = bool(sync_obj_legacy.get("enabled", False))
+            legacy_sync_status = str(sync_obj_legacy.get("status", "")).strip().lower()
+            legacy_sync_seeded = bool(sync_obj_legacy.get("seeded", True))
+            if legacy_sync_enabled and (legacy_sync_status in {"syncing", "active"} or not legacy_sync_seeded):
+                raw_status = "syncing"
+            elif not legacy_enabled:
+                raw_status = "deactive"
+            else:
+                raw_status = "synced"
+
+        sync_obj = obj.get("sync") if isinstance(obj.get("sync"), dict) else {}
+        backfill_count_raw = obj.get("backfill_count", sync_obj.get("backfill_count", 100))
+        interval_sec_raw = obj.get("interval_sec", sync_obj.get("interval_sec", 1))
+        batch_size_raw = obj.get("batch_size", sync_obj.get("batch_size", 1))
+        retry_attempts_raw = obj.get("retry_attempts", sync_obj.get("retry_attempts", 2))
+
         route = ChannelRoute(
             name=str(obj.get("name") or f"route_{idx+1}"),
-            enabled=bool(obj.get("enabled", True)),
+            status=raw_status,
             source_channel_id=source_channel_id,
             source_channel_username=source_channel_username,
             destination_channel_id=destination_channel_id,
@@ -319,34 +351,15 @@ def load_routes(config_path: str) -> RouteRegistry:
             channel_script=channel_script,
             max_message_mb=max_message_mb,
             gaurd_script=gaurd_script,
-            sync_enabled=bool((obj.get("sync") or {}).get("enabled", False)) if isinstance(obj.get("sync"), dict) else False,
-            sync_status=str((obj.get("sync") or {}).get("status", "active")).strip().lower()
-            if isinstance(obj.get("sync"), dict)
-            else "active",
-            sync_backfill_count=max(0, int((obj.get("sync") or {}).get("backfill_count", 100)))
-            if isinstance(obj.get("sync"), dict)
-            else 100,
-            sync_interval_sec=max(1, int((obj.get("sync") or {}).get("interval_sec", 300)))
-            if isinstance(obj.get("sync"), dict)
-            else 300,
-            sync_batch_size=max(1, int((obj.get("sync") or {}).get("batch_size", 1)))
-            if isinstance(obj.get("sync"), dict)
-            else 1,
-            sync_retry_attempts=max(0, int((obj.get("sync") or {}).get("retry_attempts", 2)))
-            if isinstance(obj.get("sync"), dict)
-            else 2,
-            sync_seeded=bool((obj.get("sync") or {}).get("seeded", False)) if isinstance(obj.get("sync"), dict) else False,
+            sync_backfill_count=max(0, int(backfill_count_raw)),
+            sync_interval_sec=max(1, int(interval_sec_raw)),
+            sync_batch_size=max(1, int(batch_size_raw)),
+            sync_retry_attempts=max(0, int(retry_attempts_raw)),
         )
-        if route.sync_status not in {"active", "syncing", "disabled"}:
-            route.sync_status = "active"
         routes.append(route)
-
-        if not route.enabled and not route.is_syncing():
-            continue
 
         if route.source_channel_id:
             by_id.setdefault(route.source_channel_id, []).append(route)
-
         if route.source_channel_username:
             by_username.setdefault(route.source_channel_username, []).append(route)
 

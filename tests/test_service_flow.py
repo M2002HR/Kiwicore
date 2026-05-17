@@ -15,7 +15,10 @@ from kiwi.script_runner import ScriptRunner
 from kiwi.service import KiwiService
 from kiwi.state import StateStore
 from kiwi.storage import StorageManager
+from kiwi.sync_queue import QueueItem
 from kiwi.types import ChannelRoute, IncomingChannelMessage, IncomingMedia, MediaKind
+from kiwi.types import ScriptOutputMessage
+from kiwi.types import OutputMessageKind
 
 
 class FakeTelegramClient:
@@ -443,7 +446,193 @@ def test_service_sync_baseline_uses_backfill_window_from_source_latest(tmp_path:
     assert checkpoint == 98
 
 
-def test_service_sync_skips_queued_record_older_than_checkpoint(tmp_path: Path) -> None:
+def test_service_sync_baseline_does_not_restore_checkpoint_from_storage_files(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    route = ChannelRoute(
+        name="sync-storage-fallback-off",
+        enabled=False,
+        source_channel_id="-1001",
+        source_channel_username="@srcchan",
+        destination_channel_id="-2001",
+        destination_channel_username=None,
+        channel_script=None,
+        max_message_mb=10,
+        sync_enabled=True,
+        sync_status="syncing",
+        sync_backfill_count=30,
+        sync_seeded=False,
+    )
+    source = FakeTelethonSourceClient(messages=[], seeded_messages=[])
+    service = KiwiService(
+        settings=settings,
+        routes=_route_registry(route),
+        telegram_client=FakeTelegramClient([], b""),
+        bale_client=FakeBaleClient(),
+        source_client=source,
+        storage=StorageManager(settings.storage_dir),
+        guard_runner=GuardRunner(settings.gaurd_scripts_dir, timeout_sec=5),
+        script_runner=ScriptRunner(settings.scripts_dir, timeout_sec=5),
+        state_store=StateStore(settings.state_path),
+    )
+
+    # Historical raw files may exist from previous runs, but fresh baseline must ignore them.
+    raw_path = Path(settings.storage_dir) / "messages" / "-1001" / "run-1" / "raw_update.json"
+    raw_path.parent.mkdir(parents=True, exist_ok=True)
+    raw_path.write_text(
+        json.dumps(
+            {
+                "update_id": 9990,
+                "channel_post": {
+                    "message_id": 999,
+                    "chat": {"id": -1001, "type": "channel", "username": "srcchan"},
+                    "text": "historic",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    asyncio.run(service._ensure_sync_baseline())  # noqa: SLF001
+    checkpoint = service.sync_ledger.get_route_checkpoint(route.name)  # noqa: SLF001
+    assert checkpoint == 0
+
+
+def test_service_sync_baseline_does_not_advance_checkpoint_while_syncing(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    route = ChannelRoute(
+        name="sync-baseline-no-jump",
+        enabled=False,
+        source_channel_id="-1001",
+        source_channel_username="@srcchan",
+        destination_channel_id="-2001",
+        destination_channel_username=None,
+        channel_script=None,
+        max_message_mb=10,
+        sync_enabled=True,
+        sync_status="syncing",
+        sync_backfill_count=10,
+        sync_seeded=True,
+    )
+    source = FakeTelethonSourceClient(
+        seeded_messages=[
+            IncomingChannelMessage(
+                update_id=200,
+                source_channel_id="-1001",
+                source_channel_username="@srcchan",
+                message_id=200,
+                date=None,
+                text="x",
+                caption=None,
+                medias=[],
+                raw={"telethon": True},
+                media_group_id=None,
+            )
+        ],
+    )
+    service = KiwiService(
+        settings=settings,
+        routes=_route_registry(route),
+        telegram_client=FakeTelegramClient([], b""),
+        bale_client=FakeBaleClient(),
+        source_client=source,
+        storage=StorageManager(settings.storage_dir),
+        guard_runner=GuardRunner(settings.gaurd_scripts_dir, timeout_sec=5),
+        script_runner=ScriptRunner(settings.scripts_dir, timeout_sec=5),
+        state_store=StateStore(settings.state_path),
+    )
+    service.sync_ledger.set_route_checkpoint(route.name, 100)  # noqa: SLF001
+
+    asyncio.run(service._ensure_sync_baseline())  # noqa: SLF001
+    checkpoint = service.sync_ledger.get_route_checkpoint(route.name)  # noqa: SLF001
+    assert checkpoint == 100
+
+
+def test_service_sync_enforces_order_before_checkpoint_advance(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    route = ChannelRoute(
+        name="sync-ordered",
+        enabled=False,
+        source_channel_id="-1001",
+        source_channel_username="@srcchan",
+        destination_channel_id="-2001",
+        destination_channel_username=None,
+        channel_script=None,
+        max_message_mb=10,
+        sync_enabled=True,
+        sync_status="syncing",
+        sync_seeded=True,
+    )
+    service = KiwiService(
+        settings=settings,
+        routes=_route_registry(route),
+        telegram_client=FakeTelegramClient([], b""),
+        bale_client=FakeBaleClient(),
+        storage=StorageManager(settings.storage_dir),
+        guard_runner=GuardRunner(settings.gaurd_scripts_dir, timeout_sec=5),
+        script_runner=ScriptRunner(settings.scripts_dir, timeout_sec=5),
+        state_store=StateStore(settings.state_path),
+    )
+
+    async def _ok_once(incoming, route_obj, retries):  # noqa: ARG001
+        return ("ok", None)
+
+    service._process_route_message_with_retries = _ok_once  # type: ignore[method-assign]  # noqa: SLF001
+
+    in_10 = IncomingChannelMessage(
+        update_id=10,
+        source_channel_id="-1001",
+        source_channel_username="@srcchan",
+        message_id=10,
+        date=None,
+        text="m10",
+        caption=None,
+        medias=[],
+        raw={},
+        media_group_id=None,
+    )
+    in_11 = IncomingChannelMessage(
+        update_id=11,
+        source_channel_id="-1001",
+        source_channel_username="@srcchan",
+        message_id=11,
+        date=None,
+        text="m11",
+        caption=None,
+        medias=[],
+        raw={},
+        media_group_id=None,
+    )
+
+    asyncio.run(service._enqueue_sync_message(route, in_10))  # noqa: SLF001
+    asyncio.run(service._enqueue_sync_message(route, in_11))  # noqa: SLF001
+
+    item_11 = QueueItem(
+        dedupe_key=service.sync_ledger.dedupe_key(route.name, in_11.source_channel_id, in_11.message_id, None),  # noqa: SLF001
+        route_name=route.name,
+        due_at=0.0,
+        payload_hash="",
+    )
+    item_10 = QueueItem(
+        dedupe_key=service.sync_ledger.dedupe_key(route.name, in_10.source_channel_id, in_10.message_id, None),  # noqa: SLF001
+        route_name=route.name,
+        due_at=0.0,
+        payload_hash="",
+    )
+
+    out_11_first = asyncio.run(service._process_queued_item(item_11))  # noqa: SLF001
+    assert out_11_first == 0
+    assert int(service.sync_ledger.get_route_checkpoint(route.name) or 0) == 0  # noqa: SLF001
+
+    out_10 = asyncio.run(service._process_queued_item(item_10))  # noqa: SLF001
+    assert out_10 == 1
+    assert int(service.sync_ledger.get_route_checkpoint(route.name) or 0) == 10  # noqa: SLF001
+
+    out_11 = asyncio.run(service._process_queued_item(item_11))  # noqa: SLF001
+    assert out_11 == 1
+    assert int(service.sync_ledger.get_route_checkpoint(route.name) or 0) == 11  # noqa: SLF001
+
+
+def test_service_sync_blocks_queued_record_older_than_checkpoint(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
     route = ChannelRoute(
         name="sync-stale",
@@ -488,7 +677,46 @@ def test_service_sync_skips_queued_record_older_than_checkpoint(tmp_path: Path) 
     key = service.sync_ledger.dedupe_key(route.name, incoming.source_channel_id, incoming.message_id, None)  # noqa: SLF001
     record = service.sync_ledger.get_record(key)  # noqa: SLF001
     assert record is not None
-    assert record.status == "skipped"
+    assert record.status == "blocked"
+
+
+def test_service_detects_obvious_promotional_output(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    route = ChannelRoute(
+        name="promo-check",
+        enabled=True,
+        source_channel_id="-1001",
+        source_channel_username="@src",
+        destination_channel_id="-2001",
+        destination_channel_username=None,
+        channel_script="football.py",
+        max_message_mb=10,
+    )
+    service = KiwiService(
+        settings=settings,
+        routes=_route_registry(route),
+        telegram_client=FakeTelegramClient([], b""),
+        bale_client=FakeBaleClient(),
+        storage=StorageManager(settings.storage_dir),
+        guard_runner=GuardRunner(settings.gaurd_scripts_dir, timeout_sec=5),
+        script_runner=ScriptRunner(settings.scripts_dir, timeout_sec=5),
+        state_store=StateStore(settings.state_path),
+    )
+
+    promo = ScriptOutputMessage(
+        type=OutputMessageKind.TEXT,
+        text=(
+            "A SIGNAL WITH A 100% PROFIT MARGIN. "
+            "Don't miss this deal. Join now: https://t.me/example"
+        ),
+    )
+    normal = ScriptOutputMessage(
+        type=OutputMessageKind.TEXT,
+        text="تاتنهام امشب نمایش خوبی داشت و بازی با تساوی به پایان رسید.",
+    )
+
+    assert service._is_obvious_promotional_output([promo]) is True  # noqa: SLF001
+    assert service._is_obvious_promotional_output([normal]) is False  # noqa: SLF001
 
 
 def test_service_flow_dispatches_script_output(tmp_path: Path) -> None:
@@ -813,7 +1041,7 @@ def test_service_flow_skips_missing_source_media_without_unexpected_error(tmp_pa
     )
 
     status, error = asyncio.run(service._process_route_message_detailed(incoming, route))  # noqa: SLF001
-    assert status == "skipped"
+    assert status == "blocked"
     assert error == "source_media_unavailable"
 
 
@@ -1045,7 +1273,7 @@ print(json.dumps({'messages': [{'type': 'text', 'text': 'OUT:' + text}]}))
 
     processed = asyncio.run(service.run_once())
     assert processed == 2
-    assert bale.sent == [("-2001", "OUT:hello fanout\n-2001"), ("-2002", "OUT:hello fanout\n-2002")]
+    assert sorted(bale.sent) == sorted([("-2001", "OUT:hello fanout\n-2001"), ("-2002", "OUT:hello fanout\n-2002")])
 
 
 def test_service_flow_skips_large_message(tmp_path: Path) -> None:
@@ -1350,6 +1578,7 @@ print(json.dumps({'messages': [{'type': 'text', 'text': f'COUNT:{count}'}]}))
         },
     ]
     settings = _settings(tmp_path)
+    settings.media_group_wait_sec = 0.02
     route = ChannelRoute(
         name="r",
         enabled=True,
@@ -1372,9 +1601,17 @@ print(json.dumps({'messages': [{'type': 'text', 'text': f'COUNT:{count}'}]}))
         script_runner=ScriptRunner(settings.scripts_dir, timeout_sec=5),
         state_store=StateStore(settings.state_path),
     )
-    processed = asyncio.run(service.run_once())
-    assert processed == 1
+
+    async def _drive() -> tuple[int, int]:
+        p1 = await service.run_once()
+        await asyncio.sleep(0.03)
+        p2 = await service.run_once()
+        return p1, p2
+
+    p1, p2 = asyncio.run(_drive())
+    assert (p1, p2) == (0, 1)
     assert bale.sent == [("-2001", "COUNT:2\n-2001")]
+    assert service.sync_ledger.get_route_checkpoint("r") == 72
 
 
 def test_service_merges_media_group_across_polls(tmp_path: Path) -> None:
@@ -1469,6 +1706,7 @@ print(json.dumps({'messages': [{'type': 'text', 'text': f\"COUNT:{len(payload.ge
     p1, p2, p3 = asyncio.run(_drive())
     assert (p1, p2, p3) == (0, 0, 1)
     assert bale.sent == [("-2001", "COUNT:2\n-2001")]
+    assert service.sync_ledger.get_route_checkpoint("r") == 92
 
 
 def test_service_merges_telethon_media_group_before_processing(tmp_path: Path) -> None:
@@ -1497,6 +1735,7 @@ print(json.dumps({'messages': [{'type': 'text', 'text': f'COUNT:{count}|CAP:{cap
     settings = _settings(tmp_path)
     settings.telegram_source_mode = "hybrid"
     settings.telethon_enabled = True
+    settings.media_group_wait_sec = 0.02
 
     route = ChannelRoute(
         name="telethon-group",
@@ -1563,9 +1802,244 @@ print(json.dumps({'messages': [{'type': 'text', 'text': f'COUNT:{count}|CAP:{cap
         script_runner=ScriptRunner(settings.scripts_dir, timeout_sec=5),
         state_store=StateStore(settings.state_path),
     )
-    processed = asyncio.run(service.run_once())
-    assert processed == 1
+
+    async def _drive() -> tuple[int, int]:
+        p1 = await service.run_once()
+        await asyncio.sleep(0.03)
+        p2 = await service.run_once()
+        return p1, p2
+
+    p1, p2 = asyncio.run(_drive())
+    assert (p1, p2) == (0, 1)
     assert bale.sent == [("-2001", "COUNT:2|CAP:album cap\n-2001")]
+    assert service.sync_ledger.get_route_checkpoint("telethon-group") == 202
+
+
+def test_service_media_group_does_not_flush_early_when_split_2_plus_1(tmp_path: Path) -> None:
+    scripts_dir = tmp_path / "scripts"
+    scripts_dir.mkdir()
+    script_path = scripts_dir / "-1001.py"
+    script_path.write_text(
+        """
+import json
+import argparse
+from pathlib import Path
+
+p = argparse.ArgumentParser()
+p.add_argument('--payload', required=True)
+p.add_argument('--input-dir', required=True)
+p.add_argument('--output-dir', required=True)
+a = p.parse_args()
+payload = json.loads(Path(a.payload).read_text(encoding='utf-8'))
+print(json.dumps({'messages': [{'type': 'text', 'text': f\"COUNT:{len(payload.get('inputs', []))}\"}]}))
+""".strip(),
+        encoding="utf-8",
+    )
+
+    class SplitPollTelegramClient(FakeTelegramClient):
+        def __init__(self, update_batches: list[list[dict]], file_bytes: bytes) -> None:
+            super().__init__([], file_bytes)
+            self._batches = update_batches
+            self._cursor = 0
+
+        async def get_updates(self, offset, timeout, allowed_updates):
+            if self._cursor >= len(self._batches):
+                return []
+            batch = self._batches[self._cursor]
+            self._cursor += 1
+            return batch
+
+    updates1 = [
+        {
+            "update_id": 901,
+            "channel_post": {
+                "message_id": 101,
+                "chat": {"id": -1001, "type": "channel"},
+                "media_group_id": "mg-early",
+                "caption": "cap",
+                "photo": [{"file_id": "e1"}],
+            },
+        },
+        {
+            "update_id": 902,
+            "channel_post": {
+                "message_id": 102,
+                "chat": {"id": -1001, "type": "channel"},
+                "media_group_id": "mg-early",
+                "photo": [{"file_id": "e2"}],
+            },
+        },
+    ]
+    updates2 = [
+        {
+            "update_id": 903,
+            "channel_post": {
+                "message_id": 103,
+                "chat": {"id": -1001, "type": "channel"},
+                "media_group_id": "mg-early",
+                "photo": [{"file_id": "e3"}],
+            },
+        }
+    ]
+    settings = _settings(tmp_path)
+    settings.media_group_wait_sec = 0.03
+    route = ChannelRoute(
+        name="r",
+        enabled=True,
+        source_channel_id="-1001",
+        source_channel_username=None,
+        destination_channel_id="-2001",
+        destination_channel_username=None,
+        channel_script="-1001.py",
+        max_message_mb=10,
+    )
+    tg = SplitPollTelegramClient([updates1, updates2], b"x")
+    bale = FakeBaleClient()
+    service = KiwiService(
+        settings=settings,
+        routes=_route_registry(route),
+        telegram_client=tg,
+        bale_client=bale,
+        storage=StorageManager(settings.storage_dir),
+        guard_runner=GuardRunner(settings.gaurd_scripts_dir, timeout_sec=5),
+        script_runner=ScriptRunner(settings.scripts_dir, timeout_sec=5),
+        state_store=StateStore(settings.state_path),
+    )
+
+    async def _drive() -> tuple[int, int, int]:
+        p1 = await service.run_once()
+        p2 = await service.run_once()
+        await asyncio.sleep(0.04)
+        p3 = await service.run_once()
+        return p1, p2, p3
+
+    p1, p2, p3 = asyncio.run(_drive())
+    assert (p1, p2, p3) == (0, 0, 1)
+    assert bale.sent == [("-2001", "COUNT:3\n-2001")]
+    assert service.sync_ledger.get_route_checkpoint("r") == 103
+
+
+def test_service_media_group_dedupes_same_message_from_bot_and_telethon(tmp_path: Path) -> None:
+    scripts_dir = tmp_path / "scripts"
+    scripts_dir.mkdir()
+    script_path = scripts_dir / "count_inputs.py"
+    script_path.write_text(
+        """
+import json
+import argparse
+from pathlib import Path
+
+p = argparse.ArgumentParser()
+p.add_argument('--payload', required=True)
+p.add_argument('--input-dir', required=True)
+p.add_argument('--output-dir', required=True)
+a = p.parse_args()
+payload = json.loads(Path(a.payload).read_text(encoding='utf-8'))
+print(json.dumps({'messages': [{'type': 'text', 'text': f\"COUNT:{len(payload.get('inputs', []))}\"}]}))
+""".strip(),
+        encoding="utf-8",
+    )
+
+    updates = [
+        {
+            "update_id": 1001,
+            "channel_post": {
+                "message_id": 501,
+                "chat": {"id": -1009, "type": "channel", "username": "src"},
+                "media_group_id": "g-dup",
+                "caption": "cap",
+                "photo": [{"file_id": "b1"}],
+            },
+        },
+        {
+            "update_id": 1002,
+            "channel_post": {
+                "message_id": 502,
+                "chat": {"id": -1009, "type": "channel", "username": "src"},
+                "media_group_id": "g-dup",
+                "photo": [{"file_id": "b2"}],
+            },
+        },
+    ]
+
+    settings = _settings(tmp_path)
+    settings.telegram_source_mode = "hybrid"
+    settings.telethon_enabled = True
+    settings.media_group_wait_sec = 0.02
+    route = ChannelRoute(
+        name="telethon-group-dedupe",
+        enabled=True,
+        source_channel_id="-1009",
+        source_channel_username="@src",
+        destination_channel_id="-2001",
+        destination_channel_username=None,
+        channel_script="count_inputs.py",
+        max_message_mb=10,
+    )
+
+    tm1 = IncomingChannelMessage(
+        update_id=501,
+        source_channel_id="-1009",
+        source_channel_username="@src",
+        message_id=501,
+        date=None,
+        text=None,
+        caption="cap",
+        medias=[
+            IncomingMedia(
+                kind=MediaKind.PHOTO,
+                file_id="mt:@src:501",
+                source="telethon",
+                source_ref={"source_key": "@src", "message_id": 501},
+            )
+        ],
+        raw={"telethon": True},
+        media_group_id="g-dup",
+    )
+    tm2 = IncomingChannelMessage(
+        update_id=502,
+        source_channel_id="-1009",
+        source_channel_username="@src",
+        message_id=502,
+        date=None,
+        text=None,
+        caption=None,
+        medias=[
+            IncomingMedia(
+                kind=MediaKind.PHOTO,
+                file_id="mt:@src:502",
+                source="telethon",
+                source_ref={"source_key": "@src", "message_id": 502},
+            )
+        ],
+        raw={"telethon": True},
+        media_group_id="g-dup",
+    )
+
+    tg = FakeTelegramClient(updates, b"x")
+    bale = FakeBaleClient()
+    source = FakeTelethonSourceClient(messages=[tm1, tm2], seeded_messages=[])
+    service = KiwiService(
+        settings=settings,
+        routes=_route_registry(route),
+        telegram_client=tg,
+        bale_client=bale,
+        source_client=source,
+        storage=StorageManager(settings.storage_dir),
+        guard_runner=GuardRunner(settings.gaurd_scripts_dir, timeout_sec=5),
+        script_runner=ScriptRunner(settings.scripts_dir, timeout_sec=5),
+        state_store=StateStore(settings.state_path),
+    )
+
+    async def _drive() -> tuple[int, int]:
+        p1 = await service.run_once()
+        await asyncio.sleep(0.03)
+        p2 = await service.run_once()
+        return p1, p2
+
+    p1, p2 = asyncio.run(_drive())
+    assert (p1, p2) == (0, 1)
+    assert bale.sent == [("-2001", "COUNT:2\n-2001")]
 
 
 def test_service_sends_audit_logs_to_telegram_channel(tmp_path: Path) -> None:
@@ -1778,8 +2252,7 @@ print(json.dumps({'messages': [{'type': 'text', 'text': 'SYNC:' + text}]}))
             await service.run_once()
             await asyncio.sleep(0.03)
             saved_now = json.loads(channels_path.read_text(encoding="utf-8"))
-            sync_now = saved_now[0]["sync"]
-            if sync_now.get("status") == "active":
+            if str(saved_now[0].get("status") or "").strip().lower() == "synced":
                 break
         tg._batches.append([update3])  # noqa: SLF001
         tg._batches.append([])  # noqa: SLF001
@@ -1796,12 +2269,8 @@ print(json.dumps({'messages': [{'type': 'text', 'text': 'SYNC:' + text}]}))
     assert service.sync_ledger.get_record(key_live) is None
 
     saved = json.loads(channels_path.read_text(encoding="utf-8"))
-    sync = saved[0]["sync"]
-    assert sync["status"] == "active"
-    assert sync["enabled"] is False
-    assert sync["seeded"] is True
-    assert set(sync.keys()) == {"enabled", "status", "seeded"}
-    assert saved[0]["enabled"] is True
+    assert str(saved[0].get("status") or "").strip().lower() == "synced"
+    assert set(saved[0].keys()).isdisjoint({"sync", "enabled"})
 
 
 def test_service_syncing_retries_non_guard_failures(tmp_path: Path) -> None:
@@ -2004,7 +2473,7 @@ def test_service_sync_marks_ambiguous_and_creates_review(tmp_path: Path) -> None
     assert reviews[0]["dedupe_key"] == key
 
 
-def test_service_sync_seeds_from_stored_messages(tmp_path: Path) -> None:
+def test_service_sync_does_not_seed_checkpoint_from_stored_messages(tmp_path: Path) -> None:
     scripts_dir = tmp_path / "scripts"
     scripts_dir.mkdir()
     (scripts_dir / "sync.py").write_text(
@@ -2088,7 +2557,7 @@ print(json.dumps({'messages': [{'type': 'text', 'text': 'SYNC:' + text}]}))
     assert processed1 == 0
     assert service.bale_client.sent == []
     checkpoint = service.sync_ledger.get_route_checkpoint("sync-from-storage")  # noqa: SLF001
-    assert checkpoint == 3
+    assert checkpoint == 0
 
 
 def test_service_sync_prefers_source_backfill_over_local_storage(tmp_path: Path) -> None:
@@ -2225,6 +2694,11 @@ class FlakyTelegramClient:
         return None
 
 
+class FailingGetUpdatesTelegramClient(FakeTelegramClient):
+    async def get_updates(self, offset, timeout, allowed_updates):  # noqa: ARG002
+        raise PlatformApiError("getUpdates network error: ConnectError")
+
+
 def test_service_run_retries_after_poll_error(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
     route = ChannelRoute(
@@ -2262,3 +2736,80 @@ def test_service_run_retries_after_poll_error(tmp_path: Path) -> None:
 
     asyncio.run(_run_for_a_moment())
     assert tg.calls >= 2
+
+
+def test_service_run_once_continues_with_telethon_when_get_updates_fails(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    settings.telegram_source_mode = "telethon"
+    settings.telethon_enabled = True
+
+    route = ChannelRoute(
+        name="telethon-only-route",
+        enabled=True,
+        source_channel_id="-100555",
+        source_channel_username="@stored_src",
+        destination_channel_id="-2001",
+        destination_channel_username=None,
+        channel_script=None,
+        max_message_mb=10,
+    )
+
+    incoming = IncomingChannelMessage(
+        update_id=501,
+        source_channel_id="-100555",
+        source_channel_username="@stored_src",
+        message_id=501,
+        date=None,
+        text="hello-from-telethon",
+        caption=None,
+        medias=[],
+        raw={"telethon": True},
+        media_group_id=None,
+    )
+
+    tg = FailingGetUpdatesTelegramClient([], b"")
+    bale = FakeBaleClient()
+    source = FakeTelethonSourceClient(messages=[incoming], seeded_messages=[])
+    service = KiwiService(
+        settings=settings,
+        routes=_route_registry(route),
+        telegram_client=tg,
+        bale_client=bale,
+        source_client=source,
+        storage=StorageManager(settings.storage_dir),
+        guard_runner=GuardRunner(settings.gaurd_scripts_dir, timeout_sec=5),
+        script_runner=ScriptRunner(settings.scripts_dir, timeout_sec=5),
+        state_store=StateStore(settings.state_path),
+    )
+
+    processed = asyncio.run(service.run_once())
+    assert processed == 1
+    assert len(bale.sent) == 1
+    assert bale.sent[0][0] == "-2001"
+    assert "hello-from-telethon" in bale.sent[0][1]
+
+
+def test_service_classifies_download_timeout_as_retryable(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    route = ChannelRoute(
+        name="timeout-classify",
+        enabled=True,
+        source_channel_id="-1001",
+        source_channel_username=None,
+        destination_channel_id="-2001",
+        destination_channel_username=None,
+        channel_script=None,
+        max_message_mb=10,
+    )
+    service = KiwiService(
+        settings=settings,
+        routes=_route_registry(route),
+        telegram_client=FakeTelegramClient([], b""),
+        bale_client=FakeBaleClient(),
+        storage=StorageManager(settings.storage_dir),
+        guard_runner=GuardRunner(settings.gaurd_scripts_dir, timeout_sec=5),
+        script_runner=ScriptRunner(settings.scripts_dir, timeout_sec=5),
+        state_store=StateStore(settings.state_path),
+    )
+    classified = service._classify_local_processing_error("download", asyncio.TimeoutError())  # noqa: SLF001
+    assert classified == ("failed", "download_timeout")

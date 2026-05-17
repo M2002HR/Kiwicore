@@ -6,6 +6,7 @@ import inspect
 import json
 import logging
 import os
+import re
 import threading
 import time
 from datetime import datetime, timezone
@@ -84,7 +85,6 @@ class KiwiService:
         self._offset: int | None = self.state_store.load_offset()
         self._stop_event = asyncio.Event()
         self._pending_media_groups: dict[tuple[str, str, str], dict[str, object]] = {}
-        self._sync_seeded_routes: set[str] = set()
         self._retry_queue_hydrated = False
         self._sync_drain_task: asyncio.Task[int] | None = None
         self._sync_next_due_at: dict[str, float] = {}
@@ -173,11 +173,29 @@ class KiwiService:
         await self._ensure_sync_baseline()
         await self._hydrate_retry_queue_once()
 
-        updates = await self.telegram_client.get_updates(
-            offset=self._offset,
-            timeout=self.settings.telegram_poll_timeout_sec,
-            allowed_updates=self.settings.telegram_allowed_updates,
-        )
+        updates: list[dict]
+        try:
+            updates = await self.telegram_client.get_updates(
+                offset=self._offset,
+                timeout=self.settings.telegram_poll_timeout_sec,
+                allowed_updates=self.settings.telegram_allowed_updates,
+            )
+        except PlatformApiError as exc:
+            can_continue_without_bot = (
+                self.source_client is not None and self.settings.telegram_source_mode in {"telethon", "hybrid"}
+            )
+            if not can_continue_without_bot:
+                raise
+            logger.warning(
+                "Telegram Bot API polling failed; continuing with Telethon source",
+                extra={
+                    "details": {
+                        "error": str(exc),
+                        "source_mode": self.settings.telegram_source_mode,
+                    }
+                },
+            )
+            updates = []
         telethon_messages: list[IncomingChannelMessage] = []
         if self.source_client is not None:
             try:
@@ -197,11 +215,9 @@ class KiwiService:
             ready.sort(key=lambda item: item[0].update_id)
             processed = 0
             for incoming, route in ready:
-                if route.is_syncing():
-                    await self._enqueue_sync_message(route, incoming)
+                if route.is_deactive():
                     continue
-                await self._process_route_message(incoming, route)
-                processed += 1
+                await self._enqueue_sync_message(route, incoming)
             processed += await self._tick_sync_drain()
             await self._auto_activate_ready_routes()
             return processed
@@ -248,11 +264,9 @@ class KiwiService:
 
         processed = 0
         for incoming, route in ready_messages:
-            if route.is_syncing():
-                await self._enqueue_sync_message(route, incoming)
+            if route.is_deactive():
                 continue
-            await self._process_route_message(incoming, route)
-            processed += 1
+            await self._enqueue_sync_message(route, incoming)
 
         processed += await self._tick_sync_drain()
         await self._auto_activate_ready_routes()
@@ -289,16 +303,13 @@ class KiwiService:
         if latest > checkpoint:
             return
 
-        if route.sync_status == "active" and route.enabled:
+        if route.is_synced():
             return
 
-        route.sync_status = "active"
-        route.sync_enabled = False
-        route.sync_seeded = True
-        route.enabled = True
+        route.status = "synced"
 
         logger.info(
-            "Route sync completed and auto-activated",
+            "Route sync completed and marked as synced",
             extra={
                 "details": {
                     "route": route.name,
@@ -310,12 +321,11 @@ class KiwiService:
         await self._persist_route_patch(
             route.name,
             {
-                "enabled": True,
-                "sync": {
-                    "enabled": False,
-                    "status": "active",
-                    "seeded": True,
-                },
+                "status": "synced",
+                "backfill_count": int(route.sync_backfill_count),
+                "interval_sec": int(route.sync_interval_sec),
+                "batch_size": int(route.sync_batch_size),
+                "retry_attempts": int(route.sync_retry_attempts),
             },
         )
 
@@ -347,12 +357,20 @@ class KiwiService:
 
         if self._sync_drain_task is None:
             self._sync_drain_task = asyncio.create_task(self._drain_sync_queue())
+        try:
+            processed += int(await self._sync_drain_task)
+        finally:
+            self._sync_drain_task = None
         return processed
 
     async def _enqueue_sync_message(self, route: ChannelRoute, incoming: IncomingChannelMessage) -> None:
         checkpoint = self.sync_ledger.get_route_checkpoint(route.name)
         if checkpoint is not None and int(incoming.message_id) <= checkpoint:
             return
+
+        if route.is_synced():
+            route.status = "syncing"
+            await self._persist_route_patch(route.name, {"status": "syncing"})
 
         payload = self._serialize_incoming(incoming)
         created, dedupe_key, status = self.sync_ledger.register_message(
@@ -366,7 +384,7 @@ class KiwiService:
             return
         if status == "ambiguous":
             return
-        due_at = self._reserve_sync_due_at(route.name, route.sync_interval_sec)
+        due_at = time.time()
         await self.sync_queue.enqueue(
             dedupe_key=dedupe_key,
             route_name=route.name,
@@ -401,9 +419,7 @@ class KiwiService:
         route_source_key = getattr(self.source_client, "route_source_key", None)
         latest_func = getattr(self.source_client, "latest_message_id_for_route", None)
         for route in self.routes.routes:
-            if not route.is_syncing():
-                continue
-            if route.name in self._sync_seeded_routes:
+            if route.is_deactive():
                 continue
 
             current_checkpoint = self.sync_ledger.get_route_checkpoint(route.name)
@@ -411,23 +427,30 @@ class KiwiService:
             if callable(latest_func):
                 try:
                     latest_from_source = max(0, int(await latest_func(route)))
-                except Exception:
-                    logger.exception(
-                        "Failed to fetch latest source message id for sync baseline",
-                        extra={"details": {"route": route.name}},
-                    )
+                except Exception as exc:
+                    err_text = str(exc or "").strip().lower()
+                    if ("unable to resolve source entity" in err_text) or ("could not find the input entity" in err_text):
+                        logger.warning(
+                            "Sync baseline waiting for resolvable Telethon entity",
+                            extra={"details": {"route": route.name, "error": str(exc)}},
+                        )
+                    else:
+                        logger.exception(
+                            "Failed to fetch latest source message id for sync baseline",
+                            extra={"details": {"route": route.name}},
+                        )
 
             if current_checkpoint is None:
                 baseline = 0
                 if latest_from_source > 0:
                     # Keep at most backfill_count historical messages on first sync bootstrap.
                     baseline = max(0, latest_from_source - max(0, int(route.sync_backfill_count)))
-                if baseline <= 0:
-                    baseline = self._latest_message_id_from_storage(route)
                 self.sync_ledger.set_route_checkpoint(route.name, baseline)
                 current_checkpoint = baseline
-            elif latest_from_source > 0 and not bool(route.sync_seeded):
-                # If route was explicitly restarted in syncing mode, avoid replaying very old history.
+            elif latest_from_source > 0 and (not route.is_syncing()):
+                # Apply backfill floor only when (re)starting from a non-syncing state.
+                # Never move checkpoint forward while a route is already syncing, otherwise
+                # unsynced middle messages can be skipped.
                 desired_floor = max(0, latest_from_source - max(0, int(route.sync_backfill_count)))
                 if int(current_checkpoint) < desired_floor:
                     self.sync_ledger.set_route_checkpoint(route.name, desired_floor)
@@ -438,8 +461,13 @@ class KiwiService:
                 source_key = route_source_key(route)
                 if isinstance(source_key, str) and source_key.strip():
                     prime_cursor(source_key, checkpoint)
-            route.sync_seeded = True
-            self._sync_seeded_routes.add(route.name)
+
+            if latest_from_source > checkpoint and route.status != "syncing":
+                route.status = "syncing"
+                await self._persist_route_patch(route.name, {"status": "syncing"})
+            if latest_from_source <= checkpoint and route.status == "syncing":
+                route.status = "synced"
+                await self._persist_route_patch(route.name, {"status": "synced"})
 
     def _latest_message_id_from_storage(self, route: ChannelRoute) -> int:
         messages_root = Path(self.settings.storage_dir) / "messages"
@@ -453,8 +481,6 @@ class KiwiService:
                 continue
             incoming = parse_telegram_channel_update(raw)
             if incoming is None:
-                continue
-            if route.source_channel_id and incoming.source_channel_id != route.source_channel_id:
                 continue
             if route.source_channel_username and incoming.source_channel_username != route.source_channel_username:
                 continue
@@ -528,16 +554,28 @@ class KiwiService:
 
         route = self._find_route(record.route_name)
         if route is None:
-            self.sync_ledger.mark_status(item.dedupe_key, status="skipped", last_error="route_not_found")
+            self.sync_ledger.mark_status(item.dedupe_key, status="blocked", last_error="route_not_found")
             return 1
-        if not route.sync_enabled:
-            self.sync_ledger.mark_status(item.dedupe_key, status="skipped", last_error="route_sync_disabled")
+        if route.is_deactive():
+            self.sync_ledger.mark_status(item.dedupe_key, status="blocked", last_error="route_deactive")
             return 1
 
         checkpoint = int(self.sync_ledger.get_route_checkpoint(route.name) or 0)
         if int(record.message_id) <= checkpoint:
-            self.sync_ledger.mark_status(item.dedupe_key, status="skipped", last_error="older_than_checkpoint")
+            self.sync_ledger.mark_status(item.dedupe_key, status="blocked", last_error="older_than_checkpoint")
             return 1
+
+        # Enforce monotonic per-route processing order so higher IDs cannot advance checkpoint
+        # ahead of older pending records.
+        min_pending = self.sync_ledger.min_active_message_id_for_route(route.name, above_checkpoint=checkpoint)
+        if min_pending is not None and int(record.message_id) > int(min_pending):
+            await self.sync_queue.schedule_retry(
+                dedupe_key=item.dedupe_key,
+                route_name=route.name,
+                due_at=time.time() + 0.25,
+                payload_hash=item.payload_hash,
+            )
+            return 0
 
         lock_owner = str(uuid4())
         acquired = await self.sync_queue.acquire_route_lock(
@@ -565,17 +603,24 @@ class KiwiService:
 
             if status == "ok":
                 self.sync_ledger.mark_status(item.dedupe_key, status="sent", trace_id=f"sync:{item.dedupe_key}")
-                self.sync_ledger.set_route_checkpoint(route.name, int(incoming.message_id))
+                self.sync_ledger.set_route_checkpoint(
+                    route.name,
+                    self._checkpoint_target_with_pending_groups(route.name, int(incoming.message_id)),
+                )
                 return 1
 
             if status in {"blocked", "skipped"}:
+                final_status = "blocked" if status == "skipped" else status
                 self.sync_ledger.mark_status(
                     item.dedupe_key,
-                    status=status,
+                    status=final_status,
                     last_error=last_error,
                     trace_id=f"sync:{item.dedupe_key}",
                 )
-                self.sync_ledger.set_route_checkpoint(route.name, int(incoming.message_id))
+                self.sync_ledger.set_route_checkpoint(
+                    route.name,
+                    self._checkpoint_target_with_pending_groups(route.name, int(incoming.message_id)),
+                )
                 return 1
 
             if status == "ambiguous":
@@ -617,6 +662,119 @@ class KiwiService:
         exp = max(0, int(attempt_count) - 1)
         return min(base * (2 ** exp), 300.0)
 
+    async def _download_input_media_with_retries(
+        self,
+        *,
+        media: IncomingMedia,
+        file_path: str,
+        target_path: Path,
+        remaining: int,
+        timeout_sec: float,
+        route: ChannelRoute,
+        incoming: IncomingChannelMessage,
+        trace_id: str,
+        media_index: int,
+    ) -> int:
+        is_telethon_media = media.source == "telethon" and isinstance(media.source_ref, dict)
+        attempts = 3 if is_telethon_media else 2
+        last_exc: Exception | None = None
+
+        for attempt in range(1, attempts + 1):
+            try:
+                if target_path.exists():
+                    target_path.unlink()
+
+                if is_telethon_media:
+                    if self.source_client is None:
+                        raise RuntimeError("Telethon source client is not available for media download")
+                    downloaded = await asyncio.wait_for(
+                        self.source_client.download_media(media.source_ref, target_path, max_bytes=remaining),
+                        timeout=timeout_sec,
+                    )
+                else:
+                    downloaded = await asyncio.wait_for(
+                        self.telegram_client.download_file(file_path, target_path, max_bytes=remaining),
+                        timeout=timeout_sec,
+                    )
+                return int(downloaded)
+            except (MessageTooLargeError, FileNotFoundError, PermissionError, ValueError):
+                raise
+            except Exception as exc:
+                last_exc = exc
+                is_timeout = isinstance(exc, (TimeoutError, asyncio.TimeoutError))
+                if is_telethon_media and is_timeout and self.source_client is not None:
+                    try:
+                        await self.source_client.aclose()
+                    except Exception:
+                        logger.debug(
+                            "Failed to reset Telethon source client after media download timeout",
+                            extra={
+                                "details": {
+                                    "route": route.name,
+                                    "trace_id": trace_id,
+                                    "message_id": incoming.message_id,
+                                    "media_index": media_index,
+                                }
+                            },
+                        )
+                if attempt >= attempts:
+                    break
+                logger.warning(
+                    "Media download attempt failed; retrying",
+                    extra={
+                        "details": {
+                            "route": route.name,
+                            "trace_id": trace_id,
+                            "message_id": incoming.message_id,
+                            "media_index": media_index,
+                            "media_kind": media.kind.value,
+                            "source": media.source or "bot_api",
+                            "attempt": attempt,
+                            "attempts_total": attempts,
+                            "timeout_sec": timeout_sec,
+                            "error": str(exc),
+                        }
+                    },
+                )
+                await asyncio.sleep(min(2.0, 0.4 * attempt))
+
+        if isinstance(last_exc, (TimeoutError, asyncio.TimeoutError)):
+            raise TimeoutError(
+                f"download_timeout:source={media.source or 'bot_api'}:media_index={media_index}:attempts={attempts}"
+            ) from last_exc
+        if last_exc is not None:
+            raise RuntimeError(
+                f"download_failed:source={media.source or 'bot_api'}:media_index={media_index}:error={last_exc}"
+            ) from last_exc
+        raise RuntimeError(
+            f"download_failed:source={media.source or 'bot_api'}:media_index={media_index}:error=unknown"
+        )
+
+    def _checkpoint_target_with_pending_groups(self, route_name: str, message_id: int) -> int:
+        target = max(0, int(message_id))
+        min_pending = self._min_pending_group_message_id(route_name)
+        if min_pending is None:
+            return target
+        # Keep checkpoint behind unflushed media-group members so they are not
+        # later finalized early by checkpoint-order handling.
+        return min(target, max(0, int(min_pending) - 1))
+
+    def _min_pending_group_message_id(self, route_name: str) -> int | None:
+        min_seen: int | None = None
+        for (pending_route_name, _source_channel_id, _group_id), bucket in self._pending_media_groups.items():
+            if pending_route_name != route_name:
+                continue
+            messages_by_id = bucket.get("messages_by_id") if isinstance(bucket, dict) else None
+            if not isinstance(messages_by_id, dict) or not messages_by_id:
+                continue
+            try:
+                candidate = min(int(k) for k in messages_by_id.keys())
+            except Exception:
+                continue
+            if min_seen is None or candidate < min_seen:
+                min_seen = candidate
+        return min_seen
+
     async def _process_route_message_with_retries(
         self,
         incoming: IncomingChannelMessage,
@@ -657,14 +815,14 @@ class KiwiService:
                     }
                 },
             )
-            if status in {"ok", "blocked", "skipped"}:
+            if status in {"ok", "blocked"}:
                 return status, err
             if self._is_retryable_channel_script_error_text(err):
                 if idx < attempts - 1:
                     await asyncio.sleep(0.8 * (idx + 1))
                     continue
-                # Exhausted retry policy for this route; skip and continue sync queue.
-                return "skipped", "channel_script_retry_exhausted_skipped"
+                # Exhausted route-level retries; keep this item retryable by queue policy.
+                return "failed", "channel_script_retry_exhausted"
             if status == "ambiguous":
                 if idx < attempts - 1 and self._is_transient_error_text(err):
                     await asyncio.sleep(0.8 * (idx + 1))
@@ -747,6 +905,7 @@ class KiwiService:
             "network error" in text
             or "connecttimeout" in text
             or "readtimeout" in text
+            or "download_timeout" in text
             or "http 500" in text
             or "http 502" in text
             or "http 503" in text
@@ -786,11 +945,13 @@ class KiwiService:
             if isinstance(exc, PermissionError):
                 return "failed", "storage_permission_denied"
             if isinstance(exc, FileNotFoundError):
-                return "skipped", "source_media_unavailable"
+                return "blocked", "source_media_unavailable"
+            if isinstance(exc, TimeoutError) or isinstance(exc, asyncio.TimeoutError):
+                return "failed", "download_timeout"
             if isinstance(exc, ValueError) and "source_ref" in lowered:
-                return "skipped", "invalid_source_reference"
+                return "blocked", "invalid_source_reference"
             if "empty file_path" in lowered:
-                return "skipped", "source_file_path_missing"
+                return "blocked", "source_file_path_missing"
 
         return None
 
@@ -1025,20 +1186,16 @@ class KiwiService:
         payload: dict = {
             "route": {
                 "name": route.name,
-                "source_channel_id": route.source_channel_id,
+                "status": route.status,
                 "source_channel_username": route.source_channel_username,
                 "destination_channel_id": route.destination_channel_id,
                 "destination_channel_username": route.destination_channel_username,
                 "destination_target": route.destination_target(),
                 "channel_script": route.channel_script,
-                "sync": {
-                    "enabled": route.sync_enabled,
-                    "status": route.sync_status,
-                    "backfill_count": route.sync_backfill_count,
-                    "interval_sec": route.sync_interval_sec,
-                    "batch_size": route.sync_batch_size,
-                    "retry_attempts": route.sync_retry_attempts,
-                },
+                "backfill_count": route.sync_backfill_count,
+                "interval_sec": route.sync_interval_sec,
+                "batch_size": route.sync_batch_size,
+                "retry_attempts": route.sync_retry_attempts,
             },
             "message": {
                 "update_id": incoming.update_id,
@@ -1059,7 +1216,7 @@ class KiwiService:
             for idx, media in enumerate(incoming.medias, start=1):
                 if media.kind == MediaKind.STICKER:
                     logger.info(
-                        "Sticker input skipped by policy",
+                        "Sticker input blocked by policy",
                         extra={
                             "details": {
                                 "route": route.name,
@@ -1090,12 +1247,47 @@ class KiwiService:
                 if remaining <= 0:
                     raise MessageTooLargeError(f"Message exceeded size limit ({max_mb} MB)")
 
-                if media.source == "telethon" and isinstance(media.source_ref, dict):
-                    if self.source_client is None:
-                        raise RuntimeError("Telethon source client is not available for media download")
-                    downloaded = await self.source_client.download_media(media.source_ref, target_path, max_bytes=remaining)
+                timeout_raw = os.getenv("SYNC_MEDIA_DOWNLOAD_TIMEOUT_SEC", "").strip()
+                if timeout_raw:
+                    try:
+                        base_timeout_sec = max(30.0, min(300.0, float(timeout_raw)))
+                    except Exception:
+                        base_timeout_sec = max(30.0, float(self.settings.script_timeout_sec))
                 else:
-                    downloaded = await self.telegram_client.download_file(file_path, target_path, max_bytes=remaining)
+                    base_timeout_sec = max(30.0, float(self.settings.script_timeout_sec))
+
+                heavy_timeout_raw = os.getenv("SYNC_MEDIA_DOWNLOAD_TIMEOUT_HEAVY_SEC", "").strip()
+                if heavy_timeout_raw:
+                    try:
+                        heavy_timeout_sec = max(base_timeout_sec, min(600.0, float(heavy_timeout_raw)))
+                    except Exception:
+                        heavy_timeout_sec = max(base_timeout_sec, 180.0)
+                else:
+                    heavy_timeout_sec = max(base_timeout_sec, 180.0)
+
+                if media.kind in {
+                    MediaKind.VIDEO,
+                    MediaKind.DOCUMENT,
+                    MediaKind.ANIMATION,
+                    MediaKind.AUDIO,
+                    MediaKind.VOICE,
+                    MediaKind.VIDEO_NOTE,
+                }:
+                    timeout_sec = heavy_timeout_sec
+                else:
+                    timeout_sec = base_timeout_sec
+
+                downloaded = await self._download_input_media_with_retries(
+                    media=media,
+                    file_path=file_path,
+                    target_path=target_path,
+                    remaining=remaining,
+                    timeout_sec=timeout_sec,
+                    route=route,
+                    incoming=incoming,
+                    trace_id=trace_id,
+                    media_index=idx,
+                )
                 downloaded_total += downloaded
                 logger.info(
                     "Media downloaded",
@@ -1203,7 +1395,7 @@ class KiwiService:
                     "duration_ms": self.guard_runner.last_duration_ms,
                 }
                 if route.gaurd_script
-                else {"skipped": True},
+                else {"not_configured": True},
             )
 
             channel_started = time.monotonic()
@@ -1250,7 +1442,7 @@ class KiwiService:
             if not run_result.messages:
                 await self._audit_log(
                     stage="channel_script",
-                    status="skipped",
+                    status="blocked",
                     incoming=incoming,
                     route=route,
                     reason="Channel script output was empty",
@@ -1270,7 +1462,7 @@ class KiwiService:
                         }
                     },
                 )
-                return "skipped", "channel_script_empty_output"
+                return "blocked", "channel_script_empty_output"
             await self._audit_log(
                 stage="channel_script",
                 status="ok",
@@ -1311,20 +1503,44 @@ class KiwiService:
             if not filtered_messages:
                 await self._audit_log(
                     stage="channel_script",
-                    status="skipped",
+                    status="blocked",
                     incoming=incoming,
                     route=route,
                     reason="All channel script outputs were dropped due to size limits",
                     trace_id=trace_id,
                     stage_timings_ms=stage_timings_ms,
                 )
-                return "skipped", "channel_script_output_size_limit"
+                return "blocked", "channel_script_output_size_limit"
 
             final_result = ScriptRunResult(
                 messages=self.keyword_linker.apply(route.destination_target(), filtered_messages),
                 stdout=run_result.stdout,
                 stderr=run_result.stderr,
             )
+            if self._is_obvious_promotional_output(final_result.messages):
+                block_reason = "output_promo_blocked"
+                await self._audit_log(
+                    stage="channel_script",
+                    status="blocked",
+                    incoming=incoming,
+                    route=route,
+                    reason=block_reason,
+                    trace_id=trace_id,
+                    stage_timings_ms=stage_timings_ms,
+                )
+                logger.info(
+                    "Message blocked by output promotional policy",
+                    extra={
+                        "details": {
+                            "trace_id": trace_id,
+                            "route": route.name,
+                            "reason": block_reason,
+                            "output_messages_count": len(final_result.messages),
+                        }
+                    },
+                )
+                return "blocked", block_reason
+
             upload_total_bytes = self._estimate_output_messages_bytes(
                 final_result.messages,
                 output_dir=output_dir,
@@ -1386,7 +1602,7 @@ class KiwiService:
                 stage_timings_ms=stage_timings_ms,
             )
             logger.warning(
-                "Message skipped: size limit exceeded",
+                "Message blocked: size limit exceeded",
                 extra={
                     "details": {
                         "route": route.name,
@@ -1522,7 +1738,7 @@ class KiwiService:
                     stage_timings_ms=stage_timings_ms,
                 )
                 logger.info(
-                    "Route processing skipped due to source input issue",
+                    "Route processing blocked due to source input issue",
                     extra={
                         "details": {
                             "route": route.name,
@@ -1566,7 +1782,6 @@ class KiwiService:
     ) -> list[tuple[IncomingChannelMessage, ChannelRoute]]:
         ready: list[tuple[IncomingChannelMessage, ChannelRoute]] = []
         now = asyncio.get_running_loop().time()
-        seen_in_batch: dict[tuple[str, str, str], int] = {}
 
         for incoming, route in matched_messages:
             if not incoming.media_group_id:
@@ -1574,40 +1789,35 @@ class KiwiService:
                 continue
 
             group_key = (route.name, incoming.source_channel_id, incoming.media_group_id)
-            seen_in_batch[group_key] = seen_in_batch.get(group_key, 0) + 1
             bucket = self._pending_media_groups.get(group_key)
             if bucket is None:
                 bucket = {
                     "route": route,
-                    "messages": [],
+                    "messages_by_id": {},
                     "first_seen": now,
                     "last_seen": now,
                 }
                 self._pending_media_groups[group_key] = bucket
 
-            group_messages = bucket["messages"]
-            assert isinstance(group_messages, list)
-            group_messages.append(incoming)
+            messages_by_id = bucket.get("messages_by_id")
+            if not isinstance(messages_by_id, dict):
+                messages_by_id = {}
+                bucket["messages_by_id"] = messages_by_id
+
+            existing = messages_by_id.get(int(incoming.message_id))
+            if isinstance(existing, IncomingChannelMessage):
+                messages_by_id[int(incoming.message_id)] = self._merge_group_member(existing, incoming)
+            else:
+                messages_by_id[int(incoming.message_id)] = incoming
             bucket["last_seen"] = now
 
-            # Telegram albums are at most 10 media items.
-            if len(group_messages) >= 10:
-                ready.append((self._merge_group_messages(group_messages), route))
+            # Telegram albums are at most 10 media items; once we have 10 unique members,
+            # flush immediately because no more media can belong to this group.
+            if len(messages_by_id) >= 10:
+                group_messages = self._group_bucket_messages(bucket)
+                if group_messages:
+                    ready.append((self._merge_group_messages(group_messages), route))
                 self._pending_media_groups.pop(group_key, None)
-
-        # If multiple items of one album arrived in this poll response,
-        # flush it immediately to avoid unnecessary delay.
-        for group_key, count in seen_in_batch.items():
-            if count < 2:
-                continue
-            bucket = self._pending_media_groups.get(group_key)
-            if bucket is None:
-                continue
-            route = bucket.get("route")
-            group_messages = bucket.get("messages")
-            if isinstance(route, ChannelRoute) and isinstance(group_messages, list) and group_messages:
-                ready.append((self._merge_group_messages(group_messages), route))
-            self._pending_media_groups.pop(group_key, None)
 
         return ready
 
@@ -1625,8 +1835,8 @@ class KiwiService:
                 continue
 
             route = bucket.get("route")
-            group_messages = bucket.get("messages")
-            if isinstance(route, ChannelRoute) and isinstance(group_messages, list) and group_messages:
+            group_messages = self._group_bucket_messages(bucket)
+            if isinstance(route, ChannelRoute) and group_messages:
                 ready.append((self._merge_group_messages(group_messages), route))
             keys_to_remove.append(key)
 
@@ -1650,7 +1860,6 @@ class KiwiService:
             "route_count": len(self.routes.routes),
             "pending_media_groups": len(self._pending_media_groups),
             "retry_queue_hydrated": bool(self._retry_queue_hydrated),
-            "sync_seeded_routes_count": len(self._sync_seeded_routes),
             "sync_drain_task_running": bool(self._sync_drain_task is not None and not self._sync_drain_task.done()),
             "traffic": self.traffic_snapshot(),
         }
@@ -1748,6 +1957,9 @@ class KiwiService:
         stage_timings_ms: dict[str, float] | None = None,
         stage_output: object | None = None,
     ) -> None:
+        normalized_status = str(status or "").strip().lower()
+        if normalized_status == "skipped":
+            normalized_status = "blocked"
         stage_output_text = self._format_stage_output(stage_output)
         logger.info(
             "audit_event",
@@ -1755,7 +1967,7 @@ class KiwiService:
                 "details": {
                     "trace_id": trace_id,
                     "stage": stage,
-                    "status": status,
+                    "status": normalized_status,
                     "reason": reason,
                     "route": route.name if route else None,
                     "source_channel_id": incoming.source_channel_id if incoming else None,
@@ -1773,9 +1985,9 @@ class KiwiService:
         if not self.settings.log_channel_target:
             return
 
-        if status not in {"ok", "failed", "blocked", "skipped"}:
+        if normalized_status not in {"ok", "failed", "blocked"}:
             return
-        if status == "ok" and stage != "dispatch":
+        if normalized_status == "ok" and stage != "dispatch":
             return
 
         stage_title = {
@@ -1792,12 +2004,9 @@ class KiwiService:
             "ok": "✅ Success",
             "failed": "❌ Failed",
             "blocked": "⛔ Blocked",
-            "skipped": "⏭ Skipped",
-        }.get(status, status)
+        }.get(normalized_status, normalized_status)
 
-        lines = [
-            f"🧾 Kiwi | {stage_title} | {status_title}",
-        ]
+        lines = [f"🧾 Kiwi (کیوی) | {stage_title} | {status_title}"]
         if route:
             lines.append(f"🛣 Route: {route.name}")
         if incoming:
@@ -1813,10 +2022,12 @@ class KiwiService:
             source_link = self._source_message_link(incoming)
             if source_link:
                 lines.append(f"🔗 Message Link: {source_link}")
+                lines.append(f"لینک پیام: {source_link}")
             if incoming.media_group_id:
                 lines.append(f"🗂 media_group_id: {incoming.media_group_id}")
         if reason:
             lines.append(f"📝 Details: {reason}")
+            lines.append(f"توضیح: {reason}")
         if stage_timings_ms:
             lines.append(f"⏱ timings_ms: {json.dumps(stage_timings_ms, ensure_ascii=False)}")
         if stage_output_text:
@@ -1938,8 +2149,18 @@ class KiwiService:
 
     @staticmethod
     def _merge_group_messages(messages: list[IncomingChannelMessage]) -> IncomingChannelMessage:
-        ordered = sorted(messages, key=lambda m: (m.message_id, m.update_id))
+        deduped_by_message_id: dict[int, IncomingChannelMessage] = {}
+        for msg in messages:
+            msg_id = int(msg.message_id)
+            existing = deduped_by_message_id.get(msg_id)
+            if existing is None:
+                deduped_by_message_id[msg_id] = msg
+                continue
+            deduped_by_message_id[msg_id] = KiwiService._merge_group_member(existing, msg)
+
+        ordered = sorted(deduped_by_message_id.values(), key=lambda m: (m.message_id, m.update_id))
         first = ordered[0]
+        last = ordered[-1]
         text = next((msg.text for msg in ordered if msg.text), None)
         caption = next((msg.caption for msg in ordered if msg.caption), None)
         merged_medias: list[IncomingMedia] = []
@@ -1951,16 +2172,78 @@ class KiwiService:
                 raw_updates.append(msg.raw)
 
         return IncomingChannelMessage(
-            update_id=min(msg.update_id for msg in ordered),
+            # Advance merged groups using the highest message id so checkpoint/progress
+            # does not get stuck behind trailing members of the same album.
+            update_id=max(msg.update_id for msg in ordered),
             source_channel_id=first.source_channel_id,
             source_channel_username=first.source_channel_username,
-            message_id=first.message_id,
-            date=first.date,
+            message_id=max(msg.message_id for msg in ordered),
+            date=last.date if last.date is not None else first.date,
             text=text,
             caption=caption,
             medias=merged_medias,
-            raw={"group_updates": raw_updates},
+            raw={
+                "group_updates": raw_updates,
+                "group_message_ids": [int(msg.message_id) for msg in ordered],
+                "group_message_start_id": int(first.message_id),
+                "group_message_end_id": int(max(msg.message_id for msg in ordered)),
+            },
             media_group_id=first.media_group_id,
+        )
+
+    @staticmethod
+    def _group_bucket_messages(bucket: dict[str, object]) -> list[IncomingChannelMessage]:
+        messages_by_id = bucket.get("messages_by_id")
+        if not isinstance(messages_by_id, dict):
+            return []
+        out: list[IncomingChannelMessage] = []
+        for key in sorted(messages_by_id.keys()):
+            msg = messages_by_id.get(key)
+            if isinstance(msg, IncomingChannelMessage):
+                out.append(msg)
+        return out
+
+    @staticmethod
+    def _merge_group_member(existing: IncomingChannelMessage, incoming: IncomingChannelMessage) -> IncomingChannelMessage:
+        def _media_score(msg: IncomingChannelMessage) -> tuple[int, int]:
+            has_resolved_ref = 0
+            for media in msg.medias:
+                if str(media.source or "").strip().lower() == "telethon" and isinstance(media.source_ref, dict):
+                    has_resolved_ref = 1
+                    break
+            return (has_resolved_ref, len(msg.medias))
+
+        if existing.medias and incoming.medias:
+            medias = incoming.medias if _media_score(incoming) > _media_score(existing) else existing.medias
+        elif incoming.medias:
+            medias = incoming.medias
+        else:
+            medias = existing.medias
+
+        raw: dict[str, Any]
+        if isinstance(existing.raw, dict) and isinstance(incoming.raw, dict):
+            if existing.raw == incoming.raw:
+                raw = existing.raw
+            else:
+                raw = {"merged_variants": [existing.raw, incoming.raw]}
+        elif isinstance(existing.raw, dict):
+            raw = existing.raw
+        elif isinstance(incoming.raw, dict):
+            raw = incoming.raw
+        else:
+            raw = {}
+
+        return IncomingChannelMessage(
+            update_id=min(int(existing.update_id), int(incoming.update_id)),
+            source_channel_id=existing.source_channel_id or incoming.source_channel_id,
+            source_channel_username=existing.source_channel_username or incoming.source_channel_username,
+            message_id=min(int(existing.message_id), int(incoming.message_id)),
+            date=existing.date if existing.date is not None else incoming.date,
+            text=existing.text or incoming.text,
+            caption=existing.caption or incoming.caption,
+            medias=medias,
+            raw=raw,
+            media_group_id=existing.media_group_id or incoming.media_group_id,
         )
 
     @staticmethod
@@ -2085,6 +2368,80 @@ class KiwiService:
             if extra_path.exists():
                 return extra_path
         return None
+
+    @staticmethod
+    def _is_promotional_text(text: str) -> bool:
+        combined = str(text or "").strip().lower()
+        if not combined:
+            return False
+        has_link = bool(re.search(r"(https?://|t\.me/|telegram\.me/|bit\.ly/)", combined))
+        has_handle = bool(re.search(r"(^|\s)@\w{3,}", combined))
+        cta_terms = (
+            "buy now",
+            "shop now",
+            "order now",
+            "join",
+            "join now",
+            "register",
+            "sign up",
+            "subscribe",
+            "don't miss",
+            "don’t miss",
+            "deal",
+            "vip",
+            "exclusive",
+            "خرید",
+            "ثبت نام",
+            "عضویت",
+            "فرصت",
+            "همین حالا",
+            "ویژه",
+        )
+        cta_hits = sum(1 for token in cta_terms if token in combined)
+        promo_terms = (
+            "#ad",
+            "sponsored",
+            "affiliate",
+            "referral",
+            "تبلیغ",
+            "اسپانسر",
+            "پروموشن",
+            "signal",
+            "signals",
+            "profit",
+            "profit margin",
+            "100%",
+            "100 %",
+            "high throughput",
+            "win rate",
+            "trading",
+            "forex",
+            "crypto signal",
+            "premium channel",
+            "community",
+            "سیگنال",
+            "سود",
+            "درصد سود",
+            "وین ریت",
+        )
+        promo_hits = sum(1 for token in promo_terms if token in combined)
+        if promo_hits >= 2 and (has_link or has_handle):
+            return True
+        if promo_hits >= 3:
+            return True
+        if cta_hits >= 3 and (has_link or has_handle):
+            return True
+        return False
+
+    def _is_obvious_promotional_output(self, messages: list[ScriptOutputMessage]) -> bool:
+        for msg in messages:
+            text = str(msg.text or "").strip()
+            caption = str(msg.caption or "").strip()
+            if text and self._is_promotional_text(text):
+                return True
+            if caption and self._is_promotional_text(caption):
+                return True
+        return False
 
     def _filter_oversized_output_messages(
         self,

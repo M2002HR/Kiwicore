@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import dataclasses
 import json
 import logging
@@ -10,6 +11,7 @@ import shutil
 import socket
 import threading
 import time
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from http import HTTPStatus
@@ -111,26 +113,64 @@ class AdminWebServer:
                     },
                 )
 
+            @staticmethod
+            def _is_client_disconnect_error(exc: Exception) -> bool:
+                if isinstance(exc, (BrokenPipeError, ConnectionResetError, socket.timeout, TimeoutError)):
+                    return True
+                if isinstance(exc, OSError):
+                    return int(getattr(exc, "errno", -1) or -1) in {
+                        errno.EPIPE,
+                        errno.ECONNRESET,
+                        errno.ECONNABORTED,
+                    }
+                return False
+
+            def _send_response_bytes(
+                self,
+                data: bytes,
+                *,
+                status: int,
+                content_type: str,
+                headers: dict[str, str] | None = None,
+            ) -> bool:
+                try:
+                    self.send_response(status)
+                    self.send_header("Content-Type", content_type)
+                    self.send_header("Content-Length", str(len(data)))
+                    self.send_header("Cache-Control", "no-store")
+                    if headers:
+                        for key, value in headers.items():
+                            self.send_header(str(key), str(value))
+                    self.end_headers()
+                    self.wfile.write(data)
+                    return True
+                except Exception as exc:  # pragma: no cover - socket lifecycle is integration-level
+                    if self._is_client_disconnect_error(exc):
+                        logger.info(
+                            "Admin web client disconnected before response completed",
+                            extra={
+                                "details": {
+                                    "client": self.client_address[0] if self.client_address else "-",
+                                    "method": self.command,
+                                    "path": self.path,
+                                }
+                            },
+                        )
+                        return False
+                    raise
+
             def _send_json(self, payload: object, status: int = 200, *, headers: dict[str, str] | None = None) -> None:
                 data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-                self.send_response(status)
-                self.send_header("Content-Type", "application/json; charset=utf-8")
-                self.send_header("Content-Length", str(len(data)))
-                self.send_header("Cache-Control", "no-store")
-                if headers:
-                    for key, value in headers.items():
-                        self.send_header(str(key), str(value))
-                self.end_headers()
-                self.wfile.write(data)
+                self._send_response_bytes(
+                    data,
+                    status=status,
+                    content_type="application/json; charset=utf-8",
+                    headers=headers,
+                )
 
             def _send_text(self, text: str, status: int = 200, *, content_type: str = "text/plain; charset=utf-8") -> None:
                 data = text.encode("utf-8")
-                self.send_response(status)
-                self.send_header("Content-Type", content_type)
-                self.send_header("Content-Length", str(len(data)))
-                self.send_header("Cache-Control", "no-store")
-                self.end_headers()
-                self.wfile.write(data)
+                self._send_response_bytes(data, status=status, content_type=content_type)
 
             def _read_json_body(self) -> dict[str, Any]:
                 raw_len = self.headers.get("Content-Length", "0")
@@ -176,18 +216,15 @@ class AdminWebServer:
                     return None
                 return username
 
-            def _set_auth_cookie(self, token: str) -> None:
+            def _set_auth_cookie(self, token: str) -> str:
                 expires = int(time.time() + int(parent.settings.admin_web_session_ttl_sec))
-                self.send_header(
-                    "Set-Cookie",
-                    f"kiwi_admin_session={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={max(60, int(parent.settings.admin_web_session_ttl_sec))}; Expires={_http_date(expires)}",
+                return (
+                    f"kiwi_admin_session={token}; Path=/; HttpOnly; SameSite=Lax; "
+                    f"Max-Age={max(60, int(parent.settings.admin_web_session_ttl_sec))}; Expires={_http_date(expires)}"
                 )
 
-            def _clear_auth_cookie(self) -> None:
-                self.send_header(
-                    "Set-Cookie",
-                    "kiwi_admin_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT",
-                )
+            def _clear_auth_cookie(self) -> str:
+                return "kiwi_admin_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT"
 
             def do_GET(self) -> None:  # noqa: N802
                 self._handle("GET")
@@ -227,6 +264,18 @@ class AdminWebServer:
                         status=HTTPStatus.FORBIDDEN,
                     )
                 except Exception as exc:
+                    if self._is_client_disconnect_error(exc):
+                        logger.info(
+                            "Admin web request aborted due to client disconnect",
+                            extra={
+                                "details": {
+                                    "client": self.client_address[0] if self.client_address else "-",
+                                    "method": method,
+                                    "path": path,
+                                }
+                            },
+                        )
+                        return
                     logger.exception("Admin web request failed")
                     self._send_json(
                         {"ok": False, "error": "internal_error", "detail": str(exc)},
@@ -250,19 +299,15 @@ class AdminWebServer:
                     return
 
                 body = file_path.read_bytes()
-                self.send_response(HTTPStatus.OK)
-                self.send_header("Content-Length", str(len(body)))
-                self.send_header("Cache-Control", "no-store")
                 if file_path.suffix == ".html":
-                    self.send_header("Content-Type", "text/html; charset=utf-8")
+                    content_type = "text/html; charset=utf-8"
                 elif file_path.suffix == ".js":
-                    self.send_header("Content-Type", "application/javascript; charset=utf-8")
+                    content_type = "application/javascript; charset=utf-8"
                 elif file_path.suffix == ".css":
-                    self.send_header("Content-Type", "text/css; charset=utf-8")
+                    content_type = "text/css; charset=utf-8"
                 else:
-                    self.send_header("Content-Type", "application/octet-stream")
-                self.end_headers()
-                self.wfile.write(body)
+                    content_type = "application/octet-stream"
+                self._send_response_bytes(body, status=HTTPStatus.OK, content_type=content_type)
 
             def _handle_api(self, method: str, path: str, query: dict[str, list[str]]) -> None:
                 # Public endpoints
@@ -278,30 +323,17 @@ class AdminWebServer:
                         self._send_json({"ok": False, "error": "invalid_credentials"}, status=HTTPStatus.UNAUTHORIZED)
                         return
                     token = parent._create_session(username)
-                    payload = {"ok": True, "username": username.lower()}
-                    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-                    self.send_response(HTTPStatus.OK)
-                    self._set_auth_cookie(token)
-                    self.send_header("Content-Type", "application/json; charset=utf-8")
-                    self.send_header("Content-Length", str(len(data)))
-                    self.send_header("Cache-Control", "no-store")
-                    self.end_headers()
-                    self.wfile.write(data)
+                    self._send_json(
+                        {"ok": True, "username": username.lower()},
+                        headers={"Set-Cookie": self._set_auth_cookie(token)},
+                    )
                     return
 
                 if path == "/api/auth/logout" and method == "POST":
                     token = self._cookie_token()
                     if token:
                         parent._delete_session(token)
-                    payload = {"ok": True}
-                    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-                    self.send_response(HTTPStatus.OK)
-                    self._clear_auth_cookie()
-                    self.send_header("Content-Type", "application/json; charset=utf-8")
-                    self.send_header("Content-Length", str(len(data)))
-                    self.send_header("Cache-Control", "no-store")
-                    self.end_headers()
-                    self.wfile.write(data)
+                    self._send_json({"ok": True}, headers={"Set-Cookie": self._clear_auth_cookie()})
                     return
 
                 if path == "/api/auth/me" and method == "GET":
@@ -339,6 +371,16 @@ class AdminWebServer:
                     self._send_json({"ok": True, "route": created})
                     return
 
+                if path == "/api/routes/start-all" and method == "POST":
+                    out = parent.management_api.start_all_routes()
+                    self._send_json({"ok": True, "result": out})
+                    return
+
+                if path == "/api/routes/stop-all" and method == "POST":
+                    out = parent.management_api.stop_all_routes()
+                    self._send_json({"ok": True, "result": out})
+                    return
+
                 if path.startswith("/api/routes/"):
                     route_name = unquote(path[len("/api/routes/") :])
                     if not route_name:
@@ -356,12 +398,12 @@ class AdminWebServer:
                         return
                     if route_name.endswith("/enable") and method == "POST":
                         name = route_name[: -len("/enable")]
-                        out = parent.management_api.set_route_enabled(unquote(name), True)
+                        out = parent.management_api.set_route_status(unquote(name), "synced")
                         self._send_json({"ok": True, "route": out})
                         return
                     if route_name.endswith("/disable") and method == "POST":
                         name = route_name[: -len("/disable")]
-                        out = parent.management_api.set_route_enabled(unquote(name), False)
+                        out = parent.management_api.set_route_status(unquote(name), "deactive")
                         self._send_json({"ok": True, "route": out})
                         return
                     if method == "GET":
@@ -427,7 +469,11 @@ class AdminWebServer:
                     return
 
                 if path == "/api/sync/stats" and method == "GET":
-                    stats = parent._run_async(parent.management_api.sync_stats(), timeout=12.0)
+                    try:
+                        stats = parent._run_async(parent.management_api.sync_stats(), timeout=12.0)
+                    except Exception:
+                        logger.exception("Failed to fetch async sync stats; fallback to snapshot")
+                        stats = parent.management_api.sync_stats_snapshot()
                     self._send_json({"ok": True, "stats": stats})
                     return
 
@@ -564,7 +610,11 @@ class AdminWebServer:
 
     def _run_async(self, awaitable, *, timeout: float = 10.0):
         fut = asyncio.run_coroutine_threadsafe(awaitable, self.event_loop)
-        return fut.result(timeout=max(1.0, float(timeout)))
+        try:
+            return fut.result(timeout=max(1.0, float(timeout)))
+        except FutureTimeoutError:
+            fut.cancel()
+            raise
 
     def _dashboard_snapshot(self) -> dict[str, object]:
         routes = self.management_api.list_routes()
@@ -574,17 +624,18 @@ class AdminWebServer:
             logger.exception("Failed to fetch async sync stats for dashboard; fallback to snapshot")
             sync_snapshot = self.management_api.sync_stats_snapshot()
         status_counts = dict(sync_snapshot.get("status_counts") or {})
-        sync_enabled_count = 0
+        route_status_counts = {"deactive": 0, "syncing": 0, "synced": 0}
         for route in routes:
-            sync_obj = route.get("sync")
-            if isinstance(sync_obj, dict) and bool(sync_obj.get("enabled", False)):
-                sync_enabled_count += 1
+            status = str(route.get("status") or "").strip().lower()
+            if status in route_status_counts:
+                route_status_counts[status] += 1
         return {
             "service": self.service.runtime_snapshot(),
             "routes": {
                 "total": len(routes),
-                "enabled": sum(1 for r in routes if bool(r.get("enabled", True))),
-                "sync_enabled": sync_enabled_count,
+                "deactive": int(route_status_counts["deactive"]),
+                "syncing": int(route_status_counts["syncing"]),
+                "synced": int(route_status_counts["synced"]),
             },
             "sync": sync_snapshot,
             "status_counts": status_counts,
@@ -757,11 +808,10 @@ class AdminWebServer:
 
     def _workers_status_snapshot(self) -> dict[str, object]:
         routes = self.management_api.list_routes()
-        sync_enabled_routes = 0
+        syncing_routes = 0
         for route in routes:
-            sync_obj = route.get("sync")
-            if isinstance(sync_obj, dict) and bool(sync_obj.get("enabled", False)):
-                sync_enabled_routes += 1
+            if str(route.get("status") or "").strip().lower() == "syncing":
+                syncing_routes += 1
 
         try:
             sync_stats = self._run_async(self.management_api.sync_stats(), timeout=12.0)
@@ -792,7 +842,7 @@ class AdminWebServer:
             "sync": {
                 "queue_depth": int(sync_stats.get("queue_depth", 0) or 0),
                 "open_reviews": int(sync_stats.get("open_reviews", 0) or 0),
-                "sync_enabled_routes": int(sync_enabled_routes),
+                "syncing_routes": int(syncing_routes),
                 "status_counts": {
                     "queued": queued,
                     "processing": processing,

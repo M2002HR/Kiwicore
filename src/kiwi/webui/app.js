@@ -412,8 +412,8 @@ function renderDashboardPage() {
   page.innerHTML = `
     <div class="grid cols-4">
       ${card('Total Routes', routes.total ?? 0, 'route definitions')}
-      ${card('Enabled Routes', routes.enabled ?? 0, 'enabled=true')}
-      ${card('Sync Enabled', routes.sync_enabled ?? 0, 'sync.enabled=true')}
+      ${card('Synced Routes', routes.synced ?? 0, 'status=synced')}
+      ${card('Syncing Routes', routes.syncing ?? 0, 'status=syncing')}
       ${card('Queue Depth', sync.queue_depth ?? 0, 'sync queue')}
     </div>
     <div class="grid cols-4" style="margin-top:10px">
@@ -431,10 +431,20 @@ function renderDashboardPage() {
   `;
 }
 
-function syncStatusPill(syncObj) {
-  if (!syncObj || typeof syncObj !== 'object') return '<span class="badge">-</span>';
-  if (syncObj.enabled) return '<span class="badge warn">syncing</span>';
-  return '<span class="badge ok">active</span>';
+function routeStatusPill(routeStatus) {
+  const status = String(routeStatus || '').toLowerCase();
+  if (status === 'synced') return '<span class="badge ok">synced</span>';
+  if (status === 'syncing') return '<span class="badge warn">syncing</span>';
+  if (status === 'deactive') return '<span class="badge err">deactive</span>';
+  return '<span class="badge">-</span>';
+}
+
+function effectiveRouteStatus(routeStatus, metrics) {
+  const normalized = String(routeStatus || 'deactive').toLowerCase();
+  if (normalized === 'deactive') return 'deactive';
+  const remaining = Number(metrics?.remaining_unsynced ?? 0);
+  if (Number.isFinite(remaining) && remaining > 0) return 'syncing';
+  return 'synced';
 }
 
 function findRouteByName(name) {
@@ -460,12 +470,11 @@ function toggleRouteSort(key) {
 
 function routeSortValue(route, metrics, key) {
   if (key === 'name') return String(route?.name || '');
-  if (key === 'source') return String(route?.source_channel_username || route?.source_channel_id || '');
+  if (key === 'source') return String(route?.source_channel_username || '');
   if (key === 'destination') return String(route?.destination_channel_username || route?.destination_channel_id || '');
   if (key === 'channel_script') return String(route?.channel_script || '');
   if (key === 'guard') return String(route?.gaurd_script || '');
-  if (key === 'status') return route?.enabled ? 1 : 0;
-  if (key === 'sync') return route?.sync?.enabled ? 1 : 0;
+  if (key === 'status') return effectiveRouteStatus(route?.status, metrics);
   if (key === 'remaining') return Number(metrics?.remaining_unsynced ?? 0);
   if (key === 'progress') return Number(metrics?.progress_pct ?? 0);
   if (key === 'actions') return String(route?.name || '');
@@ -491,12 +500,11 @@ function renderRoutesPage(opts = {}) {
     const hay = [
       r?.name,
       r?.source_channel_username,
-      r?.source_channel_id,
       r?.destination_channel_username,
       r?.destination_channel_id,
       r?.channel_script,
       r?.gaurd_script,
-      r?.sync?.status,
+      r?.status,
     ].map((x) => String(x || '').toLowerCase()).join(' | ');
     return hay.includes(needle);
   });
@@ -523,33 +531,32 @@ function renderRoutesPage(opts = {}) {
   const rows = sorted.map((r) => {
     const routeKey = encodeURIComponent(String(r.name || ''));
     const name = esc(r.name || '-');
-    const source = esc(r.source_channel_username || r.source_channel_id || '-');
+    const source = esc(r.source_channel_username || '-');
     const dest = esc(r.destination_channel_username || r.destination_channel_id || '-');
     const cs = esc(r.channel_script || '-');
     const gs = esc(r.gaurd_script || '-');
-    const enabled = !!r.enabled;
-    const sync = r.sync || {};
     const m = state.routeMetrics && r.name ? state.routeMetrics[String(r.name)] : null;
+    const routeStatus = effectiveRouteStatus(r.status, m);
+    const isDeactive = routeStatus === 'deactive';
     const remaining = Number(m?.remaining_unsynced ?? 0);
     const progressPct = Number(m?.progress_pct ?? 0);
-    const progressLabel = Number.isFinite(progressPct) ? `${progressPct.toFixed(1)}%` : '-';
-    const progressBadge = progressPct >= 95 ? 'ok' : (progressPct >= 60 ? 'warn' : 'err');
+    const remainingLabel = isDeactive ? '-' : String(remaining);
+    const progressLabel = isDeactive ? '-' : (Number.isFinite(progressPct) ? `${progressPct.toFixed(1)}%` : '-');
+    const progressBadge = isDeactive ? '' : (progressPct >= 95 ? 'ok' : (progressPct >= 60 ? 'warn' : 'err'));
     return `
       <tr>
-        <td>${name}</td>
-        <td>${source}</td>
-        <td>${dest}</td>
+        <td class="route-col-name" title="${name}">${name}</td>
+        <td class="route-col-source" title="${source}">${source}</td>
+        <td class="route-col-destination" title="${dest}">${dest}</td>
         <td>${cs}</td>
         <td>${gs}</td>
-        <td>${enabled ? '<span class="badge ok">on</span>' : '<span class="badge err">off</span>'}</td>
-        <td>${syncStatusPill(sync)}</td>
-        <td>${remaining}</td>
+        <td>${routeStatusPill(routeStatus)}</td>
+        <td>${remainingLabel}</td>
         <td><span class="badge ${progressBadge}">${progressLabel}</span></td>
         <td class="actions-cell">
           <div class="icon-actions">
             ${iconBtn({ act: 'edit', title: `Edit ${r.name || ''}`, icon: '✎', attrs: `data-route-name="${routeKey}"` })}
-            ${iconBtn({ act: 'toggle', title: enabled ? 'Disable route' : 'Enable route', icon: enabled ? '⏸' : '▶', attrs: `data-route-name="${routeKey}" data-enabled="${enabled ? '1' : '0'}"` })}
-            ${iconBtn({ act: 'sync', title: sync?.enabled ? 'Stop sync' : 'Start sync', icon: sync?.enabled ? '■' : '↻', attrs: `data-route-name="${routeKey}" data-sync="${sync?.enabled ? '1' : '0'}"` })}
+            ${iconBtn({ act: 'toggle', title: routeStatus === 'deactive' ? 'Start route' : 'Stop route', icon: routeStatus === 'deactive' ? '▶' : '⏸', attrs: `data-route-name="${routeKey}" data-status="${routeStatus}"` })}
             ${iconBtn({ act: 'delete', title: `Delete ${r.name || ''}`, icon: '✕', extraClass: 'btn-danger', attrs: `data-route-name="${routeKey}"` })}
           </div>
         </td>
@@ -563,21 +570,22 @@ function renderRoutesPage(opts = {}) {
         <h3>Route Management</h3>
         <div class="row">
           <input id="routeSearchInput" class="compact-input" placeholder="Search routes (name/source/destination/script)..." value="${esc(state.routeFilter)}">
+          <button id="routeStartAllBtn" class="btn">Start All</button>
+          <button id="routeStopAllBtn" class="btn btn-danger">Stop All</button>
           ${iconBtn({ title: 'Add new route', icon: '+', attrs: 'id="routeAddBtn"' })}
         </div>
       </div>
       <div class="meta-line">Showing ${filtered.length} of ${state.routes.length} routes</div>
       <div class="table-wrap routes-table-wrap">
-        <table>
+        <table class="routes-table">
           <thead>
             <tr>
-              <th><button class="th-sort" data-sort-key="name">Name <span class="sort-arrow">${routeSortIndicator('name')}</span></button></th>
-              <th><button class="th-sort" data-sort-key="source">Source <span class="sort-arrow">${routeSortIndicator('source')}</span></button></th>
-              <th><button class="th-sort" data-sort-key="destination">Destination <span class="sort-arrow">${routeSortIndicator('destination')}</span></button></th>
+              <th class="route-col-name"><button class="th-sort" data-sort-key="name">Name <span class="sort-arrow">${routeSortIndicator('name')}</span></button></th>
+              <th class="route-col-source"><button class="th-sort" data-sort-key="source">Source <span class="sort-arrow">${routeSortIndicator('source')}</span></button></th>
+              <th class="route-col-destination"><button class="th-sort" data-sort-key="destination">Destination <span class="sort-arrow">${routeSortIndicator('destination')}</span></button></th>
               <th><button class="th-sort" data-sort-key="channel_script">Channel Script <span class="sort-arrow">${routeSortIndicator('channel_script')}</span></button></th>
               <th><button class="th-sort" data-sort-key="guard">Guard <span class="sort-arrow">${routeSortIndicator('guard')}</span></button></th>
               <th><button class="th-sort" data-sort-key="status">Status <span class="sort-arrow">${routeSortIndicator('status')}</span></button></th>
-              <th><button class="th-sort" data-sort-key="sync">Sync <span class="sort-arrow">${routeSortIndicator('sync')}</span></button></th>
               <th><button class="th-sort" data-sort-key="remaining">Remaining <span class="sort-arrow">${routeSortIndicator('remaining')}</span></button></th>
               <th><button class="th-sort" data-sort-key="progress">Progress <span class="sort-arrow">${routeSortIndicator('progress')}</span></button></th>
               <th><button class="th-sort" data-sort-key="actions">Actions <span class="sort-arrow">${routeSortIndicator('actions')}</span></button></th>
@@ -641,21 +649,16 @@ function renderRoutesPage(opts = {}) {
         return;
       }
       if (act === 'toggle') {
-        const enabled = btn.dataset.enabled === '1';
+        const currentStatus = String(btn.dataset.status || 'deactive');
         await runAction(async () => {
-          await api(`/api/routes/${encodeURIComponent(name)}/${enabled ? 'disable' : 'enable'}`, { method: 'POST' });
+          if (currentStatus === 'deactive') {
+            await api(`/api/routes/${encodeURIComponent(name)}/sync/start`, { method: 'POST' });
+          } else {
+            await api(`/api/routes/${encodeURIComponent(name)}/sync/stop`, { method: 'POST' });
+          }
           showFlash('Route status updated');
           await reloadPageData('routes');
         }, 'Failed to change route status');
-        return;
-      }
-      if (act === 'sync') {
-        const syncing = btn.dataset.sync === '1';
-        await runAction(async () => {
-          await api(`/api/routes/${encodeURIComponent(name)}/sync/${syncing ? 'stop' : 'start'}`, { method: 'POST' });
-          showFlash('Sync setting updated');
-          await reloadPageData('routes');
-        }, 'Failed to update sync setting');
         return;
       }
       if (act === 'edit') {
@@ -665,15 +668,29 @@ function renderRoutesPage(opts = {}) {
   });
 
   document.getElementById('routeAddBtn')?.addEventListener('click', () => openRouteEditor(null));
+  document.getElementById('routeStartAllBtn')?.addEventListener('click', async () => {
+    await runAction(async () => {
+      await api('/api/routes/start-all', { method: 'POST' });
+      showFlash('All routes started');
+      await reloadPageData('routes');
+    }, 'Failed to start all routes');
+  });
+  document.getElementById('routeStopAllBtn')?.addEventListener('click', async () => {
+    await runAction(async () => {
+      await api('/api/routes/stop-all', { method: 'POST' });
+      showFlash('All routes stopped');
+      await reloadPageData('routes');
+    }, 'Failed to stop all routes');
+  });
 }
 
 function openRouteEditor(route) {
   const isEdit = !!route;
   const r = route || {
-    name: '', enabled: true, source_channel_username: '', source_channel_id: '',
+    name: '', status: 'synced', source_channel_username: '',
     destination_channel_username: '', destination_channel_id: '',
     channel_script: '', gaurd_script: 'default_guard.py', max_message_mb: 15,
-    sync: { enabled: false, status: 'active', backfill_count: 50, interval_sec: 60, batch_size: 1, retry_attempts: 2, seeded: false },
+    backfill_count: 50, interval_sec: 1, batch_size: 1, retry_attempts: 2,
   };
   const routeMetrics = r.name ? state.routeMetrics[String(r.name)] : null;
   const remaining = Number(routeMetrics?.remaining_unsynced ?? 0);
@@ -685,20 +702,17 @@ function openRouteEditor(route) {
       <div class="meta-line">Sync progress: ${progressPct.toFixed(1)}% | Remaining unsynced: ${remaining}</div>
       <form id="routeForm" class="modal-grid">
         <label>Route name <input name="name" required value="${esc(r.name || '')}" ${isEdit ? 'readonly' : ''}></label>
-        <label>Enabled <select name="enabled"><option value="1" ${r.enabled ? 'selected' : ''}>Yes</option><option value="0" ${!r.enabled ? 'selected' : ''}>No</option></select></label>
+        <label>Status <select name="status"><option value="deactive" ${String(r.status || '') === 'deactive' ? 'selected' : ''}>deactive</option><option value="syncing" ${String(r.status || '') === 'syncing' ? 'selected' : ''}>syncing</option><option value="synced" ${String(r.status || '') === 'synced' ? 'selected' : ''}>synced</option></select></label>
         <label>source username <input name="source_channel_username" value="${esc(r.source_channel_username || '')}"></label>
-        <label>source id <input name="source_channel_id" value="${esc(r.source_channel_id || '')}"></label>
         <label>destination username <input name="destination_channel_username" value="${esc(r.destination_channel_username || '')}"></label>
         <label>destination id <input name="destination_channel_id" value="${esc(r.destination_channel_id || '')}"></label>
         <label>channel script <input name="channel_script" value="${esc(r.channel_script || '')}"></label>
         <label>guard script <input name="gaurd_script" value="${esc(r.gaurd_script || '')}"></label>
         <label>max message MB <input type="number" min="1" name="max_message_mb" value="${esc(r.max_message_mb ?? '')}"></label>
-        <label>sync enabled <select name="sync_enabled"><option value="1" ${(r.sync || {}).enabled ? 'selected' : ''}>Yes</option><option value="0" ${!(r.sync || {}).enabled ? 'selected' : ''}>No</option></select></label>
-        <label>sync status <select name="sync_status"><option value="active" ${((r.sync || {}).status || '') === 'active' ? 'selected' : ''}>active</option><option value="syncing" ${((r.sync || {}).status || '') === 'syncing' ? 'selected' : ''}>syncing</option></select></label>
-        <label>backfill <input type="number" min="0" name="sync_backfill_count" value="${esc((r.sync || {}).backfill_count ?? 50)}"></label>
-        <label>interval sec <input type="number" min="1" name="sync_interval_sec" value="${esc((r.sync || {}).interval_sec ?? 60)}"></label>
-        <label>batch size <input type="number" min="1" name="sync_batch_size" value="${esc((r.sync || {}).batch_size ?? 1)}"></label>
-        <label>retry attempts <input type="number" min="0" name="sync_retry_attempts" value="${esc((r.sync || {}).retry_attempts ?? 2)}"></label>
+        <label>backfill <input type="number" min="0" name="backfill_count" value="${esc(r.backfill_count ?? 50)}"></label>
+        <label>interval sec <input type="number" min="1" name="interval_sec" value="${esc(r.interval_sec ?? 1)}"></label>
+        <label>batch size <input type="number" min="1" name="batch_size" value="${esc(r.batch_size ?? 1)}"></label>
+        <label>retry attempts <input type="number" min="0" name="retry_attempts" value="${esc(r.retry_attempts ?? 2)}"></label>
       </form>
       <div class="modal-actions">
         ${iconBtn({ title: 'Close', icon: '✕', attrs: 'id="cancelRouteBtn"' })}
@@ -712,32 +726,25 @@ function openRouteEditor(route) {
     await runAction(async () => {
       const form = document.getElementById('routeForm');
       const fd = new FormData(form);
-      const sync = {
-        enabled: fd.get('sync_enabled') === '1',
-        status: String(fd.get('sync_status') || 'active'),
-        backfill_count: Number(fd.get('sync_backfill_count') || 50),
-        interval_sec: Number(fd.get('sync_interval_sec') || 60),
-        batch_size: Number(fd.get('sync_batch_size') || 1),
-        retry_attempts: Number(fd.get('sync_retry_attempts') || 2),
-        seeded: false,
-      };
       const payload = {
         name: String(fd.get('name') || '').trim(),
-        enabled: fd.get('enabled') === '1',
+        status: String(fd.get('status') || 'deactive'),
         source_channel_username: (String(fd.get('source_channel_username') || '').trim() || null),
-        source_channel_id: (String(fd.get('source_channel_id') || '').trim() || null),
         destination_channel_username: (String(fd.get('destination_channel_username') || '').trim() || null),
         destination_channel_id: (String(fd.get('destination_channel_id') || '').trim() || null),
         channel_script: (String(fd.get('channel_script') || '').trim() || null),
         gaurd_script: (String(fd.get('gaurd_script') || '').trim() || null),
         max_message_mb: Number(fd.get('max_message_mb') || 0) || null,
-        sync,
+        backfill_count: Number(fd.get('backfill_count') || 50),
+        interval_sec: Number(fd.get('interval_sec') || 1),
+        batch_size: Number(fd.get('batch_size') || 1),
+        retry_attempts: Number(fd.get('retry_attempts') || 2),
       };
       if (!payload.name) {
         throw new Error('Route name is required');
       }
-      if (!payload.source_channel_id && !payload.source_channel_username) {
-        throw new Error('At least one of source username or source id is required');
+      if (!payload.source_channel_username) {
+        throw new Error('Source username is required');
       }
       if (!payload.destination_channel_id && !payload.destination_channel_username) {
         throw new Error('At least one of destination username or destination id is required');
@@ -1170,7 +1177,7 @@ function renderWorkersPage() {
     <div class="grid cols-4">
       ${card('Configured Workers', esc(workers.configured_count ?? 0), `backend=${esc(workers.queue_backend || '-')}`)}
       ${card('Estimated Busy Workers', esc(workers.estimated_busy_workers ?? 0), `drain=${workers.drain_task_running ? 'running' : 'idle'}`)}
-      ${card('Queue Depth', esc(sync.queue_depth ?? 0), `sync routes=${esc(sync.sync_enabled_routes ?? 0)}`)}
+      ${card('Queue Depth', esc(sync.queue_depth ?? 0), `syncing routes=${esc(sync.syncing_routes ?? 0)}`)}
       ${card('Open Reviews', esc(sync.open_reviews ?? 0), 'ambiguous/manual checks')}
     </div>
     <div class="grid cols-4" style="margin-top:10px">

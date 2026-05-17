@@ -5,6 +5,7 @@ import os
 import tempfile
 import threading
 import time
+import asyncio
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Callable
@@ -16,15 +17,17 @@ from kiwi.utils import dump_json, safe_script_name
 
 _ROUTE_KEYS = {
     "name",
-    "enabled",
-    "source_channel_id",
+    "status",
     "source_channel_username",
     "destination_channel_id",
     "destination_channel_username",
     "channel_script",
     "gaurd_script",
     "max_message_mb",
-    "sync",
+    "backfill_count",
+    "interval_sec",
+    "batch_size",
+    "retry_attempts",
 }
 
 
@@ -37,6 +40,7 @@ class ManagementApi:
         gaurd_scripts_dir: str,
         sync_ledger: SyncLedger | None = None,
         sync_queue: SyncQueueBackend | None = None,
+        source_client: object | None = None,
         on_routes_reloaded: Callable[[RouteRegistry], None],
     ) -> None:
         self.channels_path = Path(channels_config_path)
@@ -44,6 +48,7 @@ class ManagementApi:
         self.guards_dir = Path(gaurd_scripts_dir)
         self.sync_ledger = sync_ledger
         self.sync_queue = sync_queue
+        self.source_client = source_client
         self.on_routes_reloaded = on_routes_reloaded
         self._write_lock = threading.Lock()
         self._lock_file_path = self.channels_path.with_suffix(self.channels_path.suffix + ".lock")
@@ -52,7 +57,7 @@ class ManagementApi:
             dump_json(self.channels_path, [])
 
     def list_routes(self) -> list[dict]:
-        return self._load_routes_raw()
+        return [self._canonicalize_route_obj(item) for item in self._load_routes_raw()]
 
     def add_route(self, route_obj: dict) -> dict:
         if not isinstance(route_obj, dict):
@@ -64,9 +69,9 @@ class ManagementApi:
             raise ValueError("route name is required")
         if any(str(item.get("name") or "").strip() == name for item in routes):
             raise ValueError("route name already exists")
-        routes.append(route_obj)
+        routes.append(self._canonicalize_route_obj(route_obj))
         self._save_and_reload(routes)
-        return route_obj
+        return self._canonicalize_route_obj(route_obj)
 
     def update_route(self, name: str, patch: dict) -> dict:
         if not isinstance(patch, dict):
@@ -76,19 +81,19 @@ class ManagementApi:
         for idx, item in enumerate(routes):
             if str(item.get("name") or "").strip() != name:
                 continue
-            updated = dict(item)
+            updated = self._canonicalize_route_obj(item)
             updated.update(patch)
             if "name" in patch and str(patch.get("name") or "").strip() != name:
                 raise ValueError("renaming routes is not supported")
-            routes[idx] = updated
+            routes[idx] = self._canonicalize_route_obj(updated)
             self._save_and_reload(routes)
-            return updated
+            return routes[idx]
         raise ValueError("route not found")
 
     def get_route(self, name: str) -> dict:
         for item in self._load_routes_raw():
             if str(item.get("name") or "").strip() == name:
-                return item
+                return self._canonicalize_route_obj(item)
         raise ValueError("route not found")
 
     def delete_route(self, name: str) -> None:
@@ -98,32 +103,67 @@ class ManagementApi:
             raise ValueError("route not found")
         self._save_and_reload(filtered)
 
+    def set_route_status(self, name: str, status: str) -> dict:
+        normalized = str(status or "").strip().lower()
+        if normalized not in {"deactive", "syncing", "synced"}:
+            raise ValueError("status must be one of: deactive, syncing, synced")
+        return self.update_route(name, {"status": normalized})
+
     def set_route_enabled(self, name: str, enabled: bool) -> dict:
-        return self.update_route(name, {"enabled": bool(enabled)})
+        # Backward compatibility.
+        return self.set_route_status(name, "synced" if bool(enabled) else "deactive")
 
     def update_route_sync(self, name: str, sync_patch: dict) -> dict:
         if not isinstance(sync_patch, dict):
             raise ValueError("sync patch must be object")
-        route = self.get_route(name)
-        sync_obj = route.get("sync")
-        if not isinstance(sync_obj, dict):
-            sync_obj = {}
-        updated_sync = dict(sync_obj)
-        updated_sync.update(sync_patch)
-        return self.update_route(name, {"sync": updated_sync})
+        patch: dict[str, object] = {}
+        if "backfill_count" in sync_patch:
+            patch["backfill_count"] = int(sync_patch.get("backfill_count") or 0)
+        if "interval_sec" in sync_patch:
+            patch["interval_sec"] = int(sync_patch.get("interval_sec") or 1)
+        if "batch_size" in sync_patch:
+            patch["batch_size"] = int(sync_patch.get("batch_size") or 1)
+        if "retry_attempts" in sync_patch:
+            patch["retry_attempts"] = int(sync_patch.get("retry_attempts") or 0)
+        return self.update_route(name, patch)
 
     def start_route_sync(self, name: str) -> dict:
         route = self.get_route(name)
-        sync_obj = route.get("sync") if isinstance(route.get("sync"), dict) else {}
-        sync_patch = {
-            "enabled": True,
-            "status": "syncing",
-            "seeded": False,
-        }
-        return self.update_route_sync(name, sync_patch)
+        status = self._determine_start_status(name, route)
+        return self.set_route_status(name, status)
 
     def stop_route_sync(self, name: str) -> dict:
-        return self.update_route_sync(name, {"enabled": False, "status": "active"})
+        return self.set_route_status(name, "deactive")
+
+    def start_all_routes(self) -> dict:
+        routes = self._load_routes_raw()
+        normalized_routes: list[dict] = []
+        syncing = 0
+        synced = 0
+        for item in routes:
+            route = self._canonicalize_route_obj(item)
+            name = str(route.get("name") or "").strip()
+            if not name:
+                continue
+            next_status = self._determine_start_status(name, route)
+            route["status"] = next_status
+            if next_status == "syncing":
+                syncing += 1
+            elif next_status == "synced":
+                synced += 1
+            normalized_routes.append(route)
+        self._save_and_reload(normalized_routes)
+        return {"total": len(normalized_routes), "syncing": syncing, "synced": synced}
+
+    def stop_all_routes(self) -> dict:
+        routes = self._load_routes_raw()
+        normalized_routes: list[dict] = []
+        for item in routes:
+            route = self._canonicalize_route_obj(item)
+            route["status"] = "deactive"
+            normalized_routes.append(route)
+        self._save_and_reload(normalized_routes)
+        return {"total": len(normalized_routes), "deactive": len(normalized_routes)}
 
     def list_channel_script_files(self) -> list[str]:
         return sorted(p.name for p in self.scripts_dir.glob("*.py") if p.is_file())
@@ -228,31 +268,63 @@ class ManagementApi:
         }
 
     def sync_stats_snapshot(self) -> dict:
-        queue_depth: int | None
+        status_counts = self.sync_ledger.get_status_counts() if self.sync_ledger is not None else {}
+        per_route, per_route_metrics = self._route_sync_stats_from_ledger()
+        # Snapshot path is synchronous and may be called from non-service threads (web admin handler).
+        # Avoid touching async queue clients here to prevent cross-event-loop failures; derive a stable estimate.
         if self.sync_queue is None:
             queue_depth = 0
         else:
-            queue_depth = None
-            try:
-                import asyncio
-
-                asyncio.get_running_loop()
-            except RuntimeError:
-                import asyncio
-
-                queue_depth = int(asyncio.run(self.sync_queue.depth()))
-        status_counts = self.sync_ledger.get_status_counts() if self.sync_ledger is not None else {}
+            queue_depth = int(status_counts.get("queued", 0) or 0)
         open_reviews = self.sync_ledger.open_review_count() if self.sync_ledger is not None else 0
         return {
-            "queue_depth": queue_depth,
+            "queue_depth": int(queue_depth),
             "open_reviews": int(open_reviews),
             "status_counts": status_counts,
+            "routes": per_route,
+            "route_metrics": per_route_metrics,
         }
 
-    async def sync_stats(self) -> dict:
+    async def sync_stats(self, *, include_source_probe: bool = False, source_probe_timeout_sec: float = 0.9) -> dict:
         status_counts = self.sync_ledger.get_status_counts() if self.sync_ledger is not None else {}
         queue_depth = await self.sync_queue.depth() if self.sync_queue is not None else 0
         open_reviews = self.sync_ledger.open_review_count() if self.sync_ledger is not None else 0
+        per_route, per_route_metrics = self._route_sync_stats_from_ledger()
+
+        if include_source_probe and self.sync_ledger is not None:
+            latest_func = getattr(self.source_client, "latest_message_id_for_route", None)
+            if callable(latest_func):
+                for route in self._load_routes_raw():
+                    name = str(route.get("name") or "").strip()
+                    if not name:
+                        continue
+                    fallback = per_route_metrics.get(name) or _build_route_sync_metrics({})
+                    try:
+                        latest = int(
+                            await asyncio.wait_for(
+                                latest_func(_route_dict_to_channel_route(route)),
+                                timeout=max(0.1, float(source_probe_timeout_sec)),
+                            )
+                        )
+                        checkpoint = int(self.sync_ledger.get_route_checkpoint(name) or 0)
+                        backfill_count = int(route.get("backfill_count", 100) or 100)
+                        per_route_metrics[name] = _build_route_sync_metrics_from_checkpoint(
+                            latest=latest,
+                            checkpoint=checkpoint,
+                            backfill_count=backfill_count,
+                            fallback=fallback,
+                        )
+                    except Exception:
+                        per_route_metrics[name] = fallback
+        return {
+            "queue_depth": int(queue_depth),
+            "open_reviews": int(open_reviews),
+            "status_counts": status_counts,
+            "routes": per_route,
+            "route_metrics": per_route_metrics,
+        }
+
+    def _route_sync_stats_from_ledger(self) -> tuple[dict[str, dict[str, int]], dict[str, dict[str, int | float]]]:
         per_route: dict[str, dict[str, int]] = {}
         per_route_metrics: dict[str, dict[str, int | float]] = {}
         for route in self._load_routes_raw():
@@ -265,13 +337,7 @@ class ManagementApi:
                 counts = self.sync_ledger.get_route_status_counts(name)
             per_route[name] = counts
             per_route_metrics[name] = _build_route_sync_metrics(counts)
-        return {
-            "queue_depth": int(queue_depth),
-            "open_reviews": int(open_reviews),
-            "status_counts": status_counts,
-            "routes": per_route,
-            "route_metrics": per_route_metrics,
-        }
+        return per_route, per_route_metrics
 
     def sync_review_list(self, *, limit: int = 50, only_open: bool = True) -> list[dict]:
         if self.sync_ledger is None:
@@ -324,8 +390,9 @@ class ManagementApi:
         self.on_routes_reloaded(registry)
 
     def _save_and_reload(self, routes: list[dict]) -> None:
+        cleaned = [self._canonicalize_route_obj(item) for item in routes if isinstance(item, dict)]
         with self._atomic_file_lock():
-            _atomic_dump_json(self.channels_path, routes)
+            _atomic_dump_json(self.channels_path, cleaned)
         self.reload_routes()
 
     def _load_routes_raw(self) -> list[dict]:
@@ -341,9 +408,26 @@ class ManagementApi:
     @staticmethod
     def _normalize_route_payload(obj: dict) -> dict:
         out = {k: v for k, v in dict(obj).items() if k in _ROUTE_KEYS or k == "script"}
+        if "enabled" in obj and "status" not in out:
+            out["status"] = "synced" if bool(obj.get("enabled")) else "deactive"
+        if "source_channel_username" not in out:
+            source_id_fallback = str(obj.get("source_channel_id") or "").strip()
+            if source_id_fallback:
+                out["source_channel_username"] = source_id_fallback
         if "channel_script" not in out and "script" in out:
             out["channel_script"] = out.get("script")
         out.pop("script", None)
+        out.pop("source_channel_id", None)
+        legacy_sync_obj = obj.get("sync")
+        if isinstance(legacy_sync_obj, dict):
+            if "backfill_count" not in out and "backfill_count" in legacy_sync_obj:
+                out["backfill_count"] = legacy_sync_obj.get("backfill_count")
+            if "interval_sec" not in out and "interval_sec" in legacy_sync_obj:
+                out["interval_sec"] = legacy_sync_obj.get("interval_sec")
+            if "batch_size" not in out and "batch_size" in legacy_sync_obj:
+                out["batch_size"] = legacy_sync_obj.get("batch_size")
+            if "retry_attempts" not in out and "retry_attempts" in legacy_sync_obj:
+                out["retry_attempts"] = legacy_sync_obj.get("retry_attempts")
         for key in ("channel_script", "gaurd_script"):
             if key not in out:
                 continue
@@ -352,7 +436,68 @@ class ManagementApi:
                 continue
             if isinstance(value, str) and not value.strip():
                 out[key] = None
+        if "status" in out:
+            normalized = str(out.get("status") or "").strip().lower()
+            if normalized not in {"deactive", "syncing", "synced"}:
+                raise ValueError("status must be one of: deactive, syncing, synced")
+            out["status"] = normalized
+        if "backfill_count" in out:
+            out["backfill_count"] = max(0, int(out.get("backfill_count") or 0))
+        if "interval_sec" in out:
+            out["interval_sec"] = max(1, int(out.get("interval_sec") or 1))
+        if "batch_size" in out:
+            out["batch_size"] = max(1, int(out.get("batch_size") or 1))
+        if "retry_attempts" in out:
+            out["retry_attempts"] = max(0, int(out.get("retry_attempts") or 0))
         return out
+
+    @staticmethod
+    def _canonicalize_route_obj(route: dict) -> dict:
+        obj = dict(route)
+        normalized = ManagementApi._normalize_route_payload(obj)
+        out = dict(obj)
+        out.update(normalized)
+        status = str(out.get("status") or "").strip().lower()
+        if status not in {"deactive", "syncing", "synced"}:
+            legacy_enabled = bool(out.get("enabled", True))
+            legacy_sync = out.get("sync") if isinstance(out.get("sync"), dict) else {}
+            if bool(legacy_sync.get("enabled", False)):
+                status = "syncing"
+            elif legacy_enabled:
+                status = "synced"
+            else:
+                status = "deactive"
+        out["status"] = status
+        out["backfill_count"] = max(0, int(out.get("backfill_count", 100) or 100))
+        out["interval_sec"] = max(1, int(out.get("interval_sec", 1) or 1))
+        out["batch_size"] = max(1, int(out.get("batch_size", 1) or 1))
+        out["retry_attempts"] = max(0, int(out.get("retry_attempts", 2) or 2))
+        out.pop("sync", None)
+        out.pop("enabled", None)
+        out.pop("source_channel_id", None)
+        return out
+
+    def _determine_start_status(self, route_name: str, route: dict) -> str:
+        pending = 0
+        remaining_from_ledger = 0
+        checkpoint = 0
+        if self.sync_ledger is not None:
+            pending = int(self.sync_ledger.active_count_for_route(route_name) or 0)
+            checkpoint = int(self.sync_ledger.get_route_checkpoint(route_name) or 0)
+            counts = self.sync_ledger.get_route_status_counts(route_name)
+            remaining_from_ledger = (
+                int(counts.get("queued", 0) or 0)
+                + int(counts.get("processing", 0) or 0)
+                + int(counts.get("failed", 0) or 0)
+                + int(counts.get("ambiguous", 0) or 0)
+            )
+        if pending > 0 or remaining_from_ledger > 0:
+            return "syncing"
+        # This method can run from the web-admin thread. Do not probe Telethon here:
+        # source client methods must run only on the service event loop.
+        if self.sync_ledger is None:
+            return "syncing"
+        return "synced" if checkpoint > 0 else "syncing"
 
     @contextmanager
     def _atomic_file_lock(self):
@@ -436,3 +581,53 @@ def _build_route_sync_metrics(counts: dict[str, int]) -> dict[str, int | float]:
         "failed": int(failed),
         "ambiguous": int(ambiguous),
     }
+
+
+def _build_route_sync_metrics_from_checkpoint(
+    *,
+    latest: int,
+    checkpoint: int,
+    backfill_count: int,
+    fallback: dict[str, int | float],
+) -> dict[str, int | float]:
+    latest_n = max(0, int(latest))
+    checkpoint_n = max(0, int(checkpoint))
+    backfill_n = max(0, int(backfill_count))
+    if latest_n <= 0:
+        return fallback
+
+    if backfill_n > 0:
+        window_start = max(0, latest_n - backfill_n)
+    else:
+        window_start = checkpoint_n
+    total_window = max(0, latest_n - window_start)
+    done = min(total_window, max(0, checkpoint_n - window_start))
+    remaining = max(0, total_window - done)
+    progress_pct = 100.0 if total_window <= 0 else round((done * 100.0) / total_window, 1)
+
+    out = dict(fallback)
+    out["total_seen"] = int(total_window)
+    out["done"] = int(done)
+    out["remaining_unsynced"] = int(remaining)
+    out["progress_pct"] = float(progress_pct)
+    return out
+
+
+def _route_dict_to_channel_route(route: dict) -> "ChannelRoute":
+    from kiwi.types import ChannelRoute
+
+    sync_obj = route.get("sync") if isinstance(route.get("sync"), dict) else {}
+    return ChannelRoute(
+        name=str(route.get("name") or ""),
+        status=str(route.get("status") or "deactive"),
+        source_channel_username=str(route.get("source_channel_username") or "") or None,
+        destination_channel_id=str(route.get("destination_channel_id") or "") or None,
+        destination_channel_username=str(route.get("destination_channel_username") or "") or None,
+        channel_script=str(route.get("channel_script") or "") or None,
+        max_message_mb=int(route.get("max_message_mb")) if route.get("max_message_mb") is not None else None,
+        gaurd_script=str(route.get("gaurd_script") or "") or None,
+        sync_backfill_count=max(0, int(route.get("backfill_count", sync_obj.get("backfill_count", 100)))),
+        sync_interval_sec=max(1, int(route.get("interval_sec", sync_obj.get("interval_sec", 1)))),
+        sync_batch_size=max(1, int(route.get("batch_size", sync_obj.get("batch_size", 1)))),
+        sync_retry_attempts=max(0, int(route.get("retry_attempts", sync_obj.get("retry_attempts", 2)))),
+    )

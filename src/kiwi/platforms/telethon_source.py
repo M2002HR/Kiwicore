@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import shutil
 from pathlib import Path
@@ -39,6 +40,63 @@ class TelethonSourceClient:
         self._resolve_last_warn_at: dict[str, float] = {}
         self._lock = asyncio.Lock()
 
+    @staticmethod
+    def _is_unresolvable_entity_error(exc: Exception) -> bool:
+        text = str(exc or "").strip().lower()
+        return ("unable to resolve source entity" in text) or ("could not find the input entity" in text)
+
+    def _cache_entity(self, source_key: str, entity: Any, *, channel_id: str | None = None) -> None:
+        key = str(source_key or "").strip()
+        if key:
+            self._entity_cache[key] = entity
+        normalized_channel_id = normalize_channel_id(channel_id)
+        if normalized_channel_id:
+            self._entity_cache[normalized_channel_id] = entity
+        try:
+            ent_id = int(getattr(entity, "id", 0) or 0)
+        except Exception:
+            ent_id = 0
+        if ent_id > 0:
+            self._entity_cache[f"-100{ent_id}"] = entity
+
+    async def _resolve_entity_from_dialogs(self, channel_id: int) -> Any | None:
+        if self._client is None:
+            return None
+        iter_dialogs = getattr(self._client, "iter_dialogs", None)
+        if not callable(iter_dialogs):
+            return None
+
+        async def _scan_dialogs(*, archived: bool | None = None) -> Any | None:
+            kwargs: dict[str, Any] = {"limit": 1000}
+            if archived is not None:
+                kwargs["archived"] = archived
+            async for dlg in iter_dialogs(**kwargs):
+                entity = getattr(dlg, "entity", None)
+                if entity is None:
+                    continue
+                try:
+                    ent_id = int(getattr(entity, "id", 0) or 0)
+                except Exception:
+                    continue
+                if ent_id == int(channel_id):
+                    return entity
+            return None
+
+        try:
+            resolved = await _scan_dialogs()
+            if resolved is not None:
+                return resolved
+            try:
+                resolved = await _scan_dialogs(archived=True)
+                if resolved is not None:
+                    return resolved
+            except TypeError:
+                # Older clients/fakes may not support the archived argument.
+                pass
+        except Exception:
+            return None
+        return None
+
     def route_source_key(self, route: ChannelRoute) -> str | None:
         return self._route_source_key(route)
 
@@ -51,8 +109,9 @@ class TelethonSourceClient:
         if current is None:
             self._last_message_id[key] = seeded
             return
-        # Keep the lower cursor so shared sources never skip messages for slower routes.
-        self._last_message_id[key] = min(int(current), seeded)
+        # Never rewind an already-advanced cursor; otherwise the same backfill window
+        # is replayed every loop and media-group buffers never settle.
+        self._last_message_id[key] = max(int(current), seeded)
 
     async def aclose(self) -> None:
         if self._client is None:
@@ -66,7 +125,7 @@ class TelethonSourceClient:
 
         sources: dict[str, tuple[str | None, str | None, list[str]]] = {}
         for route in routes:
-            if not route.enabled and not route.is_syncing():
+            if route.is_deactive():
                 continue
             source_key = self._route_source_key(route)
             if source_key is None:
@@ -78,7 +137,8 @@ class TelethonSourceClient:
                 names = list(existing[2])
                 if route.name not in names:
                     names.append(route.name)
-                sources[source_key] = (existing[0], existing[1], names)
+                channel_id = existing[1] or route.source_channel_id
+                sources[source_key] = (existing[0], channel_id, names)
 
         out: list[IncomingChannelMessage] = []
         for source_key, (username, channel_id, route_names) in sources.items():
@@ -117,8 +177,7 @@ class TelethonSourceClient:
                 self._resolve_retry_after.pop(source_key, None)
                 self._resolve_last_warn_at.pop(source_key, None)
             except Exception as exc:
-                err_text = str(exc)
-                if "Unable to resolve source entity" in err_text:
+                if self._is_unresolvable_entity_error(exc):
                     # Back off repeated resolution attempts for invalid/missing channels.
                     self._resolve_retry_after[source_key] = now + 300.0
                     last_warn_at = float(self._resolve_last_warn_at.get(source_key) or 0.0)
@@ -313,55 +372,118 @@ class TelethonSourceClient:
             session_file = Path(self.session_path)
             session_file.parent.mkdir(parents=True, exist_ok=True)
             proxy = _parse_proxy_url(self.proxy_url)
-            client = TelegramClient(str(session_file), self.api_id, self.api_hash, proxy=proxy)
-            await client.connect()
-            if not await client.is_user_authorized():
-                await client.disconnect()
-                raise RuntimeError(
-                    "Telethon session is not authorized. Run one-time login first and create the session file."
-                )
-            self._client = client
+            connect_errors: list[Exception] = []
+
+            async def _connect_once(proxy_config: object | None) -> Any:
+                client = TelegramClient(str(session_file), self.api_id, self.api_hash, proxy=proxy_config)
+                try:
+                    # Broken proxy paths can hang in reconnect loops; keep bootstrap bounded.
+                    await asyncio.wait_for(client.connect(), timeout=20.0)
+                    if not await asyncio.wait_for(client.is_user_authorized(), timeout=10.0):
+                        raise RuntimeError(
+                            "Telethon session is not authorized. Run one-time login first and create the session file."
+                        )
+                    return client
+                except Exception:
+                    with contextlib.suppress(Exception):
+                        await client.disconnect()
+                    raise
+
+            if proxy is not None:
+                try:
+                    self._client = await _connect_once(proxy)
+                    return
+                except Exception as exc:
+                    connect_errors.append(exc)
+                    logger.warning(
+                        "Telethon proxy connection failed; retrying without proxy",
+                        extra={
+                            "details": {
+                                "proxy_url": self.proxy_url,
+                                "fallback": "direct_connection",
+                                "error": str(exc),
+                            }
+                        },
+                    )
+
+            try:
+                self._client = await _connect_once(None)
+                return
+            except Exception as direct_exc:
+                if connect_errors:
+                    raise RuntimeError(
+                        "Failed to connect Telethon client via configured proxy and direct connection"
+                    ) from direct_exc
+                raise
 
     async def _resolve_entity(self, source_key: str, *, username: str | None, channel_id: str | None) -> Any:
         if source_key in self._entity_cache:
             return self._entity_cache[source_key]
         assert self._client is not None
+        resolve_errors: list[Exception] = []
+
+        normalized_channel_id = normalize_channel_id(channel_id)
+        if normalized_channel_id and normalized_channel_id in self._entity_cache:
+            return self._entity_cache[normalized_channel_id]
 
         candidate = normalize_channel_username(username) or source_key
         try:
             entity = await self._client.get_entity(candidate)
-            self._entity_cache[source_key] = entity
+            self._cache_entity(source_key, entity, channel_id=channel_id)
             logger.debug(
                 "Telethon source resolved via username/source_key",
                 extra={"details": {"source_key": source_key, "resolve_strategy": "username_or_source_key"}},
             )
             return entity
-        except Exception:
+        except Exception as exc:
+            resolve_errors.append(exc)
             pass
 
-        if channel_id:
-            normalized = normalize_channel_id(channel_id)
-            if normalized:
-                # Telegram channel ids are stored as -100<channel_id>; resolve via PeerChannel first.
-                if normalized.startswith("-100") and normalized[4:].isdigit():
+        if normalized_channel_id:
+            normalized = normalized_channel_id
+            # Telegram channel ids are stored as -100<channel_id>; resolve via PeerChannel first.
+            if normalized.startswith("-100") and normalized[4:].isdigit():
+                try:
+                    from telethon.tl.types import PeerChannel  # type: ignore[import-not-found]
+                except Exception:
+                    class PeerChannel:  # type: ignore[no-redef]
+                        def __init__(self, channel_id: int) -> None:
+                            self.channel_id = int(channel_id)
+
+                        def __repr__(self) -> str:
+                            return f"PeerChannel(channel_id={self.channel_id})"
+
+                        __str__ = __repr__
+
+                cid_int = int(normalized[4:])
+                dialog_entity = await self._resolve_entity_from_dialogs(cid_int)
+                if dialog_entity is not None:
+                    self._cache_entity(source_key, dialog_entity, channel_id=normalized)
+                    logger.debug(
+                        "Telethon source resolved via dialog scan",
+                        extra={
+                            "details": {
+                                "source_key": source_key,
+                                "route_channel_id": channel_id,
+                                "resolve_strategy": "dialog_scan_by_channel_id",
+                            }
+                        },
+                    )
+                    return dialog_entity
+                try:
+                    entity = await self._client.get_entity(PeerChannel(cid_int))
+                except Exception as exc_peer:
+                    resolve_errors.append(exc_peer)
                     try:
-                        from telethon.tl.types import PeerChannel  # type: ignore[import-not-found]
-                    except Exception:
-                        class PeerChannel:  # type: ignore[no-redef]
-                            def __init__(self, channel_id: int) -> None:
-                                self.channel_id = int(channel_id)
-
-                            def __repr__(self) -> str:
-                                return f"PeerChannel(channel_id={self.channel_id})"
-
-                            __str__ = __repr__
-
-                    cid_int = int(normalized[4:])
-                    try:
-                        entity = await self._client.get_entity(PeerChannel(cid_int))
-                    except Exception:
                         entity = await self._client.get_entity(cid_int)
-                    self._entity_cache[source_key] = entity
+                    except Exception as exc_numeric:
+                        resolve_errors.append(exc_numeric)
+                        entity = None
+                if entity is None:
+                    # Continue to source_key fallback before failing.
+                    pass
+                else:
+                    self._cache_entity(source_key, entity, channel_id=normalized)
                     logger.debug(
                         "Telethon source resolved via route channel_id",
                         extra={
@@ -374,10 +496,25 @@ class TelethonSourceClient:
                     )
                     return entity
 
-                if normalized.lstrip("-").isdigit():
-                    cid_int = int(normalized)
+            if normalized.lstrip("-").isdigit():
+                cid_int = int(normalized)
+                dialog_entity = await self._resolve_entity_from_dialogs(cid_int)
+                if dialog_entity is not None:
+                    self._cache_entity(source_key, dialog_entity, channel_id=normalized)
+                    logger.debug(
+                        "Telethon source resolved via dialog scan",
+                        extra={
+                            "details": {
+                                "source_key": source_key,
+                                "route_channel_id": channel_id,
+                                "resolve_strategy": "dialog_scan_by_numeric_route_id",
+                            }
+                        },
+                    )
+                    return dialog_entity
+                try:
                     entity = await self._client.get_entity(cid_int)
-                    self._entity_cache[source_key] = entity
+                    self._cache_entity(source_key, entity, channel_id=normalized)
                     logger.debug(
                         "Telethon source resolved via numeric route id",
                         extra={
@@ -389,21 +526,39 @@ class TelethonSourceClient:
                         },
                     )
                     return entity
+                except Exception as exc:
+                    resolve_errors.append(exc)
 
         # As a fallback, try source key as numeric channel id.
         stripped = source_key
         if stripped.startswith("-100"):
             stripped = stripped[4:]
         if stripped.lstrip("-").isdigit():
-            entity = await self._client.get_entity(int(stripped))
-            self._entity_cache[source_key] = entity
-            logger.debug(
-                "Telethon source resolved via numeric source_key",
-                extra={"details": {"source_key": source_key, "resolve_strategy": "numeric_source_key"}},
-            )
-            return entity
+            cid_int = int(stripped)
+            dialog_entity = await self._resolve_entity_from_dialogs(cid_int)
+            if dialog_entity is not None:
+                self._cache_entity(source_key, dialog_entity, channel_id=f"-100{cid_int}")
+                logger.debug(
+                    "Telethon source resolved via dialog scan",
+                    extra={"details": {"source_key": source_key, "resolve_strategy": "dialog_scan_by_source_key"}},
+                )
+                return dialog_entity
+            try:
+                entity = await self._client.get_entity(cid_int)
+                self._cache_entity(source_key, entity, channel_id=f"-100{cid_int}")
+                logger.debug(
+                    "Telethon source resolved via numeric source_key",
+                    extra={"details": {"source_key": source_key, "resolve_strategy": "numeric_source_key"}},
+                )
+                return entity
+            except Exception as exc:
+                resolve_errors.append(exc)
 
-        raise ValueError(f"Unable to resolve source entity for source_key={source_key}")
+        last_error = resolve_errors[-1] if resolve_errors else None
+        suffix = f" channel_id={normalized_channel_id}" if normalized_channel_id else ""
+        if last_error is None:
+            raise ValueError(f"Unable to resolve source entity for source_key={source_key}{suffix}")
+        raise ValueError(f"Unable to resolve source entity for source_key={source_key}{suffix}") from last_error
 
     async def _to_incoming(
         self,
@@ -496,10 +651,10 @@ class TelethonSourceClient:
         lowered = raw_username.lower()
         if lowered.startswith("https://t.me/") or lowered.startswith("http://t.me/") or lowered.startswith("t.me/"):
             return raw_username
-        if route.source_channel_id:
-            return normalize_channel_id(route.source_channel_id)
         if route.source_channel_username:
             return normalize_channel_username(route.source_channel_username)
+        if route.source_channel_id:
+            return normalize_channel_id(route.source_channel_id)
         return None
 
 

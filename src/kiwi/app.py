@@ -69,6 +69,7 @@ async def build_service(env_file: str = ".env") -> KiwiService:
         gaurd_scripts_dir=settings.gaurd_scripts_dir,
         sync_ledger=sync_ledger,
         sync_queue=sync_queue,
+        source_client=telethon_source_client,
         on_routes_reloaded=service.set_routes,
     )
     service.set_route_patch_callback(management_api.update_route)

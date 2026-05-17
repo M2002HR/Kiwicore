@@ -74,6 +74,20 @@ class _FakeTelethonClient:
         return _gen()
 
 
+class _Dialog:
+    def __init__(self, entity) -> None:
+        self.entity = entity
+
+
+class _DialogEntity:
+    def __init__(self, channel_id: int, key: str) -> None:
+        self.id = int(channel_id)
+        self._key = key
+
+    def __str__(self) -> str:
+        return self._key
+
+
 def _route() -> ChannelRoute:
     return ChannelRoute(
         name="r1",
@@ -168,3 +182,75 @@ def test_poll_messages_can_resolve_via_source_channel_id() -> None:
     fake.history_by_entity["PeerChannel(channel_id=555)"].append(_Msg(12, "z"))
     second = asyncio.run(source.poll_messages([route]))
     assert [item.message_id for item in second] == [12]
+
+
+def test_poll_messages_resolves_channel_id_via_dialog_scan_when_get_entity_fails() -> None:
+    class _DialogFallbackFake(_FakeTelethonClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self._entity = _DialogEntity(555, "dialog_entity_555")
+
+        async def get_entity(self, entity):
+            raise ValueError(f"not resolvable: {entity}")
+
+        def iter_dialogs(self, limit=1000, archived=None):  # noqa: ARG002
+            async def _gen():
+                yield _Dialog(self._entity)
+
+            return _gen()
+
+    source = TelethonSourceClient(api_id=1, api_hash="x", session_path="./tmp.session")
+    fake = _DialogFallbackFake()
+    fake.history_by_entity["dialog_entity_555"] = [_Msg(10, "x"), _Msg(11, "y")]
+    source._client = fake  # noqa: SLF001
+    source._ensure_connected = lambda: asyncio.sleep(0)  # type: ignore[method-assign]  # noqa: SLF001
+
+    route = ChannelRoute(
+        name="r-id-dialog",
+        enabled=True,
+        source_channel_id="-100555",
+        source_channel_username=None,
+        destination_channel_id="-2001",
+        destination_channel_username=None,
+        channel_script="default_channel_script.py",
+        max_message_mb=50,
+        sync_enabled=True,
+        sync_status="syncing",
+        sync_seeded=True,
+    )
+
+    first = asyncio.run(source.poll_messages([route]))
+    assert first == []
+    fake.history_by_entity["dialog_entity_555"].append(_Msg(12, "z"))
+    second = asyncio.run(source.poll_messages([route]))
+    assert [item.message_id for item in second] == [12]
+
+
+def test_latest_message_id_reports_standard_unresolvable_entity_error() -> None:
+    class _UnresolvableFake(_FakeTelethonClient):
+        async def get_entity(self, entity):
+            raise ValueError(f"Could not find the input entity for {entity}")
+
+    source = TelethonSourceClient(api_id=1, api_hash="x", session_path="./tmp.session")
+    source._client = _UnresolvableFake()  # noqa: SLF001
+    source._ensure_connected = lambda: asyncio.sleep(0)  # type: ignore[method-assign]  # noqa: SLF001
+
+    route = ChannelRoute(
+        name="r-unresolvable",
+        enabled=True,
+        source_channel_id="-100777",
+        source_channel_username=None,
+        destination_channel_id="-2001",
+        destination_channel_username=None,
+        channel_script="default_channel_script.py",
+        max_message_mb=50,
+        sync_enabled=True,
+        sync_status="syncing",
+        sync_seeded=True,
+    )
+
+    try:
+        asyncio.run(source.latest_message_id_for_route(route))
+        raise AssertionError("expected ValueError")
+    except ValueError as exc:
+        assert "Unable to resolve source entity" in str(exc)

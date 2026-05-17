@@ -252,12 +252,13 @@ class AdminBotHandler:
         if flow == "route_add_source_type":
             flow_data = dict(session.get("flow_data") or {})
             new_route = dict(flow_data.get("new_route") or {})
-            if text == BTN_SRC_ID:
-                new_route["_source_field"] = "source_channel_id"
-            elif text == BTN_SRC_USER:
+            if text == BTN_SRC_USER:
+                new_route["_source_field"] = "source_channel_username"
+            elif text == BTN_SRC_ID:
+                # Stored in username field for normalized config schema.
                 new_route["_source_field"] = "source_channel_username"
             else:
-                return AdminBotResponse("از دکمه‌های نوع مبدا استفاده کن.", self._source_type_keyboard())
+                return AdminBotResponse("از دکمه‌های مبدا استفاده کن.", self._source_type_keyboard())
             flow_data["new_route"] = new_route
             self.admin_store.set_flow(inbound.user_id, "route_add_source_value", flow_data)
             return AdminBotResponse("مقدار مبدا را بفرست.", self._cancel_keyboard())
@@ -340,28 +341,26 @@ class AdminBotHandler:
             flow_data = dict(session.get("flow_data") or {})
             new_route = dict(flow_data.get("new_route") or {})
             if text == BTN_ENABLED_ON:
-                new_route["enabled"] = True
+                new_route["status"] = "synced"
             elif text == BTN_ENABLED_OFF:
-                new_route["enabled"] = False
+                new_route["status"] = "deactive"
             else:
                 return AdminBotResponse("وضعیت معتبر انتخاب کن.", self._enabled_keyboard())
-
-            flow_data["new_route"] = new_route
-            self.admin_store.set_flow(inbound.user_id, "route_add_sync_enabled", flow_data)
-            return AdminBotResponse("برای این مسیر سینک زمان‌بندی‌شده می‌خواهی؟", self._sync_toggle_keyboard())
+            new_route["backfill_count"] = max(0, int(new_route.get("backfill_count", 100) or 100))
+            new_route["interval_sec"] = max(1, int(new_route.get("interval_sec", 1) or 1))
+            new_route["batch_size"] = max(1, int(new_route.get("batch_size", 1) or 1))
+            new_route["retry_attempts"] = max(0, int(new_route.get("retry_attempts", 2) or 2))
+            return self._finalize_route_add(inbound.user_id, new_route)
 
         if flow == "route_add_sync_enabled":
             flow_data = dict(session.get("flow_data") or {})
             new_route = dict(flow_data.get("new_route") or {})
             if text == BTN_SYNC_OFF:
                 new_route["sync"] = {
-                    "enabled": False,
-                    "status": "active",
                     "backfill_count": 100,
-                    "interval_sec": 300,
+                    "interval_sec": 1,
                     "batch_size": 1,
                     "retry_attempts": 2,
-                    "seeded": False,
                 }
                 return self._finalize_route_add(inbound.user_id, new_route)
 
@@ -369,14 +368,12 @@ class AdminBotHandler:
                 return AdminBotResponse("از دکمه‌های سینک استفاده کن.", self._sync_toggle_keyboard())
 
             new_route["sync"] = {
-                "enabled": True,
-                "status": "syncing",
                 "backfill_count": 100,
-                "interval_sec": 300,
+                "interval_sec": 1,
                 "batch_size": 1,
                 "retry_attempts": 2,
-                "seeded": False,
             }
+            new_route["status"] = "syncing"
             flow_data["new_route"] = new_route
             self.admin_store.set_flow(inbound.user_id, "route_add_sync_backfill", flow_data)
             return AdminBotResponse("چند پیام آخر برای سینک اولیه در نظر گرفته شود؟ (مثلا 100)", self._cancel_keyboard())
@@ -468,9 +465,9 @@ class AdminBotHandler:
                 self.admin_store.set_flow(inbound.user_id, "route_edit_dest_value", flow_data)
                 return AdminBotResponse("یوزرنیم مقصد جدید را بفرست (مثل @my_channel).", self._cancel_keyboard())
             if text == BTN_EDIT_SRC_ID:
-                flow_data["field"] = "source_channel_id"
+                flow_data["field"] = "source_channel_username"
                 self.admin_store.set_flow(inbound.user_id, "route_edit_source_value", flow_data)
-                return AdminBotResponse("شناسه مبدا جدید را بفرست.", self._cancel_keyboard())
+                return AdminBotResponse("شناسه/یوزرنیم مبدا جدید را بفرست.", self._cancel_keyboard())
             if text == BTN_EDIT_SRC_USER:
                 flow_data["field"] = "source_channel_username"
                 self.admin_store.set_flow(inbound.user_id, "route_edit_source_value", flow_data)
@@ -478,9 +475,8 @@ class AdminBotHandler:
             if text == BTN_EDIT_SYNC_START:
                 updated = self.management_api.start_route_sync(route_name)
                 self.admin_store.set_flow(inbound.user_id, None, {})
-                sync = updated.get("sync") if isinstance(updated.get("sync"), dict) else {}
                 return AdminBotResponse(
-                    f"سینک مسیر شروع شد. status={sync.get('status') or 'syncing'}",
+                    f"سینک مسیر شروع شد. status={updated.get('status') or 'syncing'}",
                     self._main_menu_keyboard(),
                 )
             if text == BTN_EDIT_SYNC_STOP:
@@ -554,12 +550,12 @@ class AdminBotHandler:
             if not route_name:
                 raise ValueError("اطلاعات ویرایش ناقص است")
             if text == BTN_ENABLED_ON:
-                value = True
+                value = "synced"
             elif text == BTN_ENABLED_OFF:
-                value = False
+                value = "deactive"
             else:
                 return AdminBotResponse("وضعیت معتبر انتخاب کن.", self._enabled_keyboard())
-            self.management_api.update_route(route_name, {"enabled": value})
+            self.management_api.update_route(route_name, {"status": value})
             self.admin_store.set_flow(inbound.user_id, None, {})
             return AdminBotResponse("وضعیت مسیر ویرایش شد.", self._main_menu_keyboard())
 
@@ -577,7 +573,7 @@ class AdminBotHandler:
             flow_data = dict(session.get("flow_data") or {})
             route_name = str(flow_data.get("route_name") or "")
             field = str(flow_data.get("field") or "")
-            if not route_name or field not in {"source_channel_id", "source_channel_username"}:
+            if not route_name or field not in {"source_channel_username"}:
                 raise ValueError("اطلاعات ویرایش مبدا ناقص است")
             self.management_api.update_route(route_name, {field: text.strip()})
             self.admin_store.set_flow(inbound.user_id, None, {})
@@ -594,21 +590,18 @@ class AdminBotHandler:
             except Exception as exc:
                 raise ValueError("عدد معتبر وارد کن") from exc
 
-            route = self.management_api.get_route(route_name)
-            sync_obj = route.get("sync") if isinstance(route.get("sync"), dict) else {}
             if field == "sync_backfill_count":
-                sync_obj["backfill_count"] = max(0, value)
-                sync_obj["seeded"] = False
+                patch = {"backfill_count": max(0, value)}
             elif field == "sync_interval_sec":
-                sync_obj["interval_sec"] = max(1, value)
+                patch = {"interval_sec": max(1, value)}
             elif field == "sync_batch_size":
-                sync_obj["batch_size"] = max(1, value)
+                patch = {"batch_size": max(1, value)}
             elif field == "sync_retry_attempts":
-                sync_obj["retry_attempts"] = max(0, value)
+                patch = {"retry_attempts": max(0, value)}
             else:
                 raise ValueError("فیلد سینک نامعتبر است")
 
-            self.management_api.update_route(route_name, {"sync": sync_obj})
+            self.management_api.update_route(route_name, patch)
             self.admin_store.set_flow(inbound.user_id, None, {})
             return AdminBotResponse("تنظیمات سینک مسیر ذخیره شد.", self._main_menu_keyboard())
 
@@ -618,25 +611,21 @@ class AdminBotHandler:
     def _finalize_route_add(self, user_id: str, new_route: dict) -> AdminBotResponse:
         new_route.pop("_source_field", None)
         new_route.pop("_dest_field", None)
-        if not isinstance(new_route.get("sync"), dict):
-            new_route["sync"] = {
-                "enabled": False,
-                "status": "active",
-                "backfill_count": 100,
-                "interval_sec": 300,
-                "batch_size": 1,
-                "retry_attempts": 2,
-                "seeded": False,
-            }
+        if not str(new_route.get("status") or "").strip():
+            new_route["status"] = "synced"
+        new_route.pop("sync", None)
+        new_route["backfill_count"] = max(0, int(new_route.get("backfill_count", 100) or 100))
+        new_route["interval_sec"] = max(1, int(new_route.get("interval_sec", 1) or 1))
+        new_route["batch_size"] = max(1, int(new_route.get("batch_size", 1) or 1))
+        new_route["retry_attempts"] = max(0, int(new_route.get("retry_attempts", 2) or 2))
         self.management_api.add_route(new_route)
         self.admin_store.set_flow(user_id, None, {})
-        sync_obj = new_route.get("sync") if isinstance(new_route.get("sync"), dict) else {}
-        if bool(sync_obj.get("enabled", False)):
+        if str(new_route.get("status") or "").strip().lower() == "syncing":
             return AdminBotResponse(
                 f"مسیر «{new_route.get('name')}» اضافه شد و سینک روی حالت syncing فعال شد.",
                 self._main_menu_keyboard(),
             )
-        return AdminBotResponse(f"مسیر «{new_route.get('name')}» اضافه شد و فعال گردید.", self._main_menu_keyboard())
+        return AdminBotResponse(f"مسیر «{new_route.get('name')}» اضافه شد.", self._main_menu_keyboard())
 
     def _handle_command(self, inbound: AdminInboundMessage, text: str) -> AdminBotResponse:
         if text.startswith("/start"):
@@ -708,10 +697,9 @@ class AdminBotHandler:
         if text.startswith("/route_enable"):
             parts = text.split(maxsplit=2)
             if len(parts) != 3:
-                return AdminBotResponse("فرمت درست:\n/route_enable <route_name> <true|false>", self._main_menu_keyboard())
-            enabled = parts[2].strip().lower() in {"1", "true", "yes", "on"}
-            route = self.management_api.set_route_enabled(parts[1].strip(), enabled)
-            return AdminBotResponse(f"وضعیت مسیر {route.get('name')} -> {enabled}", self._main_menu_keyboard())
+                return AdminBotResponse("فرمت درست:\n/route_enable <route_name> <deactive|syncing|synced>", self._main_menu_keyboard())
+            route = self.management_api.set_route_status(parts[1].strip(), parts[2].strip())
+            return AdminBotResponse(f"وضعیت مسیر {route.get('name')} -> {route.get('status')}", self._main_menu_keyboard())
         if text.startswith("/reload_routes"):
             self.management_api.reload_routes()
             return AdminBotResponse("ریلود شد.", self._main_menu_keyboard())
@@ -763,21 +751,22 @@ class AdminBotHandler:
             return "هیچ مسیری ثبت نشده.\nبرای شروع روی «➕ افزودن مسیر» بزن."
         lines = ["📋 مسیرهای ثبت‌شده:"]
         for idx, r in enumerate(routes, start=1):
-            sync_obj = r.get("sync") if isinstance(r.get("sync"), dict) else {}
-            sync_enabled = bool(sync_obj.get("enabled", False))
-            sync_status = str(sync_obj.get("status", "active"))
+            route_status = str(r.get("status") or "deactive")
             sync_pending = 0
             if self.management_api.sync_ledger is not None:
                 sync_pending = self.management_api.sync_ledger.active_count_for_route(str(r.get("name") or ""))
-            enabled_icon = "✅" if bool(r.get("enabled", True)) else "⛔"
+            status_icon = "🟢" if route_status == "synced" else ("🟡" if route_status == "syncing" else "🔴")
+            status_text = "✅" if route_status == "synced" else ("♻️" if route_status == "syncing" else "⛔")
             max_mb_text = str(r.get("max_message_mb")) if r.get("max_message_mb") is not None else "نامحدود"
-            lines.append(f"{idx}) {enabled_icon} {r.get('name', '-')}")
-            lines.append(f"مبدا: {r.get('source_channel_username') or r.get('source_channel_id')}")
+            lines.append(f"{idx}) {status_icon}{status_text} {r.get('name', '-')}")
+            lines.append(f"مبدا: {r.get('source_channel_username') or '-'}")
             lines.append(f"مقصد: {r.get('destination_channel_username') or r.get('destination_channel_id')}")
             lines.append(f"اسکریپت کانال: {r.get('channel_script') or 'ندارد'}")
             lines.append(f"گارد: {r.get('gaurd_script') or 'ندارد'}")
             lines.append(f"حداکثر حجم: {max_mb_text} MB")
-            lines.append(f"سینک: {sync_status if sync_enabled else 'off'} | pending={sync_pending}")
+            lines.append(
+                f"وضعیت: {route_status} | pending={sync_pending} | backfill={int(r.get('backfill_count', 0) or 0)}"
+            )
             lines.append("────────")
         return "\n".join(lines)
 
@@ -793,7 +782,7 @@ class AdminBotHandler:
             "/route_add <json>\n"
             "/route_update <name> <json_patch>\n"
             "/route_delete <name>\n"
-            "/route_enable <name> <true|false>\n"
+            "/route_enable <name> <deactive|syncing|synced>\n"
             "/reload_routes\n"
             "/sync_stats\n"
             "/sync_review [open|all] [limit]\n"
@@ -814,7 +803,12 @@ class AdminBotHandler:
     def _coerce_field_value(field: str, value: str):
         val = value.strip()
         if field == "enabled":
-            return val.lower() in {"1", "true", "yes", "on", "فعال", "✅"}
+            return "synced" if val.lower() in {"1", "true", "yes", "on", "فعال", "✅"} else "deactive"
+        if field == "status":
+            normalized = val.lower()
+            if normalized not in {"deactive", "syncing", "synced"}:
+                raise ValueError("status must be one of deactive|syncing|synced")
+            return normalized
         if field == "max_message_mb":
             if val in {"", "none", "null", "نامحدود", "-"}:
                 return None

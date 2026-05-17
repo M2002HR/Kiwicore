@@ -324,6 +324,35 @@ def test_football_script_non_photo_without_caption_passthroughs_without_ai(tmp_p
     assert out == [{"type": "video", "path": "a.mp4"}]
 
 
+def test_football_script_fail_open_keeps_all_album_media_and_caption_when_ai_unavailable(
+    tmp_path: Path, monkeypatch
+) -> None:
+    mod = _load_module()
+    monkeypatch.setenv("CHANNEL_SCRIPT_AI_ENABLED", "true")
+    monkeypatch.setenv("CHANNEL_SCRIPT_AI_MANDATORY", "true")
+    monkeypatch.setenv("CHANNEL_SCRIPT_AI_FAIL_OPEN", "true")
+    monkeypatch.setenv("CHANNEL_SCRIPT_AI_ENDPOINT", "http://fake.local/proxy/gemini")
+
+    def fake_call(*, endpoint: str, body: dict, timeout_sec: float):
+        return None
+
+    monkeypatch.setattr(mod, "_call_gemini_text", fake_call)
+
+    payload = {
+        "route": {"destination_target": "@dest"},
+        "message": {"caption": "ngl you probably need the full collection 💚"},
+        "inputs": [
+            {"kind": "photo", "local_name": "photo_1"},
+            {"kind": "photo", "local_name": "photo_2"},
+            {"kind": "photo", "local_name": "photo_3"},
+        ],
+    }
+
+    out = mod.build_messages(payload, input_dir=tmp_path)
+    assert [item.get("path") for item in out] == ["photo_1", "photo_2", "photo_3"]
+    assert str(out[0].get("caption") or "").strip() == "ngl you probably need the full collection 💚"
+
+
 def test_football_script_builds_prompt_even_when_ai_is_disabled(tmp_path: Path, monkeypatch) -> None:
     mod = _load_module()
     monkeypatch.setenv("CHANNEL_SCRIPT_AI_ENABLED", "false")
@@ -384,3 +413,71 @@ def test_football_script_mandatory_mode_skips_empty_source_message(tmp_path: Pat
     }
     out = mod.build_messages(payload, input_dir=tmp_path)
     assert out == []
+
+
+def test_football_script_keeps_short_persian_caption_with_destination_signature_in_mandatory_mode(
+    tmp_path: Path, monkeypatch
+) -> None:
+    mod = _load_module()
+    monkeypatch.setenv("CHANNEL_SCRIPT_AI_ENABLED", "true")
+    monkeypatch.setenv("CHANNEL_SCRIPT_AI_MANDATORY", "true")
+    monkeypatch.setenv("CHANNEL_SCRIPT_AI_FAIL_OPEN", "true")
+    monkeypatch.setenv("CHANNEL_SCRIPT_AI_ENDPOINT", "http://fake.local/proxy/gemini")
+
+    def fake_call(*, endpoint: str, body: dict, timeout_sec: float):
+        return "برد خوب تیم\n@dest"
+
+    monkeypatch.setattr(mod, "_call_gemini_text", fake_call)
+    payload = {
+        "route": {"destination_target": "@dest"},
+        "message": {"caption": "raw source caption"},
+        "inputs": [{"kind": "photo", "local_name": "photo_1"}, {"kind": "photo", "local_name": "photo_2"}],
+    }
+    out = mod.build_messages(payload, input_dir=tmp_path)
+    assert out[0].get("caption") == "برد خوب تیم\n@dest"
+    assert [item.get("path") for item in out] == ["photo_1", "photo_2"]
+
+
+def test_football_script_fail_open_keeps_persian_caption_with_destination_signature(
+    tmp_path: Path, monkeypatch
+) -> None:
+    mod = _load_module()
+    monkeypatch.setenv("CHANNEL_SCRIPT_AI_ENABLED", "true")
+    monkeypatch.setenv("CHANNEL_SCRIPT_AI_MANDATORY", "true")
+    monkeypatch.setenv("CHANNEL_SCRIPT_AI_FAIL_OPEN", "true")
+    monkeypatch.setenv("CHANNEL_SCRIPT_AI_ENDPOINT", "http://fake.local/proxy/gemini")
+
+    def fake_call(*, endpoint: str, body: dict, timeout_sec: float):
+        return None
+
+    monkeypatch.setattr(mod, "_call_gemini_text", fake_call)
+    payload = {
+        "route": {"destination_target": "@dest"},
+        "message": {"caption": "برد خوب تیم\n@dest"},
+        "inputs": [{"kind": "photo", "local_name": "photo_1"}],
+    }
+    out = mod.build_messages(payload, input_dir=tmp_path)
+    assert out[0].get("caption") == "برد خوب تیم\n@dest"
+
+
+def test_football_script_fail_open_keeps_non_persian_caption_to_prevent_data_loss(
+    tmp_path: Path, monkeypatch
+) -> None:
+    mod = _load_module()
+    monkeypatch.setenv("CHANNEL_SCRIPT_AI_ENABLED", "true")
+    monkeypatch.setenv("CHANNEL_SCRIPT_AI_MANDATORY", "true")
+    monkeypatch.setenv("CHANNEL_SCRIPT_AI_FAIL_OPEN", "true")
+    monkeypatch.setenv("CHANNEL_SCRIPT_AI_ENDPOINT", "http://fake.local/proxy/gemini")
+
+    def fake_call(*, endpoint: str, body: dict, timeout_sec: float):
+        return None
+
+    monkeypatch.setattr(mod, "_call_gemini_text", fake_call)
+    payload = {
+        "route": {"destination_target": "@dest"},
+        "message": {"caption": "Fabinho says Neymar is still Brazil's most talented player."},
+        "inputs": [{"kind": "photo", "local_name": "photo_1"}, {"kind": "photo", "local_name": "photo_2"}],
+    }
+    out = mod.build_messages(payload, input_dir=tmp_path)
+    assert [item.get("path") for item in out] == ["photo_1", "photo_2"]
+    assert out[0].get("caption") == "Fabinho says Neymar is still Brazil's most talented player."

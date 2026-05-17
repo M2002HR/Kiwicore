@@ -24,6 +24,9 @@ PROMPT_LEAK_RE = re.compile(
     r"(professional persian football content writer|raw text|captions|ready-to-publish|rules|translation|rewrite)",
     re.IGNORECASE,
 )
+URL_RE = re.compile(r"(https?://\S+|www\.\S+|t\.me/\S+|telegram\.me/\S+)", re.IGNORECASE)
+MENTION_RE = re.compile(r"(?<!\w)@[A-Za-z0-9_]{3,}(?!\w)")
+HASHTAG_RE = re.compile(r"(?<!\w)#[\w_]+")
 MEDIA_OUTPUT_TYPES = {"photo", "video", "voice", "audio", "document", "animation", "video_note"}
 EMOJI_JOINER = "\u200d"
 EMOJI_VARIATION = "\ufe0f"
@@ -213,6 +216,120 @@ def _has_textual_source(payload: dict) -> bool:
     text = str(message.get("text") or "").strip()
     caption = str(message.get("caption") or "").strip()
     return bool(text or caption)
+
+
+def _is_promotional_text(text: str) -> bool:
+    combined = str(text or "").strip().lower()
+    if not combined:
+        return False
+    has_link = bool(re.search(r"(https?://|t\.me/|telegram\.me/|bit\.ly/)", combined))
+    has_handle = bool(re.search(r"(^|\s)@\w{3,}", combined))
+    cta_terms = (
+        "buy now",
+        "shop now",
+        "order now",
+        "join",
+        "join now",
+        "register",
+        "sign up",
+        "subscribe",
+        "don't miss",
+        "don’t miss",
+        "deal",
+        "vip",
+        "exclusive",
+        "خرید",
+        "ثبت نام",
+        "عضویت",
+        "فرصت",
+        "همین حالا",
+        "ویژه",
+    )
+    cta_hits = sum(1 for token in cta_terms if token in combined)
+
+    promo_terms = (
+        "#ad",
+        "sponsored",
+        "affiliate",
+        "referral",
+        "تبلیغ",
+        "اسپانسر",
+        "پروموشن",
+        "سیگنال",
+        "signal",
+        "signals",
+        "profit",
+        "profit margin",
+        "100%",
+        "100 %",
+        "high throughput",
+        "win rate",
+        "crypto signal",
+        "forex",
+        "trading",
+        "premium channel",
+        "community",
+        "سود",
+        "درصد سود",
+        "وین ریت",
+    )
+    promo_hits = sum(1 for token in promo_terms if token in combined)
+
+    if promo_hits >= 2 and (has_link or has_handle):
+        return True
+    if promo_hits >= 3:
+        return True
+    if cta_hits >= 3 and (has_link or has_handle):
+        return True
+    return False
+
+
+def _is_promotional_payload(payload: dict) -> bool:
+    message = payload.get("message")
+    if not isinstance(message, dict):
+        return False
+    text = str(message.get("text") or "").strip()
+    caption = str(message.get("caption") or "").strip()
+    combined = "\n".join([text, caption]).strip()
+    return _is_promotional_text(combined)
+
+
+def _is_promotional_messages(messages: list[dict]) -> bool:
+    for item in messages:
+        if not isinstance(item, dict):
+            continue
+        text = str(item.get("text") or "").strip()
+        caption = str(item.get("caption") or "").strip()
+        if text and _is_promotional_text(text):
+            return True
+        if caption and _is_promotional_text(caption):
+            return True
+    return False
+
+
+def _safe_fail_open_messages(base: list[dict], *, destination: str = "") -> list[dict]:
+    # Fail-open mode must keep transfer continuity.
+    # Only block clear promotional content; do not drop non-Persian captions/text.
+    out: list[dict] = []
+    for item in base:
+        if not isinstance(item, dict):
+            continue
+        obj = dict(item)
+        msg_type = str(obj.get("type") or "").strip().lower()
+        if msg_type == "text":
+            text = str(obj.get("text") or "").strip()
+            if text and not _is_promotional_text(text):
+                out.append(obj)
+            continue
+        if msg_type in CAPTION_TYPES:
+            caption = str(obj.get("caption") or "").strip()
+            if caption and _is_promotional_text(caption):
+                # Keep media item, strip only promotional caption.
+                obj.pop("caption", None)
+            out.append(obj)
+            continue
+        out.append(obj)
+    return out
 
 
 def _is_image_input(item: dict) -> bool:
@@ -604,15 +721,36 @@ def _looks_low_quality(text: str) -> bool:
     return latin_ratio > 0.35
 
 
-def _is_persian_acceptable(text: str) -> bool:
+def _normalize_for_language_quality(text: str, *, destination: str = "") -> str:
+    if not text:
+        return ""
+    lines = [line.strip() for line in str(text).splitlines() if line.strip()]
+    dst = str(destination or "").strip()
+    kept: list[str] = []
+    for line in lines:
+        if dst and line == dst:
+            continue
+        kept.append(line)
+    out = _normalize_text("\n".join(kept))
+    out = URL_RE.sub(" ", out)
+    out = HASHTAG_RE.sub(" ", out)
+    out = MENTION_RE.sub(" ", out)
+    out = re.sub(r"[ \t]+", " ", out).strip()
+    return out
+
+
+def _is_persian_acceptable(text: str, *, destination: str = "") -> bool:
     if not text:
         return False
-    if not PERSIAN_CHAR_RE.search(text):
+    normalized = _normalize_for_language_quality(text, destination=destination)
+    if not normalized:
         return False
-    tokens = re.findall(r"\S+", text)
+    if not PERSIAN_CHAR_RE.search(normalized):
+        return False
+    tokens = re.findall(r"\S+", normalized)
     if not tokens:
         return False
-    latin_ratio = len(LATIN_WORD_RE.findall(text)) / max(1, len(tokens))
+    latin_ratio = len(LATIN_WORD_RE.findall(normalized)) / max(1, len(tokens))
     return latin_ratio <= 0.2
 
 
@@ -744,7 +882,7 @@ def _generate_football_text(*, payload: dict, input_dir: Path, base_messages: li
     # Hard quality gate: if still non-Persian, force strict Persian rewrite retries.
     strict_sources = [cleaned or source_text, source_text]
     for strict_source in strict_sources:
-        if _is_persian_acceptable(cleaned):
+        if _is_persian_acceptable(cleaned, destination=destination):
             break
         attempts = 0
         while attempts < 2 and _remaining_budget() > 4.0:
@@ -771,14 +909,14 @@ def _generate_football_text(*, payload: dict, input_dir: Path, base_messages: li
             strict_clean = _preserve_source_emojis(strict_clean, destination=destination, source_emojis=source_emojis)
             if strict_clean:
                 cleaned = strict_clean
-            if _is_persian_acceptable(cleaned):
+            if _is_persian_acceptable(cleaned, destination=destination):
                 break
 
     if not cleaned:
         return ""
 
     # Never allow non-Persian output to pass through when AI path is active.
-    if not _is_persian_acceptable(cleaned):
+    if not _is_persian_acceptable(cleaned, destination=destination):
         return ""
 
     return cleaned
@@ -810,22 +948,33 @@ def _apply_generated_text(base_messages: list[dict], generated_text: str) -> lis
 
 def build_messages(payload: dict, *, input_dir: Path) -> list[dict]:
     base = _build_base_messages(payload)
+    if _is_promotional_payload(payload):
+        return []
+
     generated = _generate_football_text(payload=payload, input_dir=input_dir, base_messages=base)
     ai_mandatory = _ai_mandatory_mode()
     has_textual_source = _has_textual_source(payload)
+    used_fail_open_passthrough = False
+
+    destination = _destination_signature(payload)
 
     if ai_mandatory and (generated is None or not generated):
         if not has_textual_source:
             # Non-text messages must pass through unchanged.
             return base
-        raise RuntimeError("ai_generation_required_failed")
-
-    if generated is None:
-        out = base
-    elif generated:
-        out = _apply_generated_text(base, generated)
+        if _ai_fail_open():
+            # Keep sync moving without leaking raw unsafe text/captions.
+            out = _safe_fail_open_messages(base, destination=destination)
+            used_fail_open_passthrough = True
+        else:
+            raise RuntimeError("ai_generation_required_failed")
     else:
-        out = base
+        if generated is None:
+            out = base
+        elif generated:
+            out = _apply_generated_text(base, generated)
+        else:
+            out = base
 
     # Last safety net: only reuse source caption/text when textual source exists.
     if _has_media_without_caption(out) and not ai_mandatory and has_textual_source:
@@ -844,19 +993,22 @@ def build_messages(payload: dict, *, input_dir: Path) -> list[dict]:
                 injected.append(obj)
             out = injected
 
+    if _is_promotional_messages(out):
+        return []
+
     # AI-enabled route: never emit output with non-Persian text/captions.
-    if ai_mandatory:
+    if ai_mandatory and not used_fail_open_passthrough:
         for item in out:
             if not isinstance(item, dict):
                 continue
             msg_type = str(item.get("type") or "").strip().lower()
             if msg_type == "text":
                 text = str(item.get("text") or "").strip()
-                if text and not _is_persian_acceptable(text):
+                if text and not _is_persian_acceptable(text, destination=destination):
                     raise RuntimeError("ai_output_not_acceptable")
             if msg_type in CAPTION_TYPES:
                 caption = str(item.get("caption") or "").strip()
-                if caption and not _is_persian_acceptable(caption):
+                if caption and not _is_persian_acceptable(caption, destination=destination):
                     raise RuntimeError("ai_output_not_acceptable")
     return out
 
@@ -873,7 +1025,7 @@ def main() -> None:
         messages = build_messages(payload, input_dir=Path(args.input_dir))
     except Exception as exc:
         print(f"[football.py] non-fatal error: {exc}", file=sys.stderr)
-        if _ai_mandatory_mode():
+        if _ai_mandatory_mode() and not _ai_fail_open():
             # In mandatory mode do not pass source text through;
             # let upstream sync retry this message.
             sys.exit(2)

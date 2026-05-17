@@ -203,10 +203,17 @@ def _is_obvious_advertisement(payload: dict) -> bool:
         "order now",
         "limited offer",
         "join now",
+        "join",
         "follow us",
+        "follow",
         "subscribe",
         "sign up",
         "register now",
+        "don’t miss",
+        "don't miss",
+        "deal",
+        "exclusive",
+        "vip",
         "خرید",
         "سفارش",
         "ثبت نام",
@@ -216,20 +223,25 @@ def _is_obvious_advertisement(payload: dict) -> bool:
         "از لینک",
         "لینک خرید",
         "تخفیف",
-        "follow",
-        "join",
+        "ویژه",
     )
     cta_hits = sum(1 for token in cta_signals if token in combined)
 
     has_link = bool(re.search(r"(https?://|t\.me/|telegram\.me/|instagram\.com/|bit\.ly/)", combined))
+    has_handle = bool(re.search(r"(^|\s)@\w{3,}", combined))
     has_price = bool(re.search(r"(\$|€|£|تومان|ریال|\d+\s*%|\d+\s*(k|m|b)?)", combined))
 
     # Block explicit commercial ads.
     if has_link and cta_hits >= 1:
         return True
+    if has_handle and cta_hits >= 2:
+        return True
     if cta_hits >= 2 and has_price:
         return True
     if cta_hits >= 3:
+        return True
+
+    if _is_signal_promo_advertisement(combined):
         return True
 
     if _is_obvious_gambling_advertisement(combined):
@@ -253,6 +265,61 @@ def _is_obvious_advertisement(payload: dict) -> bool:
     if has_bundle_header and promo_line_hits >= 2:
         return True
 
+    return False
+
+
+def _is_signal_promo_advertisement(combined: str) -> bool:
+    # Covers common pump/signal promos that often evade generic ad keywords.
+    signal_terms = (
+        "signal",
+        "signals",
+        "profit",
+        "profit margin",
+        "high throughput",
+        "win rate",
+        "100%",
+        "100 %",
+        "community",
+        "deal",
+        "vip",
+        "trading",
+        "trade",
+        "forex",
+        "crypto signal",
+        "premium channel",
+        "کانال ویژه",
+        "سیگنال",
+        "سود",
+        "درصد سود",
+        "وین ریت",
+    )
+    signal_hits = sum(1 for token in signal_terms if token in combined)
+    if signal_hits <= 0:
+        return False
+
+    has_link = bool(re.search(r"(https?://|t\.me/|telegram\.me/|bit\.ly/)", combined))
+    has_handle = bool(re.search(r"(^|\s)@\w{3,}", combined))
+    cta_terms = (
+        "join",
+        "register",
+        "sign up",
+        "don't miss",
+        "deal",
+        "subscribe",
+        "community",
+        "عضویت",
+        "ثبت نام",
+        "فرصت",
+        "همین حالا",
+    )
+    cta_hits = sum(1 for token in cta_terms if token in combined)
+
+    if signal_hits >= 2 and (has_link or has_handle):
+        return True
+    if signal_hits >= 3:
+        return True
+    if signal_hits >= 1 and cta_hits >= 2 and (has_link or has_handle):
+        return True
     return False
 
 

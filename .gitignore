@@ -5,5 +5,5 @@ __pycache__/
 .env
 app_data/
 app_tmp/
-config/channels.json
+config/channels.json*
 config/admin_users.json

@@ -313,10 +313,11 @@ def _is_promotional_messages(messages: list[dict]) -> bool:
 
 def _safe_fail_open_messages(base: list[dict], *, destination: str = "") -> list[dict]:
     # Fail-open mode must keep transfer continuity.
-    # Only block clear promotional content; do not drop non-Persian captions/text.
+    # Only block clear promotional content; never leak non-Persian captions/text.
     out: list[dict] = []
     first_media_idx: int | None = None
     has_media_caption = False
+    has_text_message = False
     for item in base:
         if not isinstance(item, dict):
             continue
@@ -325,6 +326,9 @@ def _safe_fail_open_messages(base: list[dict], *, destination: str = "") -> list
         if msg_type == "text":
             text = str(obj.get("text") or "").strip()
             if text and not _is_promotional_text(text):
+                if not _is_persian_acceptable(text, destination=destination):
+                    obj["text"] = _text_only_fallback_message(destination=destination)
+                has_text_message = True
                 out.append(obj)
             continue
         if msg_type in CAPTION_TYPES:
@@ -333,6 +337,9 @@ def _safe_fail_open_messages(base: list[dict], *, destination: str = "") -> list
             caption = str(obj.get("caption") or "").strip()
             if caption and _is_promotional_text(caption):
                 # Keep media item, strip only promotional caption.
+                obj.pop("caption", None)
+                caption = ""
+            if caption and not _is_persian_acceptable(caption, destination=destination):
                 obj.pop("caption", None)
                 caption = ""
             if caption:
@@ -344,6 +351,8 @@ def _safe_fail_open_messages(base: list[dict], *, destination: str = "") -> list
     # Keep output deliverable for media posts even when AI path failed.
     if first_media_idx is not None and not has_media_caption:
         out[first_media_idx]["caption"] = _media_only_fallback_caption(destination=destination)
+    if first_media_idx is None and not has_text_message:
+        out.insert(0, {"type": "text", "text": _text_only_fallback_message(destination=destination)})
     return out
 
 
@@ -772,6 +781,14 @@ def _is_persian_acceptable(text: str, *, destination: str = "") -> bool:
 
 def _media_only_fallback_caption(*, destination: str = "") -> str:
     base = "📸 پست جدید فوتبالی منتشر شد."
+    dst = str(destination or "").strip()
+    if dst:
+        return f"{base}\n{dst}"
+    return base
+
+
+def _text_only_fallback_message(*, destination: str = "") -> str:
+    base = "📰 خبر جدید فوتبالی منتشر شد."
     dst = str(destination or "").strip()
     if dst:
         return f"{base}\n{dst}"

@@ -1175,6 +1175,10 @@ def build_messages(payload: dict, *, input_dir: Path) -> list[dict]:
     base = _build_base_messages(payload)
     if _is_promotional_payload(payload):
         return []
+    # Some channel updates do not carry any usable text/caption/media payload.
+    # Treat them as a safe skip instead of failing the sync pipeline.
+    if not _has_meaningful_source(payload):
+        return []
 
     generated = _generate_football_text(payload=payload, input_dir=input_dir, base_messages=base)
     ai_mandatory = _ai_mandatory_mode()

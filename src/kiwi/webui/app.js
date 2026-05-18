@@ -1163,7 +1163,7 @@ function openRouteEditor(route) {
   const r = route || {
     name: '', status: 'synced', source_channel_username: '', source_channel_id: '',
     destination_channel_username: '', destination_channel_id: '',
-    channel_script: '', gaurd_script: 'default_guard.py', max_message_mb: 15,
+    channel_script: '', gaurd_script: 'default_guard.py', max_message_mb: 60,
     backfill_count: 50, interval_sec: 1, batch_size: 1, retry_attempts: 2,
   };
   const routeMetrics = r.name ? state.routeMetrics[String(r.name)] : null;

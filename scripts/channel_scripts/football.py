@@ -442,6 +442,8 @@ def _safe_fail_open_messages(base: list[dict], *, destination: str = "") -> list
 
 def _is_image_input(item: dict) -> bool:
     kind = str(item.get("kind") or "").strip().lower()
+    if kind in {"video", "video_note"}:
+        return False
     if kind == "photo":
         return True
 

@@ -22,6 +22,8 @@ def _load_payload(path: Path) -> dict:
 
 def _is_image_input(item: dict) -> bool:
     kind = str(item.get("kind") or "").strip().lower()
+    if kind in {"video", "video_note"}:
+        return False
     if kind == "photo":
         return True
     mime = str(item.get("mime_type") or "").strip().lower()
@@ -174,7 +176,7 @@ def _is_obvious_advertisement(payload: dict) -> bool:
     message = payload.get("message") or {}
     text = str(message.get("text") or "")
     caption = str(message.get("caption") or "")
-    combined = f"{text}\n{caption}".lower()
+    combined = _normalize_ad_text(f"{text}\n{caption}")
     if not combined.strip():
         return False
 
@@ -247,6 +249,9 @@ def _is_obvious_advertisement(payload: dict) -> bool:
     if _is_obvious_gambling_advertisement(combined):
         return True
 
+    if _is_obvious_crypto_platform_advertisement(combined):
+        return True
+
     # Channel-promo bundles: only block when multiple promo rows exist.
     list_lines = [ln.strip().lower() for ln in combined.splitlines() if ln.strip()]
     promo_line_hits = 0
@@ -266,6 +271,14 @@ def _is_obvious_advertisement(payload: dict) -> bool:
         return True
 
     return False
+
+
+def _normalize_ad_text(text: str) -> str:
+    normalized = str(text or "").lower()
+    normalized = normalized.replace("\u200c", "").replace("\u200d", "").replace("\u200f", "")
+    normalized = normalized.replace("٫", ".").replace("。", ".")
+    normalized = re.sub(r"[ \t]+", " ", normalized)
+    return normalized.strip()
 
 
 def _is_signal_promo_advertisement(combined: str) -> bool:
@@ -325,6 +338,9 @@ def _is_signal_promo_advertisement(combined: str) -> bool:
 
 def _is_obvious_gambling_advertisement(combined: str) -> bool:
     strong_brand_signals = (
+        "bc.game",
+        "bc game",
+        "bcgame",
         "1xbet",
         "1x bet",
         "bet365",
@@ -409,6 +425,127 @@ def _is_obvious_gambling_advertisement(combined: str) -> bool:
     if has_link and (cta_hits >= 1 or promo_code):
         return True
     if cta_hits >= 2:
+        return True
+
+    return False
+
+
+def _is_obvious_crypto_platform_advertisement(combined: str) -> bool:
+    # Block explicit crypto-platform promotions (exchanges, referral/airdrop campaigns, join CTAs).
+    # Normal non-promotional mentions should not be blocked unless ad signals are present.
+    crypto_platforms = (
+        "binance",
+        "bybit",
+        "okx",
+        "ok-ex",
+        "okex",
+        "kucoin",
+        "bitget",
+        "coinex",
+        "bingx",
+        "mexc",
+        "lbank",
+        "toobit",
+        "xt.com",
+        "coinbase",
+        "kraken",
+        "gate.io",
+        "gateio",
+        "nobitex",
+        "wallex",
+        "tabdeal",
+        "bitpin",
+        "ramzinex",
+        "excoino",
+        "crypto.com",
+        "coinmarketcap",
+    )
+    crypto_keywords = (
+        "crypto",
+        "cryptocurrency",
+        "blockchain",
+        "bitcoin",
+        "btc",
+        "ethereum",
+        "eth",
+        "usdt",
+        "تتر",
+        "صرافی",
+        "رمزارز",
+        "ارز دیجیتال",
+        "کریپتو",
+        "کوین",
+        "توکن",
+        "کیف پول",
+        "wallet",
+        "airdrop",
+        "launchpool",
+        "copy trade",
+        "copytrade",
+        "futures",
+        "leverage",
+    )
+    ad_cta = (
+        "register",
+        "sign up",
+        "join now",
+        "join",
+        "claim",
+        "deposit",
+        "withdraw",
+        "trade now",
+        "buy now",
+        "get bonus",
+        "invite",
+        "invitation",
+        "referral",
+        "promo",
+        "promo code",
+        "affiliate",
+        "uid",
+        "kyc",
+        "ثبت نام",
+        "ثبت‌نام",
+        "عضویت",
+        "واریز",
+        "برداشت",
+        "معامله",
+        "بونوس",
+        "بوناس",
+        "کد دعوت",
+        "کد معرف",
+        "کد رفرال",
+        "رفرال",
+        "همین حالا",
+        "از لینک",
+    )
+
+    has_link = bool(re.search(r"(https?://|t\.me/|telegram\.me/|bit\.ly/|tinyurl\.com/|[a-z0-9-]+\.(com|io|net|org))", combined))
+    has_handle = bool(re.search(r"(^|\s)@\w{3,}", combined))
+    has_platform = any(token in combined for token in crypto_platforms)
+    has_crypto = any(token in combined for token in crypto_keywords)
+    cta_hits = sum(1 for token in ad_cta if token in combined)
+    has_ref_code = bool(
+        re.search(
+            r"(\b(ref|referral|promo|invite|code|uid)\b|کد\s*(دعوت|معرف|رفرال))",
+            combined,
+        )
+    )
+
+    # Hard block: explicit exchange/platform promo campaigns.
+    if has_platform and (has_link or has_handle or cta_hits >= 1 or has_ref_code):
+        return True
+    if has_platform and "airdrop" in combined:
+        return True
+
+    # Generic crypto ad patterns with clear conversion intent.
+    if has_crypto and (has_link or has_handle) and (cta_hits >= 2 or has_ref_code):
+        return True
+    if ("airdrop" in combined or "launchpool" in combined) and (has_link or has_handle):
+        return True
+    if ("futures" in combined or "leverage" in combined or "copy trade" in combined or "copytrade" in combined) and (
+        has_link or has_handle
+    ):
         return True
 
     return False

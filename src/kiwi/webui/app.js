@@ -350,7 +350,69 @@ async function loadScriptsMeta() {
 
 async function loadKeywords() {
   const data = await api('/api/keyword-links');
-  state.keywordLinks = data.links || [];
+  state.keywordLinks = normalizeKeywordLinksForUi(data.links || []);
+}
+
+function normalizeKeywordTerm(item, fallbackPriority = 0) {
+  if (typeof item === 'string') {
+    const text = String(item || '').trim();
+    if (!text) return null;
+    return { keyword: text, priority: Number(fallbackPriority) || 0 };
+  }
+  if (!item || typeof item !== 'object') return null;
+  const text = String(item.keyword || item.text || item.term || '').trim();
+  if (!text) return null;
+  const prRaw = item.priority;
+  const priority = Number.isFinite(Number(prRaw)) ? Number(prRaw) : (Number(fallbackPriority) || 0);
+  return { keyword: text, priority: Math.trunc(priority) };
+}
+
+function normalizeKeywordEntry(item) {
+  if (!item || typeof item !== 'object') return null;
+  const destination = String(item.destination || '').trim();
+  const link = String(item.link || '').trim();
+  if (!destination) return null;
+  const entryPriority = Number.isFinite(Number(item.priority)) ? Number(item.priority) : 0;
+  const rawKeywords = Array.isArray(item.keywords) ? item.keywords : [];
+  const terms = [];
+  const seen = new Set();
+  for (const raw of rawKeywords) {
+    const parsed = normalizeKeywordTerm(raw, entryPriority);
+    if (!parsed) continue;
+    const dedupeKey = parsed.keyword.toLocaleLowerCase();
+    if (seen.has(dedupeKey)) continue;
+    seen.add(dedupeKey);
+    terms.push(parsed);
+  }
+  if (!terms.length) return null;
+  terms.sort((a, b) => {
+    const byPr = Number(b.priority || 0) - Number(a.priority || 0);
+    if (byPr !== 0) return byPr;
+    return String(b.keyword || '').length - String(a.keyword || '').length;
+  });
+  return { destination, link, keywords: terms };
+}
+
+function normalizeKeywordLinksForUi(items) {
+  if (!Array.isArray(items)) return [];
+  const out = [];
+  for (const item of items) {
+    const parsed = normalizeKeywordEntry(item);
+    if (parsed) out.push(parsed);
+  }
+  out.sort((a, b) => String(a.destination || '').localeCompare(String(b.destination || ''), undefined, { sensitivity: 'base' }));
+  return out;
+}
+
+function serializeKeywordLinksForApi(items) {
+  return normalizeKeywordLinksForUi(items).map((entry) => ({
+    destination: String(entry.destination || '').trim(),
+    link: String(entry.link || '').trim(),
+    keywords: (entry.keywords || []).map((kw) => ({
+      keyword: String(kw.keyword || '').trim(),
+      priority: Math.trunc(Number(kw.priority || 0)),
+    })),
+  }));
 }
 
 async function loadSync() {
@@ -851,46 +913,194 @@ function openScriptEditorModal({ kind, name, content }) {
 
 function renderKeywordsPage() {
   const page = document.getElementById('page-keywords');
-  const links = state.keywordLinks || [];
+  const links = normalizeKeywordLinksForUi(state.keywordLinks || []);
+  state.keywordLinks = links;
+  const totalKeywords = links.reduce((acc, item) => acc + (Array.isArray(item.keywords) ? item.keywords.length : 0), 0);
+  const rows = links.map((entry, idx) => {
+    const keywords = Array.isArray(entry.keywords) ? entry.keywords : [];
+    const topPriority = keywords.length ? Math.max(...keywords.map((x) => Number(x.priority || 0))) : 0;
+    const chips = keywords.slice(0, 5).map((kw) => (
+      `<span class="badge">${esc(kw.keyword)} <small>#${esc(kw.priority)}</small></span>`
+    )).join('');
+    const more = keywords.length > 5 ? `<span class="muted">+${keywords.length - 5} more</span>` : '';
+    return `
+      <tr>
+        <td>${esc(entry.destination || '-')}</td>
+        <td>${entry.link ? `<a href="${esc(entry.link)}" target="_blank" rel="noreferrer">${esc(entry.link)}</a>` : '<span class="muted">auto</span>'}</td>
+        <td>${keywords.length}</td>
+        <td><span class="badge">${esc(topPriority)}</span></td>
+        <td><div class="keyword-chip-wrap">${chips}${more}</div></td>
+        <td class="actions-cell">
+          <div class="icon-actions">
+            ${iconBtn({ title: 'Edit mapping', icon: '✎', attrs: `data-kword-act="edit" data-kword-idx="${idx}"` })}
+            ${iconBtn({ title: 'Delete mapping', icon: '✕', extraClass: 'btn-danger', attrs: `data-kword-act="delete" data-kword-idx="${idx}"` })}
+          </div>
+        </td>
+      </tr>
+    `;
+  }).join('');
   page.innerHTML = `
     <div class="card">
       <div class="row" style="justify-content:space-between">
         <h3>Keyword Links</h3>
-        ${iconBtn({ title: 'Edit keyword links', icon: '✎', attrs: 'id="openKeywordsEditorBtn"' })}
+        <div class="row">
+          ${iconBtn({ title: 'Add keyword mapping', icon: '+', attrs: 'id="addKeywordMapBtn"' })}
+          ${iconBtn({ title: 'Save all changes', icon: '✓', attrs: 'id="saveKeywordMapBtn"' })}
+        </div>
       </div>
-      <div class="meta-line">Total mappings: ${links.length}</div>
+      <div class="meta-line">Mappings: ${links.length} | Keywords: ${totalKeywords}</div>
+      <div class="table-wrap" style="margin-top:8px">
+        <table>
+          <thead>
+            <tr>
+              <th>Destination</th>
+              <th>Link</th>
+              <th>Keywords</th>
+              <th>Top Priority</th>
+              <th>Preview</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody>${rows || '<tr><td colspan="6"><span class="muted">No keyword mapping yet</span></td></tr>'}</tbody>
+        </table>
+      </div>
     </div>
   `;
 
-  document.getElementById('openKeywordsEditorBtn')?.addEventListener('click', () => {
-    const jsonText = JSON.stringify(links, null, 2);
-    openModal(
-      'Edit Keyword Links',
-      `
-        <p class="meta-line">Array of objects with destination/link/keywords</p>
-        <textarea id="keywordsEditor" style="min-height:520px">${esc(jsonText)}</textarea>
-        <div class="modal-actions">
-          ${iconBtn({ title: 'Close', icon: '✕', attrs: 'id="keywordsCancelBtn"' })}
-          ${iconBtn({ title: 'Save keyword links', icon: '✓', attrs: 'id="saveKeywordsBtn"' })}
-        </div>
-      `,
-    );
+  document.getElementById('addKeywordMapBtn')?.addEventListener('click', () => openKeywordMappingModal(null));
+  document.getElementById('saveKeywordMapBtn')?.addEventListener('click', async () => {
+    await runAction(async () => {
+      const payload = serializeKeywordLinksForApi(state.keywordLinks || []);
+      await api('/api/keyword-links', { method: 'PUT', body: JSON.stringify({ links: payload }) });
+      showFlash('Keyword links saved');
+      await loadKeywords();
+      renderKeywordsPage();
+    }, 'Failed to save keyword links');
+  });
 
-    document.getElementById('keywordsCancelBtn')?.addEventListener('click', closeModal);
-    document.getElementById('saveKeywordsBtn')?.addEventListener('click', async () => {
-      await runAction(async () => {
-        const text = document.getElementById('keywordsEditor')?.value || '[]';
-        let parsed;
-        try { parsed = JSON.parse(text); } catch (e) {
-          throw new Error(`Invalid JSON: ${e}`);
-        }
-        await api('/api/keyword-links', { method: 'PUT', body: JSON.stringify({ links: parsed }) });
-        showFlash('Keyword links saved');
-        closeModal();
-        await loadKeywords();
+  page.querySelectorAll('button[data-kword-act]').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      const idx = Number(btn.dataset.kwordIdx);
+      if (!Number.isInteger(idx) || idx < 0 || idx >= links.length) return;
+      const act = String(btn.dataset.kwordAct || '');
+      if (act === 'edit') {
+        openKeywordMappingModal(idx);
+        return;
+      }
+      if (act === 'delete') {
+        if (!confirm(`Delete keyword mapping for ${links[idx].destination}?`)) return;
+        state.keywordLinks = links.filter((_, i) => i !== idx);
         renderKeywordsPage();
-      }, 'Failed to save keyword links');
+      }
     });
+  });
+}
+
+function openKeywordMappingModal(editIndex) {
+  const links = normalizeKeywordLinksForUi(state.keywordLinks || []);
+  const isEdit = Number.isInteger(editIndex) && editIndex >= 0 && editIndex < links.length;
+  const current = isEdit ? links[editIndex] : { destination: '', link: '', keywords: [{ keyword: '', priority: 100 }] };
+  const keywordRows = (current.keywords || []).map((kw, idx) => `
+    <div class="keyword-row" data-keyword-row="${idx}">
+      <input data-kword-field="keyword" placeholder="keyword" value="${esc(kw.keyword || '')}">
+      <input data-kword-field="priority" type="number" step="1" placeholder="priority" value="${esc(kw.priority ?? 0)}">
+      ${iconBtn({ title: 'Remove keyword', icon: '✕', extraClass: 'btn-danger', attrs: 'data-kword-row-act="remove" type="button"' })}
+    </div>
+  `).join('');
+
+  openModal(
+    isEdit ? `Edit Keywords: ${current.destination}` : 'Add Keyword Mapping',
+    `
+      <form id="keywordMapForm" class="stack">
+        <div class="modal-grid">
+          <label>Destination <input id="keywordDestinationInput" required value="${esc(current.destination || '')}" placeholder="@channel"></label>
+          <label>Link (optional) <input id="keywordLinkInput" value="${esc(current.link || '')}" placeholder="https://ble.ir/channel"></label>
+        </div>
+        <div class="row" style="justify-content:space-between">
+          <h4 style="margin:0">Keywords</h4>
+          ${iconBtn({ title: 'Add keyword', icon: '+', attrs: 'id="addKeywordRowBtn" type="button"' })}
+        </div>
+        <div class="meta-line">Higher priority wins when keywords overlap. Example: \"لیگ قهرمانان اروپا\" > \"لیگ قهرمانان\"</div>
+        <div id="keywordRowsWrap" class="stack">${keywordRows || `
+          <div class="keyword-row" data-keyword-row="0">
+            <input data-kword-field="keyword" placeholder="keyword" value="">
+            <input data-kword-field="priority" type="number" step="1" placeholder="priority" value="100">
+            ${iconBtn({ title: 'Remove keyword', icon: '✕', extraClass: 'btn-danger', attrs: 'data-kword-row-act="remove" type="button"' })}
+          </div>
+        `}</div>
+      </form>
+      <div class="modal-actions">
+        ${iconBtn({ title: 'Close', icon: '✕', attrs: 'id="keywordMapCancelBtn"' })}
+        ${iconBtn({ title: 'Save mapping', icon: '✓', attrs: 'id="keywordMapSaveBtn"' })}
+      </div>
+    `,
+  );
+
+  const rowsWrap = document.getElementById('keywordRowsWrap');
+  const buildKeywordRow = (keyword = '', priority = 100) => `
+    <div class="keyword-row">
+      <input data-kword-field="keyword" placeholder="keyword" value="${esc(keyword)}">
+      <input data-kword-field="priority" type="number" step="1" placeholder="priority" value="${esc(priority)}">
+      ${iconBtn({ title: 'Remove keyword', icon: '✕', extraClass: 'btn-danger', attrs: 'data-kword-row-act="remove" type="button"' })}
+    </div>
+  `;
+  const bindRemoveButtons = () => {
+    rowsWrap?.querySelectorAll('button[data-kword-row-act="remove"]').forEach((btn) => {
+      btn.onclick = () => {
+        const row = btn.closest('.keyword-row');
+        row?.remove();
+      };
+    });
+  };
+  bindRemoveButtons();
+
+  document.getElementById('addKeywordRowBtn')?.addEventListener('click', (e) => {
+    e.preventDefault();
+    if (!rowsWrap) return;
+    rowsWrap.insertAdjacentHTML('beforeend', buildKeywordRow('', 100));
+    bindRemoveButtons();
+  });
+
+  document.getElementById('keywordMapCancelBtn')?.addEventListener('click', closeModal);
+  document.getElementById('keywordMapSaveBtn')?.addEventListener('click', () => {
+    const destination = String(document.getElementById('keywordDestinationInput')?.value || '').trim();
+    const link = String(document.getElementById('keywordLinkInput')?.value || '').trim();
+    if (!destination) {
+      showFlash('Destination is required', true);
+      return;
+    }
+    const keywordRowsEls = Array.from(rowsWrap?.querySelectorAll('.keyword-row') || []);
+    const keywords = [];
+    const seen = new Set();
+    for (const row of keywordRowsEls) {
+      const keyword = String(row.querySelector('input[data-kword-field="keyword"]')?.value || '').trim();
+      const rawPriority = Number(row.querySelector('input[data-kword-field="priority"]')?.value || 0);
+      const priority = Number.isFinite(rawPriority) ? Math.trunc(rawPriority) : 0;
+      if (!keyword) continue;
+      const dedupeKey = keyword.toLocaleLowerCase();
+      if (seen.has(dedupeKey)) continue;
+      seen.add(dedupeKey);
+      keywords.push({ keyword, priority });
+    }
+    if (!keywords.length) {
+      showFlash('At least one keyword is required', true);
+      return;
+    }
+
+    const normalized = normalizeKeywordEntry({ destination, link, keywords });
+    if (!normalized) {
+      showFlash('Invalid keyword mapping', true);
+      return;
+    }
+    const next = links.slice();
+    if (isEdit) {
+      next[editIndex] = normalized;
+    } else {
+      next.push(normalized);
+    }
+    state.keywordLinks = normalizeKeywordLinksForUi(next);
+    closeModal();
+    renderKeywordsPage();
   });
 }
 

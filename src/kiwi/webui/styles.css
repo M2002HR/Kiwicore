@@ -377,6 +377,20 @@ tbody tr:hover { background: rgba(15,157,143,.05); }
   color: var(--muted);
 }
 
+.keyword-chip-wrap {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+}
+
+.keyword-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 140px 34px;
+  gap: 8px;
+  align-items: center;
+}
+
 pre {
   margin: 0;
   white-space: pre-wrap;
@@ -399,4 +413,5 @@ pre {
   .modal-shell { width: 100%; }
   .modal-grid { grid-template-columns: 1fr; }
   .compact-input { width: 100%; }
+  .keyword-row { grid-template-columns: minmax(0, 1fr) 110px 34px; }
 }

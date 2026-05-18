@@ -44,7 +44,8 @@ def test_routes_page_has_search_and_modal_editor() -> None:
 def test_other_sections_use_modal_for_edit_or_preview() -> None:
     js = _read("app.js")
     assert "openScriptEditorModal(" in js
-    assert "Edit Keyword Links" in js
+    assert "openKeywordMappingModal(" in js
+    assert "Add Keyword Mapping" in js
     assert "File Preview:" in js
     assert "Add Admin" in js
     assert "renderTrafficPage()" in js
@@ -72,3 +73,5 @@ def test_styles_define_compact_rows_and_modal_layout() -> None:
     assert ".modal-grid" in css
     assert ".toast-root" in css
     assert ".toast.error" in css
+    assert ".keyword-chip-wrap" in css
+    assert ".keyword-row" in css

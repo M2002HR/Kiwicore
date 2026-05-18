@@ -987,7 +987,8 @@ def _generate_football_text(*, payload: dict, input_dir: Path, base_messages: li
         return None
 
     image_parts = _load_image_parts(payload, input_dir)
-    has_visual_context = bool(image_parts)
+    active_image_parts = list(image_parts)
+    has_visual_context = bool(active_image_parts)
     if not source_text and not has_visual_context:
         return None
 
@@ -1014,9 +1015,19 @@ def _generate_football_text(*, payload: dict, input_dir: Path, base_messages: li
         return body
 
     model = _pick_ai_model()
-    first_parts = [{"text": prompt}, *image_parts] if has_visual_context else [{"text": prompt}]
-    first_body = _build_body(first_parts, temperature=0.2)
-    first = _call_with_budget(first_body)
+
+    def _prompt_parts(prompt_text: str) -> list[dict]:
+        if active_image_parts:
+            return [{"text": prompt_text}, *active_image_parts]
+        return [{"text": prompt_text}]
+
+    first = _call_with_budget(_build_body(_prompt_parts(prompt), temperature=0.2))
+    if first is None and active_image_parts and source_text:
+        # Some image sets can be intermittently blocked/refused by model safety.
+        # Keep mandatory AI flow alive by retrying the same prompt as text-only.
+        active_image_parts = []
+        has_visual_context = False
+        first = _call_with_budget(_build_body(_prompt_parts(prompt), temperature=0.2))
     if first is None:
         return "" if not _ai_fail_open() else None
 
@@ -1044,7 +1055,7 @@ def _generate_football_text(*, payload: dict, input_dir: Path, base_messages: li
             f"{layout_instruction}\n\n"
             f"متن:\n{cleaned or source_text or 'از روی تصویر یک کپشن فوتبالی بساز'}"
         )
-        refine_parts = [{"text": refine_prompt}, *image_parts] if has_visual_context else [{"text": refine_prompt}]
+        refine_parts = _prompt_parts(refine_prompt)
         refine_body: dict = {"contents": [{"role": "user", "parts": refine_parts}], "generationConfig": {"temperature": 0.1}}
         if model:
             refine_body["model"] = model
@@ -1086,7 +1097,7 @@ def _generate_football_text(*, payload: dict, input_dir: Path, base_messages: li
                 f"{layout_instruction}\n\n"
                 f"متن:\n{strict_source}"
             )
-            strict_parts = [{"text": strict_prompt}, *image_parts] if has_visual_context else [{"text": strict_prompt}]
+            strict_parts = _prompt_parts(strict_prompt)
             strict_body: dict = {"contents": [{"role": "user", "parts": strict_parts}], "generationConfig": {"temperature": 0.05}}
             if model:
                 strict_body["model"] = model
@@ -1122,7 +1133,7 @@ def _generate_football_text(*, payload: dict, input_dir: Path, base_messages: li
             f"{layout_instruction}\n\n"
             f"متن:\n{cleaned}"
         )
-        adjust_parts = [{"text": adjust_prompt}, *image_parts] if has_visual_context else [{"text": adjust_prompt}]
+        adjust_parts = _prompt_parts(adjust_prompt)
         adjust_body = _build_body(adjust_parts, temperature=0.08)
         adjusted = _call_with_budget(adjust_body)
         if not adjusted:

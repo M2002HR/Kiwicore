@@ -89,6 +89,7 @@ class KiwiService:
         self._retry_queue_hydrated = False
         self._sync_drain_task: asyncio.Task[int] | None = None
         self._sync_next_due_at: dict[str, float] = {}
+        self._next_stale_recover_at = 0.0
         self._started_at_ts = time.time()
         self._run_id = str(uuid4())
         self._run_once_calls = 0
@@ -290,6 +291,9 @@ class KiwiService:
             return
 
         checkpoint = int(self.sync_ledger.get_route_checkpoint(route.name) or 0)
+        # Keep brand-new routes in syncing until at least one source message is confirmed.
+        if checkpoint <= 0:
+            return
         latest = checkpoint
         latest_func = getattr(self.source_client, "latest_message_id_for_route", None)
         if callable(latest_func):
@@ -302,6 +306,8 @@ class KiwiService:
                 )
                 return
 
+        if latest <= 0:
+            return
         if latest > checkpoint:
             return
 
@@ -443,6 +449,11 @@ class KiwiService:
                 continue
 
             current_checkpoint = self.sync_ledger.get_route_checkpoint(route.name)
+            checkpoint_now = int(current_checkpoint or 0)
+            if checkpoint_now <= 0 and route.is_synced():
+                # Self-heal stale "synced" routes that have never established a valid source baseline.
+                route.status = "syncing"
+                await self._persist_route_patch(route.name, {"status": "syncing"})
             if current_checkpoint is None:
                 latest_from_source = 0
                 if callable(latest_func):
@@ -474,7 +485,7 @@ class KiwiService:
                 if latest_from_source > int(current_checkpoint) and route.status != "syncing":
                     route.status = "syncing"
                     await self._persist_route_patch(route.name, {"status": "syncing"})
-                if latest_from_source <= int(current_checkpoint) and route.status == "syncing":
+                if latest_from_source > 0 and latest_from_source <= int(current_checkpoint) and route.status == "syncing":
                     route.status = "synced"
                     await self._persist_route_patch(route.name, {"status": "synced"})
 
@@ -554,6 +565,7 @@ class KiwiService:
         return None
 
     async def _drain_sync_queue(self) -> int:
+        await self._recover_stale_sync_records()
         batch_limit = max(1, int(self.settings.sync_worker_count)) * 4
         items = await self.sync_queue.pop_due(limit=batch_limit, now_ts=time.time())
         if not items:
@@ -573,6 +585,43 @@ class KiwiService:
                 continue
             processed += int(result)
         return processed
+
+    async def _recover_stale_sync_records(self) -> None:
+        now = time.time()
+        if now < float(self._next_stale_recover_at):
+            return
+
+        stale_cutoff_sec = max(60, int(self.settings.sync_lock_ttl_sec) * 2)
+        # Run periodically without waiting for restart, so stuck "processing" records
+        # cannot stall queue progress for long periods.
+        self._next_stale_recover_at = now + max(30.0, float(stale_cutoff_sec) / 2.0)
+        recovered = int(self.sync_ledger.requeue_stale_processing(older_than_sec=stale_cutoff_sec) or 0)
+        if recovered <= 0:
+            return
+
+        hydrated = 0
+        for idx, key in enumerate(self.sync_ledger.list_retryable_keys(limit=max(2000, recovered * 4))):
+            record = self.sync_ledger.get_record(key)
+            if record is None:
+                continue
+            await self.sync_queue.enqueue(
+                dedupe_key=key,
+                route_name=record.route_name,
+                due_at=now + (0.002 * idx),
+                payload_hash=payload_hash_from_json(record.payload),
+            )
+            hydrated += 1
+
+        logger.warning(
+            "Recovered stale processing sync records during runtime",
+            extra={
+                "details": {
+                    "recovered": recovered,
+                    "requeued": hydrated,
+                    "stale_cutoff_sec": stale_cutoff_sec,
+                }
+            },
+        )
 
     async def _process_queued_item(self, item) -> int:
         record = self.sync_ledger.get_record(item.dedupe_key)

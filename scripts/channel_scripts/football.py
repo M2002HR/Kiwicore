@@ -313,11 +313,9 @@ def _is_promotional_messages(messages: list[dict]) -> bool:
 
 def _safe_fail_open_messages(base: list[dict], *, destination: str = "") -> list[dict]:
     # Fail-open mode must keep transfer continuity.
-    # Only block clear promotional content; never leak non-Persian captions/text.
+    # Only block clear promotional content and unsafe non-Persian content.
+    # Never inject synthetic fallback captions/text.
     out: list[dict] = []
-    first_media_idx: int | None = None
-    has_media_caption = False
-    has_text_message = False
     for item in base:
         if not isinstance(item, dict):
             continue
@@ -325,15 +323,10 @@ def _safe_fail_open_messages(base: list[dict], *, destination: str = "") -> list
         msg_type = str(obj.get("type") or "").strip().lower()
         if msg_type == "text":
             text = str(obj.get("text") or "").strip()
-            if text and not _is_promotional_text(text):
-                if not _is_persian_acceptable(text, destination=destination):
-                    obj["text"] = _text_only_fallback_message(destination=destination)
-                has_text_message = True
+            if text and not _is_promotional_text(text) and _is_persian_acceptable(text, destination=destination):
                 out.append(obj)
             continue
         if msg_type in CAPTION_TYPES:
-            if first_media_idx is None:
-                first_media_idx = len(out)
             caption = str(obj.get("caption") or "").strip()
             if caption and _is_promotional_text(caption):
                 # Keep media item, strip only promotional caption.
@@ -341,18 +334,9 @@ def _safe_fail_open_messages(base: list[dict], *, destination: str = "") -> list
                 caption = ""
             if caption and not _is_persian_acceptable(caption, destination=destination):
                 obj.pop("caption", None)
-                caption = ""
-            if caption:
-                has_media_caption = True
             out.append(obj)
             continue
         out.append(obj)
-
-    # Keep output deliverable for media posts even when AI path failed.
-    if first_media_idx is not None and not has_media_caption:
-        out[first_media_idx]["caption"] = _media_only_fallback_caption(destination=destination)
-    if first_media_idx is None and not has_text_message:
-        out.insert(0, {"type": "text", "text": _text_only_fallback_message(destination=destination)})
     return out
 
 
@@ -779,22 +763,6 @@ def _is_persian_acceptable(text: str, *, destination: str = "") -> bool:
     return latin_ratio <= 0.2
 
 
-def _media_only_fallback_caption(*, destination: str = "") -> str:
-    base = "📸 پست جدید فوتبالی منتشر شد."
-    dst = str(destination or "").strip()
-    if dst:
-        return f"{base}\n{dst}"
-    return base
-
-
-def _text_only_fallback_message(*, destination: str = "") -> str:
-    base = "📰 خبر جدید فوتبالی منتشر شد."
-    dst = str(destination or "").strip()
-    if dst:
-        return f"{base}\n{dst}"
-    return base
-
-
 def _has_media_without_caption(messages: list[dict]) -> bool:
     for item in messages:
         if not isinstance(item, dict):
@@ -1000,18 +968,11 @@ def build_messages(payload: dict, *, input_dir: Path) -> list[dict]:
     generated = _generate_football_text(payload=payload, input_dir=input_dir, base_messages=base)
     ai_mandatory = _ai_mandatory_mode()
     has_textual_source = _has_textual_source(payload)
-    used_fail_open_passthrough = False
 
     destination = _destination_signature(payload)
 
     if ai_mandatory and (generated is None or not generated):
-        if _has_any_media(base) and not has_textual_source:
-            generated = _media_only_fallback_caption(destination=destination)
-    if ai_mandatory and (generated is None or not generated):
-        # Never hard-fail route processing from channel script.
-        # In mandatory mode, degrade to safe passthrough so sync continuity is preserved.
-        out = _safe_fail_open_messages(base, destination=destination)
-        used_fail_open_passthrough = True
+        raise RuntimeError("ai_generation_required_failed")
     else:
         if generated is None:
             out = base
@@ -1040,23 +1001,8 @@ def build_messages(payload: dict, *, input_dir: Path) -> list[dict]:
     if _is_promotional_messages(out):
         return []
 
-    # AI-enabled route: sanitize low-quality output instead of raising.
-    if ai_mandatory and not used_fail_open_passthrough:
-        if _has_any_media(out) and _has_media_without_caption(out):
-            fallback_caption = _media_only_fallback_caption(destination=destination)
-            patched: list[dict] = []
-            assigned = False
-            for item in out:
-                if not isinstance(item, dict):
-                    continue
-                obj = dict(item)
-                msg_type = str(obj.get("type") or "").strip().lower()
-                if (not assigned) and msg_type in CAPTION_TYPES and not str(obj.get("caption") or "").strip():
-                    obj["caption"] = fallback_caption
-                    assigned = True
-                patched.append(obj)
-            out = patched
-
+    # AI-enabled mandatory route: reject invalid output instead of injecting fallbacks.
+    if ai_mandatory:
         sanitized: list[dict] = []
         for item in out:
             if not isinstance(item, dict):
@@ -1066,13 +1012,13 @@ def build_messages(payload: dict, *, input_dir: Path) -> list[dict]:
             if msg_type == "text":
                 text = str(item.get("text") or "").strip()
                 if text and not _is_persian_acceptable(text, destination=destination):
-                    continue
+                    raise RuntimeError("ai_output_not_acceptable")
                 sanitized.append(obj)
                 continue
             if msg_type in CAPTION_TYPES:
                 caption = str(obj.get("caption") or "").strip()
                 if caption and not _is_persian_acceptable(caption, destination=destination):
-                    obj["caption"] = _media_only_fallback_caption(destination=destination)
+                    raise RuntimeError("ai_output_not_acceptable")
                 sanitized.append(obj)
                 continue
             sanitized.append(obj)
@@ -1091,6 +1037,13 @@ def main() -> None:
         payload = _load_payload(Path(args.payload))
         messages = build_messages(payload, input_dir=Path(args.input_dir))
     except Exception as exc:
+        lowered = str(exc).lower()
+        if "ai_generation_required_failed" in lowered:
+            print("ai_generation_required_failed", file=sys.stderr)
+            raise SystemExit(2)
+        if "ai_output_not_acceptable" in lowered:
+            print("ai_output_not_acceptable", file=sys.stderr)
+            raise SystemExit(2)
         print(f"[football.py] non-fatal error: {exc}", file=sys.stderr)
         try:
             payload = _load_payload(Path(args.payload))

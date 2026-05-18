@@ -209,6 +209,51 @@ def test_football_script_stdout_stays_json_when_ai_enabled_and_endpoint_fails(tm
     assert out == {"messages": [{"type": "text", "text": "متن تست"}]}
 
 
+def test_football_script_exits_with_ai_generation_required_failed_when_mandatory_ai_unavailable(tmp_path: Path) -> None:
+    payload = {
+        "route": {"destination_target": "@dest"},
+        "message": {"caption": "متن تست"},
+        "inputs": [{"kind": "photo", "local_name": "a.jpg"}],
+    }
+    payload_path = tmp_path / "payload.json"
+    input_dir = tmp_path / "input"
+    output_dir = tmp_path / "output"
+    input_dir.mkdir()
+    output_dir.mkdir()
+    payload_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+    env = os.environ.copy()
+    env.update(
+        {
+            "CHANNEL_SCRIPT_AI_ENABLED": "true",
+            "CHANNEL_SCRIPT_AI_ENDPOINT": "http://127.0.0.1:9/nowhere",
+            "CHANNEL_SCRIPT_AI_MANDATORY": "true",
+            "CHANNEL_SCRIPT_AI_RETRY_COUNT": "0",
+            "CHANNEL_SCRIPT_AI_TIMEOUT_SEC": "0.2",
+        }
+    )
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(_script_path()),
+            "--payload",
+            str(payload_path),
+            "--input-dir",
+            str(input_dir),
+            "--output-dir",
+            str(output_dir),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert result.returncode != 0
+    assert "ai_generation_required_failed" in (result.stderr or "")
+    assert "پست جدید فوتبالی منتشر شد" not in (result.stdout or "")
+    assert "خبر جدید فوتبالی منتشر شد" not in (result.stdout or "")
+
+
 def test_football_script_postprocess_removes_prompt_leak_and_duplicate_signature(tmp_path: Path, monkeypatch) -> None:
     mod = _load_module()
     monkeypatch.setenv("CHANNEL_SCRIPT_AI_ENABLED", "true")
@@ -324,7 +369,7 @@ def test_football_script_non_photo_without_caption_passthroughs_without_ai(tmp_p
     assert out == [{"type": "video", "path": "a.mp4"}]
 
 
-def test_football_script_fail_open_keeps_all_album_media_and_caption_when_ai_unavailable(
+def test_football_script_raises_when_mandatory_ai_unavailable_for_album_caption(
     tmp_path: Path, monkeypatch
 ) -> None:
     mod = _load_module()
@@ -347,10 +392,11 @@ def test_football_script_fail_open_keeps_all_album_media_and_caption_when_ai_una
             {"kind": "photo", "local_name": "photo_3"},
         ],
     }
-
-    out = mod.build_messages(payload, input_dir=tmp_path)
-    assert [item.get("path") for item in out] == ["photo_1", "photo_2", "photo_3"]
-    assert str(out[0].get("caption") or "").strip() == "ngl you probably need the full collection 💚"
+    try:
+        mod.build_messages(payload, input_dir=tmp_path)
+        assert False, "expected RuntimeError"
+    except RuntimeError as exc:
+        assert "ai_generation_required_failed" in str(exc)
 
 
 def test_football_script_builds_prompt_even_when_ai_is_disabled(tmp_path: Path, monkeypatch) -> None:
@@ -438,7 +484,7 @@ def test_football_script_keeps_short_persian_caption_with_destination_signature_
     assert [item.get("path") for item in out] == ["photo_1", "photo_2"]
 
 
-def test_football_script_fail_open_keeps_persian_caption_with_destination_signature(
+def test_football_script_raises_when_mandatory_ai_unavailable_even_if_source_caption_is_persian(
     tmp_path: Path, monkeypatch
 ) -> None:
     mod = _load_module()
@@ -456,11 +502,14 @@ def test_football_script_fail_open_keeps_persian_caption_with_destination_signat
         "message": {"caption": "برد خوب تیم\n@dest"},
         "inputs": [{"kind": "photo", "local_name": "photo_1"}],
     }
-    out = mod.build_messages(payload, input_dir=tmp_path)
-    assert out[0].get("caption") == "برد خوب تیم\n@dest"
+    try:
+        mod.build_messages(payload, input_dir=tmp_path)
+        assert False, "expected RuntimeError"
+    except RuntimeError as exc:
+        assert "ai_generation_required_failed" in str(exc)
 
 
-def test_football_script_fail_open_keeps_non_persian_caption_to_prevent_data_loss(
+def test_football_script_raises_when_mandatory_ai_unavailable_with_non_persian_source_caption(
     tmp_path: Path, monkeypatch
 ) -> None:
     mod = _load_module()
@@ -478,6 +527,8 @@ def test_football_script_fail_open_keeps_non_persian_caption_to_prevent_data_los
         "message": {"caption": "Fabinho says Neymar is still Brazil's most talented player."},
         "inputs": [{"kind": "photo", "local_name": "photo_1"}, {"kind": "photo", "local_name": "photo_2"}],
     }
-    out = mod.build_messages(payload, input_dir=tmp_path)
-    assert [item.get("path") for item in out] == ["photo_1", "photo_2"]
-    assert out[0].get("caption") == "Fabinho says Neymar is still Brazil's most talented player."
+    try:
+        mod.build_messages(payload, input_dir=tmp_path)
+        assert False, "expected RuntimeError"
+    except RuntimeError as exc:
+        assert "ai_generation_required_failed" in str(exc)

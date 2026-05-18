@@ -1890,7 +1890,7 @@ class KiwiService:
             stage_timings_ms["total"] = round((time.monotonic() - started_at) * 1000.0, 2)
             await self._audit_log(
                 stage="download",
-                status="failed",
+                status="blocked",
                 incoming=incoming,
                 route=route,
                 reason=f"Message size exceeded allowed limit: {exc}",
@@ -1913,11 +1913,11 @@ class KiwiService:
             )
             _monitor_stage(
                 stage="download",
-                status="failed",
-                progress_pct=42.0,
+                status="blocked",
+                progress_pct=100.0,
                 details=f"Message too large: {exc}",
             )
-            return "failed", str(exc)
+            return "blocked", str(exc)
         except PlatformApiError as exc:
             stage_timings_ms["total"] = round((time.monotonic() - started_at) * 1000.0, 2)
             error_text = str(exc)

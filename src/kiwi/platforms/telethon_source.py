@@ -312,9 +312,9 @@ class TelethonSourceClient:
         if msg is None:
             raise FileNotFoundError(f"Telethon message not found: {source_key}#{message_id}")
 
-        size = int(getattr(getattr(msg, "file", None), "size", 0) or 0)
-        if size > 0 and size > max_bytes:
-            raise MessageTooLargeError(f"Message exceeded size limit ({size} > {max_bytes} bytes)")
+        # Do not hard-fail on Telethon metadata size hints.
+        # Some media can report stale/inexact size metadata and cause false positives.
+        # Enforce the limit based on the actual downloaded file size instead.
 
         output_path.parent.mkdir(parents=True, exist_ok=True)
         before = {p.resolve() for p in output_path.parent.glob("*") if p.is_file()}

@@ -992,6 +992,152 @@ print(json.dumps({"messages":[{"type":"text","text":"نیکو اورایلی د�
     ]
 
 
+def test_service_keyword_priority_prefers_longer_phrase_when_priority_is_higher(tmp_path: Path) -> None:
+    scripts_dir = tmp_path / "scripts"
+    scripts_dir.mkdir()
+    (scripts_dir / "emit_text.py").write_text(
+        """
+import json
+print(json.dumps({"messages":[{"type":"text","text":"لیگ قهرمانان اروپا امشب برگزار می‌شود."}]}))
+""".strip(),
+        encoding="utf-8",
+    )
+
+    (tmp_path / "keyword_links.json").write_text(
+        json.dumps(
+            [
+                {
+                    "destination": "@uefa_champ_league",
+                    "link": "https://ble.ir/short_link",
+                    "keywords": [{"keyword": "لیگ قهرمانان", "priority": 10}],
+                },
+                {
+                    "destination": "@uefa_champ_league",
+                    "link": "https://ble.ir/long_link",
+                    "keywords": [{"keyword": "لیگ قهرمانان اروپا", "priority": 100}],
+                },
+            ],
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    update = {
+        "update_id": 115,
+        "channel_post": {
+            "message_id": 15,
+            "chat": {"id": -1001, "type": "channel"},
+            "text": "x",
+        },
+    }
+
+    settings = _settings(tmp_path)
+    route = ChannelRoute(
+        name="r-link-priority-long",
+        enabled=True,
+        source_channel_id="-1001",
+        source_channel_username=None,
+        destination_channel_id=None,
+        destination_channel_username="@uefa_champ_league",
+        channel_script="emit_text.py",
+        max_message_mb=10,
+    )
+    tg = FakeTelegramClient([update], b"")
+    bale = FakeBaleClient()
+    service = KiwiService(
+        settings=settings,
+        routes=_route_registry(route),
+        telegram_client=tg,
+        bale_client=bale,
+        storage=StorageManager(settings.storage_dir),
+        guard_runner=GuardRunner(settings.gaurd_scripts_dir, timeout_sec=5),
+        script_runner=ScriptRunner(settings.scripts_dir, timeout_sec=5),
+        state_store=StateStore(settings.state_path),
+    )
+
+    processed = asyncio.run(service.run_once())
+    assert processed == 1
+    assert bale.sent == [
+        (
+            "@uefa_champ_league",
+            "[لیگ قهرمانان اروپا](https://ble.ir/long_link) امشب برگزار می‌شود.\n@uefa_champ_league",
+        )
+    ]
+
+
+def test_service_keyword_priority_prefers_higher_priority_even_if_phrase_is_shorter(tmp_path: Path) -> None:
+    scripts_dir = tmp_path / "scripts"
+    scripts_dir.mkdir()
+    (scripts_dir / "emit_text.py").write_text(
+        """
+import json
+print(json.dumps({"messages":[{"type":"text","text":"لیگ قهرمانان اروپا امشب برگزار می‌شود."}]}))
+""".strip(),
+        encoding="utf-8",
+    )
+
+    (tmp_path / "keyword_links.json").write_text(
+        json.dumps(
+            [
+                {
+                    "destination": "@uefa_champ_league",
+                    "link": "https://ble.ir/short_wins",
+                    "keywords": [{"keyword": "لیگ قهرمانان", "priority": 1000}],
+                },
+                {
+                    "destination": "@uefa_champ_league",
+                    "link": "https://ble.ir/long_loses",
+                    "keywords": [{"keyword": "لیگ قهرمانان اروپا", "priority": 1}],
+                },
+            ],
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    update = {
+        "update_id": 116,
+        "channel_post": {
+            "message_id": 16,
+            "chat": {"id": -1001, "type": "channel"},
+            "text": "x",
+        },
+    }
+
+    settings = _settings(tmp_path)
+    route = ChannelRoute(
+        name="r-link-priority-short",
+        enabled=True,
+        source_channel_id="-1001",
+        source_channel_username=None,
+        destination_channel_id=None,
+        destination_channel_username="@uefa_champ_league",
+        channel_script="emit_text.py",
+        max_message_mb=10,
+    )
+    tg = FakeTelegramClient([update], b"")
+    bale = FakeBaleClient()
+    service = KiwiService(
+        settings=settings,
+        routes=_route_registry(route),
+        telegram_client=tg,
+        bale_client=bale,
+        storage=StorageManager(settings.storage_dir),
+        guard_runner=GuardRunner(settings.gaurd_scripts_dir, timeout_sec=5),
+        script_runner=ScriptRunner(settings.scripts_dir, timeout_sec=5),
+        state_store=StateStore(settings.state_path),
+    )
+
+    processed = asyncio.run(service.run_once())
+    assert processed == 1
+    assert bale.sent == [
+        (
+            "@uefa_champ_league",
+            "[لیگ قهرمانان](https://ble.ir/short_wins) اروپا امشب برگزار می‌شود.\n@uefa_champ_league",
+        )
+    ]
+
+
 def test_service_flow_skips_missing_source_media_without_unexpected_error(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
     route = ChannelRoute(

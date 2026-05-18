@@ -8,7 +8,7 @@ import time
 import asyncio
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 from kiwi.config import RouteRegistry, load_routes
 from kiwi.sync_ledger import SyncLedger
@@ -226,38 +226,21 @@ class ManagementApi:
         raw = json.loads(path.read_text(encoding="utf-8"))
         if not isinstance(raw, list):
             raise ValueError("keyword links config must be list")
-        out: list[dict] = []
+        out: list[dict[str, Any]] = []
         for item in raw:
-            if isinstance(item, dict):
-                out.append(item)
+            normalized = self._normalize_keyword_link_item(item)
+            if normalized is not None:
+                out.append(normalized)
         return out
 
     def save_keyword_links(self, payload: list[dict]) -> dict[str, object]:
         if not isinstance(payload, list):
             raise ValueError("keyword links payload must be list")
-        cleaned: list[dict[str, object]] = []
+        cleaned: list[dict[str, Any]] = []
         for item in payload:
-            if not isinstance(item, dict):
-                continue
-            destination = str(item.get("destination") or "").strip()
-            link = str(item.get("link") or "").strip()
-            keywords_raw = item.get("keywords")
-            if not destination:
-                continue
-            keywords: list[str] = []
-            if isinstance(keywords_raw, list):
-                for kw in keywords_raw:
-                    if isinstance(kw, str) and kw.strip():
-                        keywords.append(kw.strip())
-            if not keywords:
-                continue
-            cleaned.append(
-                {
-                    "destination": destination,
-                    "link": link,
-                    "keywords": keywords,
-                }
-            )
+            normalized = self._normalize_keyword_link_item(item)
+            if normalized is not None:
+                cleaned.append(normalized)
         path = self.keyword_links_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         _atomic_dump_json(path, cleaned)
@@ -265,6 +248,56 @@ class ManagementApi:
             "path": str(path),
             "count": len(cleaned),
             "updated_at": int(path.stat().st_mtime),
+        }
+
+    @staticmethod
+    def _normalize_keyword_link_item(item: object) -> dict[str, Any] | None:
+        if not isinstance(item, dict):
+            return None
+        destination = str(item.get("destination") or "").strip()
+        link = str(item.get("link") or "").strip()
+        if not destination:
+            return None
+
+        entry_priority_raw = item.get("priority")
+        try:
+            entry_priority = int(entry_priority_raw or 0)
+        except Exception:
+            entry_priority = 0
+
+        keywords_raw = item.get("keywords")
+        if not isinstance(keywords_raw, list):
+            return None
+
+        keywords: list[dict[str, object]] = []
+        seen: set[str] = set()
+        for kw in keywords_raw:
+            keyword_text = ""
+            keyword_priority = entry_priority
+            if isinstance(kw, str):
+                keyword_text = kw.strip()
+            elif isinstance(kw, dict):
+                keyword_text = str(kw.get("keyword") or kw.get("text") or kw.get("term") or "").strip()
+                try:
+                    keyword_priority = int(kw.get("priority") if kw.get("priority") is not None else entry_priority)
+                except Exception:
+                    keyword_priority = entry_priority
+            if not keyword_text:
+                continue
+            dedupe_key = keyword_text.casefold()
+            if dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+            keywords.append({"keyword": keyword_text, "priority": int(keyword_priority)})
+
+        if not keywords:
+            return None
+
+        keywords.sort(key=lambda obj: (-int(obj.get("priority") or 0), -len(str(obj.get("keyword") or ""))))
+        return {
+            "destination": destination,
+            "link": link,
+            "keywords": keywords,
         }
 
     def sync_stats_snapshot(self) -> dict:

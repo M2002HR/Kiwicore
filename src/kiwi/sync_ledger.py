@@ -10,7 +10,9 @@ from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
 
 TERMINAL_STATUSES = {"sent", "blocked", "skipped"}
-ACTIVE_STATUSES = {"queued", "processing", "failed", "ambiguous"}
+# Only statuses that are currently executable should block per-route ordering.
+# Keeping failed/ambiguous here can deadlock a route behind one bad record.
+ACTIVE_STATUSES = {"queued", "processing"}
 
 
 @dataclass(slots=True)
@@ -437,7 +439,7 @@ class SyncLedger:
                     conn,
                     """
                     SELECT dedupe_key FROM sync_message_ledger
-                    WHERE status IN ('queued', 'failed')
+                    WHERE status IN ('queued', 'failed', 'retry_wait')
                     ORDER BY first_seen_at ASC
                     LIMIT ?
                     """,

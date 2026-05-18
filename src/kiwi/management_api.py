@@ -18,6 +18,7 @@ from kiwi.utils import dump_json, safe_script_name
 _ROUTE_KEYS = {
     "name",
     "status",
+    "source_channel_id",
     "source_channel_username",
     "destination_channel_id",
     "destination_channel_username",
@@ -443,14 +444,15 @@ class ManagementApi:
         out = {k: v for k, v in dict(obj).items() if k in _ROUTE_KEYS or k == "script"}
         if "enabled" in obj and "status" not in out:
             out["status"] = "synced" if bool(obj.get("enabled")) else "deactive"
-        if "source_channel_username" not in out:
-            source_id_fallback = str(obj.get("source_channel_id") or "").strip()
-            if source_id_fallback:
-                out["source_channel_username"] = source_id_fallback
         if "channel_script" not in out and "script" in out:
             out["channel_script"] = out.get("script")
         out.pop("script", None)
-        out.pop("source_channel_id", None)
+        if "source_channel_username" in out:
+            source_username = str(out.get("source_channel_username") or "").strip()
+            out["source_channel_username"] = source_username or None
+        if "source_channel_id" in out:
+            source_id = str(out.get("source_channel_id") or "").strip()
+            out["source_channel_id"] = source_id or None
         legacy_sync_obj = obj.get("sync")
         if isinstance(legacy_sync_obj, dict):
             if "backfill_count" not in out and "backfill_count" in legacy_sync_obj:
@@ -507,7 +509,6 @@ class ManagementApi:
         out["retry_attempts"] = max(0, int(out.get("retry_attempts", 2) or 2))
         out.pop("sync", None)
         out.pop("enabled", None)
-        out.pop("source_channel_id", None)
         return out
 
     def _determine_start_status(self, route_name: str, route: dict) -> str:
@@ -653,6 +654,7 @@ def _route_dict_to_channel_route(route: dict) -> "ChannelRoute":
     return ChannelRoute(
         name=str(route.get("name") or ""),
         status=str(route.get("status") or "deactive"),
+        source_channel_id=str(route.get("source_channel_id") or "") or None,
         source_channel_username=str(route.get("source_channel_username") or "") or None,
         destination_channel_id=str(route.get("destination_channel_id") or "") or None,
         destination_channel_username=str(route.get("destination_channel_username") or "") or None,

@@ -43,6 +43,7 @@ def test_management_api_crud_and_reload(tmp_path: Path) -> None:
         }
     )
     assert created["name"] == "r1"
+    assert created["source_channel_id"] == "-1001"
     assert len(api.list_routes()) == 1
 
     updated = api.update_route("r1", {"max_message_mb": 33})

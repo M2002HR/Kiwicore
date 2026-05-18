@@ -59,6 +59,27 @@ class TelethonSourceClient:
         if ent_id > 0:
             self._entity_cache[f"-100{ent_id}"] = entity
 
+    @staticmethod
+    def _is_channel_entity(entity: Any) -> bool:
+        if entity is None:
+            return False
+        cls_name = str(getattr(entity.__class__, "__name__", "") or "").lower()
+        if "channel" in cls_name:
+            return True
+        if bool(getattr(entity, "broadcast", False)):
+            return True
+        if bool(getattr(entity, "megagroup", False)):
+            return True
+        if bool(getattr(entity, "gigagroup", False)):
+            return True
+        return False
+
+    def _cache_if_channel_entity(self, source_key: str, entity: Any, *, channel_id: str | None = None) -> bool:
+        if not self._is_channel_entity(entity):
+            return False
+        self._cache_entity(source_key, entity, channel_id=channel_id)
+        return True
+
     async def _resolve_entity_from_dialogs(self, channel_id: int) -> Any | None:
         if self._client is None:
             return None
@@ -79,6 +100,8 @@ class TelethonSourceClient:
                 except Exception:
                     continue
                 if ent_id == int(channel_id):
+                    if not self._is_channel_entity(entity):
+                        continue
                     return entity
             return None
 
@@ -429,12 +452,13 @@ class TelethonSourceClient:
         candidate = normalize_channel_username(username) or source_key
         try:
             entity = await self._client.get_entity(candidate)
-            self._cache_entity(source_key, entity, channel_id=channel_id)
-            logger.debug(
-                "Telethon source resolved via username/source_key",
-                extra={"details": {"source_key": source_key, "resolve_strategy": "username_or_source_key"}},
-            )
-            return entity
+            if self._cache_if_channel_entity(source_key, entity, channel_id=channel_id):
+                logger.debug(
+                    "Telethon source resolved via username/source_key",
+                    extra={"details": {"source_key": source_key, "resolve_strategy": "username_or_source_key"}},
+                )
+                return entity
+            resolve_errors.append(ValueError("resolved peer is not a channel"))
         except Exception as exc:
             resolve_errors.append(exc)
             pass
@@ -483,18 +507,19 @@ class TelethonSourceClient:
                     # Continue to source_key fallback before failing.
                     pass
                 else:
-                    self._cache_entity(source_key, entity, channel_id=normalized)
-                    logger.debug(
-                        "Telethon source resolved via route channel_id",
-                        extra={
-                            "details": {
-                                "source_key": source_key,
-                                "route_channel_id": channel_id,
-                                "resolve_strategy": "route_channel_id_peerchannel",
-                            }
-                        },
-                    )
-                    return entity
+                    if self._cache_if_channel_entity(source_key, entity, channel_id=normalized):
+                        logger.debug(
+                            "Telethon source resolved via route channel_id",
+                            extra={
+                                "details": {
+                                    "source_key": source_key,
+                                    "route_channel_id": channel_id,
+                                    "resolve_strategy": "route_channel_id_peerchannel",
+                                }
+                            },
+                        )
+                        return entity
+                    resolve_errors.append(ValueError("resolved peer is not a channel"))
 
             if normalized.lstrip("-").isdigit():
                 cid_int = int(normalized)
@@ -514,18 +539,19 @@ class TelethonSourceClient:
                     return dialog_entity
                 try:
                     entity = await self._client.get_entity(cid_int)
-                    self._cache_entity(source_key, entity, channel_id=normalized)
-                    logger.debug(
-                        "Telethon source resolved via numeric route id",
-                        extra={
-                            "details": {
-                                "source_key": source_key,
-                                "route_channel_id": channel_id,
-                                "resolve_strategy": "route_channel_id_numeric",
-                            }
-                        },
-                    )
-                    return entity
+                    if self._cache_if_channel_entity(source_key, entity, channel_id=normalized):
+                        logger.debug(
+                            "Telethon source resolved via numeric route id",
+                            extra={
+                                "details": {
+                                    "source_key": source_key,
+                                    "route_channel_id": channel_id,
+                                    "resolve_strategy": "route_channel_id_numeric",
+                                }
+                            },
+                        )
+                        return entity
+                    resolve_errors.append(ValueError("resolved peer is not a channel"))
                 except Exception as exc:
                     resolve_errors.append(exc)
 
@@ -545,12 +571,13 @@ class TelethonSourceClient:
                 return dialog_entity
             try:
                 entity = await self._client.get_entity(cid_int)
-                self._cache_entity(source_key, entity, channel_id=f"-100{cid_int}")
-                logger.debug(
-                    "Telethon source resolved via numeric source_key",
-                    extra={"details": {"source_key": source_key, "resolve_strategy": "numeric_source_key"}},
-                )
-                return entity
+                if self._cache_if_channel_entity(source_key, entity, channel_id=f"-100{cid_int}"):
+                    logger.debug(
+                        "Telethon source resolved via numeric source_key",
+                        extra={"details": {"source_key": source_key, "resolve_strategy": "numeric_source_key"}},
+                    )
+                    return entity
+                resolve_errors.append(ValueError("resolved peer is not a channel"))
             except Exception as exc:
                 resolve_errors.append(exc)
 

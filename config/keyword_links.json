@@ -95,6 +95,11 @@
     "keywords": ["لیورپول", "باشگاه لیورپول", "قرمزهای مرسی‌ساید", "ردز"]
   },
   {
+    "destination": "@laliga_fa",
+    "link": "https://ble.ir/laliga_fa",
+    "keywords": ["لالیگا", "لا لیگا", "لالیگا اسپانیا", "لیگ اسپانیا", "LaLiga", "la liga"]
+  },
+  {
     "destination": "@madrid_atletico",
     "link": "https://ble.ir/madrid_atletico",
     "keywords": ["اتلتیکو", "اتلتیکو مادرید", "باشگاه اتلتیکو", "روخی‌بلانکوس"]
@@ -128,6 +133,11 @@
     "destination": "@paris_saint_germain_ir",
     "link": "https://ble.ir/paris_saint_germain_ir",
     "keywords": ["پاری سن ژرمن", "پاریس سن ژرمن", "پاری‌سن‌ژرمن", "پی اس جی"]
+  },
+  {
+    "destination": "@premier_league_ir",
+    "link": "https://ble.ir/premier_league_ir",
+    "keywords": ["پریمیر لیگ", "پرمیر لیگ", "پریمییر لیگ", "لیگ برتر انگلیس", "لیگ انگلیس", "Premier League", "premier league"]
   },
   {
     "destination": "@real_madrid_fa",

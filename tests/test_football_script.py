@@ -406,10 +406,17 @@ def test_football_script_builds_prompt_even_when_ai_is_disabled(tmp_path: Path, 
     seen: dict[str, str] = {}
     original_prompt = mod._football_prompt
 
-    def tracking_prompt(source_text: str, destination: str) -> str:
+    def tracking_prompt(source_text: str, destination: str, *, length_instruction: str, layout_instruction: str) -> str:
         seen["source_text"] = source_text
         seen["destination"] = destination
-        return original_prompt(source_text, destination)
+        seen["length_instruction"] = length_instruction
+        seen["layout_instruction"] = layout_instruction
+        return original_prompt(
+            source_text,
+            destination,
+            length_instruction=length_instruction,
+            layout_instruction=layout_instruction,
+        )
 
     monkeypatch.setattr(mod, "_football_prompt", tracking_prompt)
 
@@ -421,7 +428,45 @@ def test_football_script_builds_prompt_even_when_ai_is_disabled(tmp_path: Path, 
     out = mod.build_messages(payload, input_dir=tmp_path)
     assert seen["destination"] == "@dest"
     assert "TEXT:" in seen["source_text"]
+    assert "طول خروجی باید نزدیک طول ورودی باشد" in seen["length_instruction"]
+    assert "خروجی را خوانا نگه دار" in seen["layout_instruction"]
     assert out == [{"type": "text", "text": "Inter Miami won"}]
+
+
+def test_football_script_length_bounds_follow_source_size() -> None:
+    mod = _load_module()
+    low_s, high_s, bucket_s = mod._source_length_bounds("گل")
+    medium_source = (
+        "تیم در نیمه اول با پرس شدید بازی را کنترل کرد و بعد از گل اول، با پاس‌های کوتاه و منظم "
+        "ریتم مسابقه را نگه داشت تا حریف نتواند ضدحمله‌های خطرناک بسازد."
+    )
+    low_m, high_m, bucket_m = mod._source_length_bounds(medium_source)
+    long_source = " ".join(["تیم"] * 180)
+    low_l, high_l, bucket_l = mod._source_length_bounds(long_source)
+    assert bucket_s == "short"
+    assert bucket_m == "medium"
+    assert bucket_l == "long"
+    assert low_s < low_m < low_l
+    assert high_s < high_m < high_l
+
+
+def test_football_script_applies_newline_layout_when_source_is_multiline(tmp_path: Path, monkeypatch) -> None:
+    mod = _load_module()
+    monkeypatch.setenv("CHANNEL_SCRIPT_AI_ENABLED", "true")
+    monkeypatch.setenv("CHANNEL_SCRIPT_AI_ENDPOINT", "http://fake.local/proxy/gemini")
+
+    def fake_call(*, endpoint: str, body: dict, timeout_sec: float):
+        return "تیم عالی بود. مالکیت بالا بود. دفاع منسجم بود."
+
+    monkeypatch.setattr(mod, "_call_gemini_text", fake_call)
+    payload = {
+        "route": {"destination_target": "@dest"},
+        "message": {"caption": "خط اول\nخط دوم\n@dest"},
+        "inputs": [{"kind": "photo", "local_name": "a.jpg"}],
+    }
+    out = mod.build_messages(payload, input_dir=tmp_path)
+    caption = str(out[0].get("caption") or "")
+    assert "\n" in caption
 
 
 def test_football_script_rejects_non_persian_caption_in_mandatory_mode(tmp_path: Path, monkeypatch) -> None:

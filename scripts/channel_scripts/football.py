@@ -53,6 +53,26 @@ def _normalize_text(text: str) -> str:
     return "\n".join(lines).strip()
 
 
+def _normalize_multiline_text(text: str) -> str:
+    text = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
+    out: list[str] = []
+    prev_blank = False
+    for raw in text.split("\n"):
+        line = re.sub(r"[ \t]+", " ", raw).strip()
+        if not line:
+            if out and not prev_blank:
+                out.append("")
+            prev_blank = True
+            continue
+        out.append(line)
+        prev_blank = False
+    while out and out[0] == "":
+        out.pop(0)
+    while out and out[-1] == "":
+        out.pop()
+    return "\n".join(out).strip()
+
+
 def _resolve_local_name(item: dict) -> str | None:
     local_name = item.get("local_name")
     if isinstance(local_name, str) and local_name.strip():
@@ -211,6 +231,86 @@ def _collect_source_text(payload: dict) -> str:
         parts.append(f"CAPTION:\n{caption.strip()}")
 
     return "\n\n".join(parts).strip()
+
+
+def _collect_source_content_text(payload: dict) -> str:
+    message = payload.get("message") or {}
+    if not isinstance(message, dict):
+        return ""
+
+    text = str(message.get("text") or "").strip()
+    caption = str(message.get("caption") or "").strip()
+    parts: list[str] = []
+    if text:
+        parts.append(text)
+    if caption and caption != text:
+        parts.append(caption)
+    return _normalize_multiline_text("\n\n".join(parts))
+
+
+def _source_length_bounds(source_content: str) -> tuple[int, int, str]:
+    normalized = re.sub(r"\s+", " ", str(source_content or "")).strip()
+    n = len(normalized)
+    if n <= 0:
+        return (55, 220, "medium")
+    if n < 90:
+        low = max(18, int(n * 0.55))
+        high = max(low + 28, int(n * 1.70))
+        return (low, min(220, high), "short")
+    if n <= 260:
+        low = max(70, int(n * 0.65))
+        high = max(low + 40, int(n * 1.45))
+        return (low, min(430, high), "medium")
+    low = max(170, int(n * 0.60))
+    high = max(low + 70, int(n * 1.35))
+    return (low, min(700, high), "long")
+
+
+def _source_length_instruction(source_content: str) -> str:
+    low, high, bucket = _source_length_bounds(source_content)
+    if bucket == "short":
+        bucket_hint = "کوتاه"
+    elif bucket == "long":
+        bucket_hint = "بلند"
+    else:
+        bucket_hint = "متوسط"
+    return (
+        f"طول خروجی باید نزدیک طول ورودی باشد (سطح {bucket_hint}). "
+        f"حدود طول مناسب: بین {low} تا {high} کاراکتر."
+    )
+
+
+def _content_length_without_signature(text: str, *, destination: str = "") -> int:
+    body = _normalize_for_language_quality(text, destination=destination)
+    compact = re.sub(r"\s+", " ", body).strip()
+    return len(compact)
+
+
+def _is_length_acceptable(text: str, *, source_content: str, destination: str = "") -> bool:
+    if not text:
+        return False
+    low, high, _ = _source_length_bounds(source_content)
+    size = _content_length_without_signature(text, destination=destination)
+    return low <= size <= high
+
+
+def _source_layout_hint(payload: dict) -> tuple[int, bool]:
+    source = _collect_source_content_text(payload)
+    if not source:
+        return (1, False)
+    lines = [line for line in source.splitlines() if line.strip()]
+    has_multiline = len(lines) >= 2 or "\n\n" in source
+    target_lines = max(1, min(4, len(lines))) if has_multiline else 1
+    return (target_lines, has_multiline)
+
+
+def _source_layout_instruction(payload: dict) -> str:
+    target_lines, multiline = _source_layout_hint(payload)
+    if not multiline:
+        return "خروجی را خوانا نگه دار و از شکستن بی‌دلیل خط خودداری کن."
+    if target_lines <= 2:
+        return "فرمت خروجی را مثل ورودی نگه دار و با دو خط مجزا بنویس."
+    return f"فرمت خروجی را مثل ورودی نگه دار و حدود {target_lines} خط خوانا با newline مناسب بده."
 
 
 def _has_textual_source(payload: dict) -> bool:
@@ -394,7 +494,7 @@ def _load_image_parts(payload: dict, input_dir: Path) -> list[dict]:
     return parts
 
 
-def _football_prompt(source_text: str, destination: str) -> str:
+def _football_prompt(source_text: str, destination: str, *, length_instruction: str, layout_instruction: str) -> str:
     return (
         "تو یک نویسنده حرفه‌ای محتوای فوتبالی فارسی هستی.\n"
         "ورودی می‌تواند متن خام، کپشن، یا تصاویر فوتبال باشد.\n"
@@ -409,6 +509,8 @@ def _football_prompt(source_text: str, destination: str) -> str:
         "7) لینک و هشتگ تبلیغی نیاور.\n"
         "8) اگر امضای مقصد داده شده، فقط در خط آخر و فقط یک بار بیاور.\n\n"
         "9) ایموجی‌های معنادار ورودی را حذف نکن و در خروجی به‌شکل طبیعی حفظ کن.\n\n"
+        f"10) {length_instruction}\n"
+        f"11) {layout_instruction}\n\n"
         f"امضای مقصد: {destination or '<none>'}\n\n"
         f"ورودی:\n{source_text or '<empty>'}\n\n"
         "اگر متن ورودی خالی بود، فقط با اتکا به تصاویر/مدیای ورودی یک کپشن فوتبالی مرتبط تولید کن."
@@ -519,7 +621,7 @@ def _sanitize_ai_output(text: str) -> str:
         if PROMPT_LEAK_RE.search(line):
             continue
         lines.append(line)
-    return _normalize_text("\n".join(lines))
+    return _normalize_multiline_text("\n".join(lines))
 
 
 def _is_latin_heavy_line(line: str) -> bool:
@@ -545,7 +647,7 @@ def _strip_prompt_leakage_lines(text: str, *, destination: str = "") -> str:
         if _is_latin_heavy_line(line) and not PERSIAN_CHAR_RE.search(line):
             continue
         kept.append(line)
-    return _normalize_text("\n".join(kept))
+    return _normalize_multiline_text("\n".join(kept))
 
 
 def _dedupe_lines(text: str) -> str:
@@ -560,7 +662,7 @@ def _dedupe_lines(text: str) -> str:
             continue
         seen.add(key)
         out.append(line)
-    return _normalize_text("\n".join(out))
+    return _normalize_multiline_text("\n".join(out))
 
 
 def _normalize_signature(text: str, destination: str) -> str:
@@ -576,12 +678,12 @@ def _normalize_signature(text: str, destination: str) -> str:
                 had_signature = True
                 continue
             out_lines.append(line)
-        out = _normalize_text("\n".join(out_lines))
+        out = _normalize_multiline_text("\n".join(out_lines))
         if had_signature and out:
             out = f"{out}\n{destination}"
         elif had_signature and not out:
             out = destination
-    return out
+    return _normalize_multiline_text(out)
 
 
 def _is_emoji_base_char(ch: str) -> bool:
@@ -702,19 +804,65 @@ def _preserve_source_emojis(text: str, *, destination: str, source_emojis: list[
             body[0] = f"{bundle} {body[0]}".strip()
         else:
             body = [bundle]
-        return _normalize_text("\n".join([*body, destination]))
+        return _normalize_multiline_text("\n".join([*body, destination]))
 
     lines[0] = f"{bundle} {lines[0]}".strip()
-    return _normalize_text("\n".join(lines))
+    return _normalize_multiline_text("\n".join(lines))
 
 
-def _postprocess_generated_text(text: str, *, destination: str) -> str:
+def _split_sentences_for_layout(text: str) -> list[str]:
+    compact = _normalize_multiline_text(text)
+    if not compact:
+        return []
+    compact = re.sub(r"\s*\n\s*", " ", compact).strip()
+    parts = re.split(r"(?<=[\.\!\?؟])\s+", compact)
+    out = [part.strip() for part in parts if part and part.strip()]
+    return out
+
+
+def _apply_layout_hint(text: str, *, target_lines: int, prefer_multiline: bool, destination: str = "") -> str:
+    normalized = _normalize_multiline_text(text)
+    if not normalized or not prefer_multiline:
+        return normalized
+    body_lines = [line for line in normalized.splitlines() if line.strip()]
+    dst = str(destination or "").strip()
+    has_signature = bool(dst and body_lines and body_lines[-1] == dst)
+    if has_signature:
+        body_lines = body_lines[:-1]
+    if len(body_lines) >= 2:
+        return normalized
+
+    target = max(2, min(4, int(target_lines or 2)))
+    sentences = _split_sentences_for_layout("\n".join(body_lines))
+    if len(sentences) < 2:
+        text_line = " ".join(body_lines).strip()
+        comma_parts = [p.strip() for p in text_line.split("،") if p.strip()]
+        if len(comma_parts) >= 2:
+            sentences = [f"{p}." if not re.search(r"[.!؟?]$", p) else p for p in comma_parts]
+    if len(sentences) < 2:
+        return normalized
+
+    line_count = min(target, len(sentences))
+    chunk_size = max(1, (len(sentences) + line_count - 1) // line_count)
+    new_lines: list[str] = []
+    idx = 0
+    while idx < len(sentences):
+        chunk = sentences[idx : idx + chunk_size]
+        new_lines.append(" ".join(chunk).strip())
+        idx += chunk_size
+    if has_signature:
+        new_lines.append(dst)
+    return _normalize_multiline_text("\n".join(new_lines))
+
+
+def _postprocess_generated_text(text: str, *, destination: str, target_lines: int = 1, prefer_multiline: bool = False) -> str:
     out = _strip_md_fence(text)
     out = _sanitize_ai_output(out)
     out = _strip_prompt_leakage_lines(out, destination=destination)
     out = _dedupe_lines(out)
     out = _normalize_signature(out, destination)
-    return _normalize_text(out)
+    out = _apply_layout_hint(out, target_lines=target_lines, prefer_multiline=prefer_multiline, destination=destination)
+    return _normalize_multiline_text(out)
 
 
 def _looks_low_quality(text: str) -> bool:
@@ -818,9 +966,18 @@ def _has_meaningful_source(payload: dict) -> bool:
 
 def _generate_football_text(*, payload: dict, input_dir: Path, base_messages: list[dict]) -> str | None:
     source_text = _collect_source_text(payload)
+    source_content = _collect_source_content_text(payload)
     destination = _destination_signature(payload)
     source_emojis = _source_emoji_tokens(payload)
-    prompt = _football_prompt(source_text, destination=destination)
+    target_lines, prefer_multiline = _source_layout_hint(payload)
+    length_instruction = _source_length_instruction(source_content)
+    layout_instruction = _source_layout_instruction(payload)
+    prompt = _football_prompt(
+        source_text,
+        destination=destination,
+        length_instruction=length_instruction,
+        layout_instruction=layout_instruction,
+    )
 
     if not _football_ai_enabled():
         return None
@@ -863,10 +1020,18 @@ def _generate_football_text(*, payload: dict, input_dir: Path, base_messages: li
     if first is None:
         return "" if not _ai_fail_open() else None
 
-    cleaned = _postprocess_generated_text(first, destination=destination)
+    cleaned = _postprocess_generated_text(
+        first,
+        destination=destination,
+        target_lines=target_lines,
+        prefer_multiline=prefer_multiline,
+    )
     cleaned = _preserve_source_emojis(cleaned, destination=destination, source_emojis=source_emojis)
 
-    if _looks_low_quality(cleaned) and _remaining_budget() > 6.0:
+    if (
+        (_looks_low_quality(cleaned) or not _is_length_acceptable(cleaned, source_content=source_content, destination=destination))
+        and _remaining_budget() > 6.0
+    ):
         refine_prompt = (
             "متن زیر را به یک پست فوتبالی فارسی روان، طبیعی و آماده انتشار بازنویسی کن.\n"
             "هیچ توضیحی اضافه نکن و فقط نسخه نهایی را بده.\n"
@@ -875,6 +1040,8 @@ def _generate_football_text(*, payload: dict, input_dir: Path, base_messages: li
             "ایموجی‌های اصلی متن را حذف نکن.\n\n"
             "هیچ خط انگلیسی یا توضیح فرامتنی نیاور.\n"
             "اگر امضای مقصد وجود دارد، فقط یک‌بار در خط آخر بیاور.\n\n"
+            f"{length_instruction}\n"
+            f"{layout_instruction}\n\n"
             f"متن:\n{cleaned or source_text or 'از روی تصویر یک کپشن فوتبالی بساز'}"
         )
         refine_parts = [{"text": refine_prompt}, *image_parts] if has_visual_context else [{"text": refine_prompt}]
@@ -884,7 +1051,12 @@ def _generate_football_text(*, payload: dict, input_dir: Path, base_messages: li
 
         second = _call_with_budget(refine_body)
         if second:
-            candidate = _postprocess_generated_text(second, destination=destination)
+            candidate = _postprocess_generated_text(
+                second,
+                destination=destination,
+                target_lines=target_lines,
+                prefer_multiline=prefer_multiline,
+            )
             candidate = _preserve_source_emojis(candidate, destination=destination, source_emojis=source_emojis)
             if candidate:
                 cleaned = candidate
@@ -910,6 +1082,8 @@ def _generate_football_text(*, payload: dict, input_dir: Path, base_messages: li
                 "معنی تغییر نکند.\n"
                 "حداکثر 4 جمله.\n\n"
                 "ایموجی‌های موجود را حذف نکن.\n\n"
+                f"{length_instruction}\n"
+                f"{layout_instruction}\n\n"
                 f"متن:\n{strict_source}"
             )
             strict_parts = [{"text": strict_prompt}, *image_parts] if has_visual_context else [{"text": strict_prompt}]
@@ -919,12 +1093,49 @@ def _generate_football_text(*, payload: dict, input_dir: Path, base_messages: li
             strict = _call_with_budget(strict_body)
             if not strict:
                 continue
-            strict_clean = _postprocess_generated_text(strict, destination=destination)
+            strict_clean = _postprocess_generated_text(
+                strict,
+                destination=destination,
+                target_lines=target_lines,
+                prefer_multiline=prefer_multiline,
+            )
             strict_clean = _preserve_source_emojis(strict_clean, destination=destination, source_emojis=source_emojis)
             if strict_clean:
                 cleaned = strict_clean
             if _is_persian_acceptable(cleaned, destination=destination):
                 break
+
+    adjust_attempts = 0
+    while (
+        cleaned
+        and not _is_length_acceptable(cleaned, source_content=source_content, destination=destination)
+        and _remaining_budget() > 4.0
+        and adjust_attempts < 2
+    ):
+        adjust_attempts += 1
+        low, high, _ = _source_length_bounds(source_content)
+        adjust_prompt = (
+            "متن زیر را با همان معنا بازنویسی کن و فقط طول و فرم را تنظیم کن.\n"
+            "هیچ توضیح اضافه نده.\n"
+            "فقط نسخه نهایی را بده.\n"
+            f"طول خروجی باید بین {low} تا {high} کاراکتر باشد.\n"
+            f"{layout_instruction}\n\n"
+            f"متن:\n{cleaned}"
+        )
+        adjust_parts = [{"text": adjust_prompt}, *image_parts] if has_visual_context else [{"text": adjust_prompt}]
+        adjust_body = _build_body(adjust_parts, temperature=0.08)
+        adjusted = _call_with_budget(adjust_body)
+        if not adjusted:
+            break
+        adjusted_clean = _postprocess_generated_text(
+            adjusted,
+            destination=destination,
+            target_lines=target_lines,
+            prefer_multiline=prefer_multiline,
+        )
+        adjusted_clean = _preserve_source_emojis(adjusted_clean, destination=destination, source_emojis=source_emojis)
+        if adjusted_clean:
+            cleaned = adjusted_clean
 
     if not cleaned:
         return ""

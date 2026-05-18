@@ -9,8 +9,10 @@ import os
 import secrets
 import shutil
 import socket
+import ssl
 import threading
 import time
+import contextlib
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -19,7 +21,13 @@ from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse, urlencode
+
+try:  # optional at import-time; required for realtime websocket server
+    from websockets.legacy.server import WebSocketServerProtocol, serve as ws_serve
+except Exception:  # pragma: no cover - dependency may be missing in limited test envs
+    WebSocketServerProtocol = Any  # type: ignore[misc,assignment]
+    ws_serve = None  # type: ignore[assignment]
 
 from kiwi.admin_store import AdminStore
 from kiwi.config import Settings
@@ -32,6 +40,13 @@ logger = logging.getLogger(__name__)
 
 @dataclass(slots=True)
 class _Session:
+    username: str
+    issued_at: float
+    expires_at: float
+
+
+@dataclass(slots=True)
+class _RealtimeTicket:
     username: str
     issued_at: float
     expires_at: float
@@ -55,15 +70,25 @@ class AdminWebServer:
 
         self._sessions: dict[str, _Session] = {}
         self._sessions_lock = threading.Lock()
+        self._realtime_tickets: dict[str, _RealtimeTicket] = {}
+        self._realtime_tickets_lock = threading.Lock()
 
         self._static_root = Path(__file__).resolve().parent / "webui"
         self._httpd: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
+        self._ws_thread: threading.Thread | None = None
+        self._ws_loop: asyncio.AbstractEventLoop | None = None
+        self._ws_shutdown = threading.Event()
+        self._ws_ready = threading.Event()
+        self._ws_port = int(self.settings.admin_ws_port) if int(self.settings.admin_ws_port or 0) > 0 else int(self.settings.admin_web_port) + 1
+        self._ws_ssl_context: ssl.SSLContext | None = None
+        self._ws_tls_enabled = False
 
     def start(self) -> None:
         if self._httpd is not None:
             return
 
+        self._start_ws_server()
         handler_cls = self._build_handler_class()
         self._httpd = ThreadingHTTPServer((self.settings.admin_web_host, int(self.settings.admin_web_port)), handler_cls)
         self._httpd.daemon_threads = True
@@ -77,6 +102,8 @@ class AdminWebServer:
                 "details": {
                     "host": self.settings.admin_web_host,
                     "port": int(self.settings.admin_web_port),
+                    "websocket_port": int(self._ws_port),
+                    "websocket_tls": bool(self._ws_tls_enabled),
                     "static_root": str(self._static_root),
                 }
             },
@@ -84,15 +111,289 @@ class AdminWebServer:
 
     def stop(self) -> None:
         httpd = self._httpd
-        if httpd is None:
-            return
         try:
-            httpd.shutdown()
-            httpd.server_close()
+            if httpd is not None:
+                httpd.shutdown()
+                httpd.server_close()
         finally:
             self._httpd = None
             self._thread = None
+            self._stop_ws_server()
             logger.info("Admin web panel stopped")
+
+    def _start_ws_server(self) -> None:
+        if self._ws_thread is not None:
+            return
+        self._ws_ssl_context = self._build_ws_ssl_context()
+        self._ws_tls_enabled = self._ws_ssl_context is not None
+        self._ws_shutdown.clear()
+        self._ws_ready.clear()
+        self._ws_thread = threading.Thread(target=self._ws_thread_main, name="kiwi-admin-ws", daemon=True)
+        self._ws_thread.start()
+        self._ws_ready.wait(timeout=2.5)
+
+    def _stop_ws_server(self) -> None:
+        self._ws_shutdown.set()
+        loop = self._ws_loop
+        if loop is not None:
+            try:
+                loop.call_soon_threadsafe(lambda: None)
+            except Exception:
+                pass
+        thread = self._ws_thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=2.5)
+        self._ws_thread = None
+        self._ws_loop = None
+        self._ws_ssl_context = None
+        self._ws_tls_enabled = False
+        self._ws_ready.clear()
+
+    def _build_ws_ssl_context(self) -> ssl.SSLContext | None:
+        cert_path = str(self.settings.admin_ws_tls_cert_path or "").strip()
+        key_path = str(self.settings.admin_ws_tls_key_path or "").strip()
+        if not cert_path or not key_path:
+            return None
+        cert_file = Path(cert_path)
+        key_file = Path(key_path)
+        if not cert_file.exists() or not key_file.exists():
+            logger.warning(
+                "Websocket TLS cert/key not found; starting without TLS",
+                extra={"details": {"cert_path": cert_path, "key_path": key_path}},
+            )
+            return None
+        try:
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            context.load_cert_chain(str(cert_file), str(key_file))
+            return context
+        except Exception:
+            logger.exception(
+                "Failed to load websocket TLS cert/key; starting without TLS",
+                extra={"details": {"cert_path": cert_path, "key_path": key_path}},
+            )
+            return None
+
+    def _ws_thread_main(self) -> None:
+        loop = asyncio.new_event_loop()
+        self._ws_loop = loop
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(self._ws_main())
+        except Exception:
+            logger.exception("Admin websocket server crashed")
+        finally:
+            pending = asyncio.all_tasks(loop)
+            for task in pending:
+                task.cancel()
+            if pending:
+                with contextlib.suppress(Exception):
+                    loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+            with contextlib.suppress(Exception):
+                loop.run_until_complete(loop.shutdown_asyncgens())
+            loop.close()
+
+    async def _ws_main(self) -> None:
+        if ws_serve is None:
+            logger.warning("websockets dependency is missing; realtime websocket server disabled")
+            self._ws_ready.set()
+            while not self._ws_shutdown.is_set():
+                await asyncio.sleep(0.5)
+            return
+
+        clients: dict[WebSocketServerProtocol, set[str]] = {}
+        clients_lock = asyncio.Lock()
+
+        async def send_json(client: WebSocketServerProtocol, payload: dict[str, Any]) -> None:
+            try:
+                await client.send(json.dumps(payload, ensure_ascii=False))
+            except Exception:
+                with contextlib.suppress(Exception):
+                    await client.close()
+
+        async def broadcast(payload: dict[str, Any], *, scopes: set[str] | None = None) -> None:
+            if not clients:
+                return
+            target_scopes = {str(s).strip() for s in (scopes or set()) if str(s).strip()}
+            async with clients_lock:
+                if not target_scopes:
+                    targets = list(clients.keys())
+                else:
+                    targets = [
+                        ws
+                        for ws, ws_scopes in clients.items()
+                        if ws_scopes.intersection(target_scopes) or "*" in ws_scopes
+                    ]
+            if not targets:
+                return
+            await asyncio.gather(*(send_json(client, payload) for client in targets), return_exceptions=True)
+
+        def parse_scopes(query: dict[str, list[str]]) -> set[str]:
+            out: set[str] = set()
+            scope_one = _q_str(query, "scope")
+            if scope_one:
+                out.add(scope_one)
+            scopes_raw = _q_str(query, "scopes")
+            if scopes_raw:
+                for item in str(scopes_raw).split(","):
+                    token = str(item).strip()
+                    if token:
+                        out.add(token)
+            if not out:
+                out.add("dashboard_cards")
+            return out
+
+        async def auth_and_register(websocket: WebSocketServerProtocol) -> tuple[bool, str | None, set[str]]:
+            parsed = urlparse(str(getattr(websocket, "path", "") or ""))
+            if parsed.path != "/ws":
+                with contextlib.suppress(Exception):
+                    await websocket.close(code=1008, reason="invalid_path")
+                return False, None, set()
+            query = parse_qs(parsed.query or "")
+            ticket = _q_str(query, "ticket")
+            username = self._validate_realtime_ticket(ticket or "")
+            if not username:
+                with contextlib.suppress(Exception):
+                    await websocket.close(code=1008, reason="unauthorized")
+                return False, None, set()
+            scopes = parse_scopes(query)
+            async with clients_lock:
+                clients[websocket] = scopes
+            return True, username, scopes
+
+        async def unregister(websocket: WebSocketServerProtocol) -> None:
+            async with clients_lock:
+                clients.pop(websocket, None)
+
+        async def ws_handler(websocket: WebSocketServerProtocol) -> None:
+            ok, username, scopes = await auth_and_register(websocket)
+            if not ok:
+                return
+            latest_seq = int(self.service.message_monitor_events(after_seq=0, limit=1).get("latest_seq") or 0)
+            await send_json(
+                websocket,
+                {
+                    "type": "hello",
+                    "latest_seq": latest_seq,
+                    "username": username,
+                    "scopes": sorted(scopes),
+                    "server_time": datetime.now(tz=timezone.utc).isoformat(),
+                },
+            )
+            try:
+                async for raw in websocket:
+                    try:
+                        data = json.loads(str(raw or "{}"))
+                    except Exception:
+                        continue
+                    if not isinstance(data, dict):
+                        continue
+                    msg_type = str(data.get("type") or "").strip().lower()
+                    if msg_type != "subscribe":
+                        continue
+                    raw_scopes = data.get("scopes")
+                    if not isinstance(raw_scopes, list):
+                        continue
+                    normalized = {str(item).strip() for item in raw_scopes if str(item).strip()}
+                    if not normalized:
+                        continue
+                    async with clients_lock:
+                        if websocket in clients:
+                            clients[websocket] = normalized
+                    await send_json(websocket, {"type": "subscribed", "scopes": sorted(normalized)})
+            except Exception:
+                pass
+            finally:
+                await unregister(websocket)
+
+        async def push_loop() -> None:
+            last_seq = 0
+            next_hint_at = time.time()
+            hint_scopes = {
+                "dashboard_cards",
+                "routes_table",
+                "keywords_table",
+                "sync_reviews_table",
+                "monitor_messages_table",
+                "logs_table",
+                "traffic_runs_table",
+                "traffic_routes_table",
+                "workers_status_table",
+                "storage_runs_table",
+                "system_checks_table",
+                "admins_table",
+                "scripts_meta",
+            }
+            monitor_scopes = {
+                "monitor_messages_table",
+                "sync_reviews_table",
+                "workers_status_table",
+                "dashboard_cards",
+                "routes_table",
+                "traffic_runs_table",
+                "traffic_routes_table",
+                "storage_runs_table",
+            }
+            while not self._ws_shutdown.is_set():
+                try:
+                    payload = self.service.message_monitor_events(after_seq=last_seq, limit=500)
+                    events = payload.get("events") if isinstance(payload, dict) else []
+                    latest_seq = int(payload.get("latest_seq") or 0) if isinstance(payload, dict) else last_seq
+                    if isinstance(events, list) and events:
+                        await broadcast(
+                            {
+                                "type": "monitor_events",
+                                "events": events,
+                                "latest_seq": latest_seq,
+                                "scopes": sorted(monitor_scopes),
+                            },
+                            scopes=monitor_scopes,
+                        )
+                    if latest_seq > last_seq:
+                        last_seq = latest_seq
+                    now = time.time()
+                    if now >= next_hint_at:
+                        await broadcast(
+                            {
+                                "type": "refresh_hint",
+                                "scopes": sorted(hint_scopes),
+                                "ts": datetime.now(tz=timezone.utc).isoformat(),
+                            },
+                            scopes=hint_scopes,
+                        )
+                        next_hint_at = now + 2.0
+                except Exception:
+                    logger.exception("Admin websocket broadcaster loop failed")
+                await asyncio.sleep(0.45)
+
+        host = "0.0.0.0"
+        async with ws_serve(
+            ws_handler,
+            host,
+            int(self._ws_port),
+            ping_interval=25,
+            ping_timeout=None,
+            max_size=2_000_000,
+            ssl=self._ws_ssl_context,
+        ):
+            self._ws_ready.set()
+            logger.info(
+                "Admin websocket server started",
+                extra={"details": {"host": host, "port": int(self._ws_port), "tls": bool(self._ws_ssl_context)}},
+            )
+            task = asyncio.create_task(push_loop())
+            try:
+                while not self._ws_shutdown.is_set():
+                    await asyncio.sleep(0.4)
+            finally:
+                task.cancel()
+                with contextlib.suppress(Exception):
+                    await task
+                async with clients_lock:
+                    targets = list(clients.keys())
+                    clients.clear()
+                for client in targets:
+                    with contextlib.suppress(Exception):
+                        await client.close(code=1001, reason="server_shutdown")
 
     def _build_handler_class(self):
         parent = self
@@ -349,6 +650,10 @@ class AdminWebServer:
                 if not username:
                     return
 
+                if path == "/api/realtime/config" and method == "GET":
+                    self._send_json({"ok": True, **parent._realtime_config(username=username, request_headers=self.headers)})
+                    return
+
                 if path == "/api/dashboard" and method == "GET":
                     self._send_json({"ok": True, "data": parent._dashboard_snapshot()})
                     return
@@ -485,6 +790,29 @@ class AdminWebServer:
                     self._send_json({"ok": True, "workers": parent._workers_status_snapshot()})
                     return
 
+                if path == "/api/monitor/messages" and method == "GET":
+                    limit = _q_int(query, "limit", 200, min_value=1, max_value=2000)
+                    route_name = _q_str(query, "route")
+                    status = _q_str(query, "status")
+                    search = _q_str(query, "search")
+                    active_only = _q_bool(query, "active_only", False)
+                    payload = parent.service.message_monitor_snapshot(
+                        limit=limit,
+                        route_name=route_name,
+                        status=status,
+                        active_only=active_only,
+                        search=search,
+                    )
+                    self._send_json({"ok": True, **payload})
+                    return
+
+                if path == "/api/monitor/events" and method == "GET":
+                    after_seq = _q_int(query, "after_seq", 0, min_value=0, max_value=10_000_000)
+                    limit = _q_int(query, "limit", 200, min_value=1, max_value=2000)
+                    payload = parent.service.message_monitor_events(after_seq=after_seq, limit=limit)
+                    self._send_json({"ok": True, **payload})
+                    return
+
                 if path == "/api/sync/reviews" and method == "GET":
                     limit = _q_int(query, "limit", 50, min_value=1, max_value=500)
                     only_open = _q_bool(query, "only_open", True)
@@ -607,6 +935,115 @@ class AdminWebServer:
         stale = [token for token, sess in self._sessions.items() if float(sess.expires_at) <= ref]
         for token in stale:
             self._sessions.pop(token, None)
+
+    def _create_realtime_ticket(self, username: str) -> str:
+        now = time.time()
+        token = secrets.token_urlsafe(28)
+        ttl_sec = min(300, max(45, int(self.settings.admin_web_session_ttl_sec // 4)))
+        with self._realtime_tickets_lock:
+            self._realtime_tickets[token] = _RealtimeTicket(
+                username=str(username or "").strip().lower(),
+                issued_at=now,
+                expires_at=now + ttl_sec,
+            )
+            self._purge_expired_realtime_tickets(now)
+        return token
+
+    def _validate_realtime_ticket(self, token: str) -> str | None:
+        key = str(token or "").strip()
+        if not key:
+            return None
+        now = time.time()
+        with self._realtime_tickets_lock:
+            item = self._realtime_tickets.get(key)
+            if item is None:
+                return None
+            if float(item.expires_at) <= now:
+                self._realtime_tickets.pop(key, None)
+                return None
+            return item.username
+
+    def _purge_expired_realtime_tickets(self, now: float | None = None) -> None:
+        ref = float(now if now is not None else time.time())
+        stale = [token for token, item in self._realtime_tickets.items() if float(item.expires_at) <= ref]
+        for token in stale:
+            self._realtime_tickets.pop(token, None)
+
+    def _realtime_config(self, *, username: str, request_headers: Any | None = None) -> dict[str, object]:
+        ticket = self._create_realtime_ticket(username)
+        proto = "http"
+        host_header = ""
+        if request_headers is not None:
+            try:
+                host_header = str(request_headers.get("x-forwarded-host") or request_headers.get("host") or "").strip()
+            except Exception:
+                host_header = ""
+            try:
+                raw_proto = str(request_headers.get("x-forwarded-proto") or "").strip().lower()
+                if raw_proto:
+                    proto = raw_proto.split(",", 1)[0].strip().lower()
+            except Exception:
+                proto = "http"
+        if proto not in {"http", "https"}:
+            proto = "http"
+        ws_scheme_same_origin = "wss" if proto == "https" else "ws"
+        ws_scheme_direct = "wss" if bool(self._ws_tls_enabled) else "ws"
+
+        def _format_host(raw: str) -> str:
+            text = str(raw or "").strip()
+            if not text:
+                return text
+            if text.startswith("[") and text.endswith("]"):
+                return text
+            if ":" in text:
+                return f"[{text}]"
+            return text
+
+        def _with_ticket(base_url: str) -> str:
+            raw = str(base_url or "").strip()
+            if not raw:
+                return ""
+            parsed = urlparse(raw)
+            current_q = parse_qs(parsed.query or "")
+            current_q["ticket"] = [ticket]
+            query = urlencode(current_q, doseq=True)
+            rebuilt = parsed._replace(query=query)
+            return rebuilt.geturl()
+
+        host_only = ""
+        host_without_port = ""
+        if host_header:
+            parsed = urlparse(f"//{host_header}")
+            host_only = str(parsed.netloc or host_header).strip()
+            host_without_port = str(parsed.hostname or "").strip()
+        if not host_without_port:
+            host_without_port = str(self.settings.admin_web_host or "").strip() or "127.0.0.1"
+        if not host_only:
+            host_only = _format_host(host_without_port)
+            default_http_port = int(self.settings.admin_web_port)
+            if default_http_port > 0:
+                host_only = f"{host_only}:{default_http_port}"
+
+        direct_host = _format_host(host_without_port)
+        candidates: list[str] = []
+        public_ws_base = str(self.settings.admin_ws_public_url or "").strip()
+        if public_ws_base:
+            candidates.append(_with_ticket(public_ws_base))
+        direct_ws = _with_ticket(f"{ws_scheme_direct}://{direct_host}:{int(self._ws_port)}/ws")
+        same_origin_ws = _with_ticket(f"{ws_scheme_same_origin}://{host_only}/ws")
+        for item in (direct_ws, same_origin_ws):
+            if item and item not in candidates:
+                candidates.append(item)
+
+        return {
+            "enabled": ws_serve is not None,
+            "ws_port": int(self._ws_port),
+            "ws_path": "/ws",
+            "ws_tls_enabled": bool(self._ws_tls_enabled),
+            "ws_url": candidates[0] if candidates else "",
+            "ws_candidates": candidates,
+            "ticket": ticket,
+        }
 
     def _run_async(self, awaitable, *, timeout: float = 10.0):
         fut = asyncio.run_coroutine_threadsafe(awaitable, self.event_loop)

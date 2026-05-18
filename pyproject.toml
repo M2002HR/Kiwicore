@@ -17,6 +17,7 @@ dependencies = [
   "redis>=5.0.0,<7",
   "pymysql>=1.1.1,<2",
   "cryptography>=42.0.0,<47",
+  "websockets>=12.0,<16",
 ]
 
 [project.optional-dependencies]

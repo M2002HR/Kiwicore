@@ -20,6 +20,7 @@ def test_index_uses_ltr_and_modal_shell() -> None:
     assert 'id="modalCloseBtn"' in html
     assert 'id="page-traffic"' in html
     assert 'id="page-workers"' in html
+    assert 'id="page-monitor"' in html
     assert 'id="toastRoot"' in html
     assert 'id="toggleAutoRefreshBtn"' in html
 
@@ -39,6 +40,7 @@ def test_routes_page_has_search_and_modal_editor() -> None:
     assert "openRouteEditor(" in js
     assert "openModal(" in js
     assert "data-route-name" in js
+    assert "source_channel_id" in js
 
 
 def test_other_sections_use_modal_for_edit_or_preview() -> None:
@@ -52,6 +54,11 @@ def test_other_sections_use_modal_for_edit_or_preview() -> None:
     assert "/api/traffic/stats" in js
     assert "renderWorkersPage()" in js
     assert "/api/workers/status" in js
+    assert "renderMonitorPage()" in js
+    assert "/api/monitor/messages" in js
+    assert "/api/monitor/events" in js
+    assert "/api/realtime/config" in js
+    assert "buildSourceMessageLink(" in js
     assert "Service Run Traffic History" in js
     assert "All Runs Download" in js
     assert "Current Run Download" in js

@@ -65,6 +65,10 @@ class Settings:
     admin_web_host: str = "127.0.0.1"
     admin_web_port: int = 8787
     admin_web_session_ttl_sec: int = 28800
+    admin_ws_port: int = 0
+    admin_ws_public_url: str = ""
+    admin_ws_tls_cert_path: str = ""
+    admin_ws_tls_key_path: str = ""
 
 
 @dataclass(slots=True)
@@ -193,6 +197,10 @@ def load_settings(env_file: str = ".env") -> Settings:
         admin_web_host=_str("ADMIN_WEB_HOST", "127.0.0.1").strip() or "127.0.0.1",
         admin_web_port=max(1, min(65535, _int("ADMIN_WEB_PORT", 8787))),
         admin_web_session_ttl_sec=max(300, _int("ADMIN_WEB_SESSION_TTL_SEC", 28800)),
+        admin_ws_port=max(0, min(65535, _int("ADMIN_WS_PORT", 0))),
+        admin_ws_public_url=_str("ADMIN_WS_PUBLIC_URL", "").strip(),
+        admin_ws_tls_cert_path=_str("ADMIN_WS_TLS_CERT_PATH", "").strip(),
+        admin_ws_tls_key_path=_str("ADMIN_WS_TLS_KEY_PATH", "").strip(),
     )
 
     if settings.telegram_source_mode not in {"bot", "telethon", "hybrid"}:

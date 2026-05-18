@@ -3,6 +3,7 @@ const state = {
   currentPage: 'dashboard',
   routeFilter: '',
   routeSort: { key: 'name', dir: 'asc' },
+  tablePrefs: {},
   autoRefreshMs: 5000,
   autoRefreshTimer: null,
   autoRefreshRunning: false,
@@ -14,6 +15,23 @@ const state = {
   workers: null,
   scripts: { channel: [], guard: [] },
   sync: null,
+  monitor: { messages: [], summary: {}, latestSeq: 0 },
+  monitorFilters: {
+    route: '',
+    status: '',
+    search: '',
+    activeOnly: true,
+  },
+  monitorEventSeq: 0,
+  monitorEventSeen: new Set(),
+  realtime: {
+    channels: {},
+    pageReloadDebounceTimer: null,
+    wsLastCloseAt: 0,
+    wsLastCloseText: '',
+    config: null,
+    configFetchedAt: 0,
+  },
   logs: [],
   logFilters: {
     level: '',
@@ -33,6 +51,7 @@ const menuItems = [
   ['scripts', 'Scripts', 'Edit channel and guard scripts'],
   ['keywords', 'Keywords', 'Manage keyword links'],
   ['sync', 'Sync Queue', 'Queue and review status'],
+  ['monitor', 'Message Monitor', 'Per-message pipeline and progress'],
   ['logs', 'Logs', 'Live log viewer'],
   ['traffic', 'Traffic', 'Download and upload usage'],
   ['workers', 'Workers', 'Sync workers and host resources'],
@@ -63,6 +82,315 @@ const els = {
   modalBody: document.getElementById('modalBody'),
   modalCloseBtn: document.getElementById('modalCloseBtn'),
 };
+
+const DEFAULT_PAGE_SIZE = 25;
+const PAGE_SIZE_OPTIONS = [10, 25, 50, 100, 200];
+const PAGE_SCOPES = {
+  dashboard: ['dashboard_cards'],
+  routes: ['routes_table'],
+  scripts: ['scripts_meta'],
+  keywords: ['keywords_table'],
+  sync: ['sync_reviews_table'],
+  monitor: ['monitor_messages_table'],
+  logs: ['logs_table'],
+  traffic: ['traffic_runs_table', 'traffic_routes_table'],
+  workers: ['workers_status_table'],
+  storage: ['storage_runs_table'],
+  system: ['system_checks_table'],
+  admins: ['admins_table'],
+};
+
+function parseNumberLike(value) {
+  const text = String(value || '').trim().toLowerCase();
+  if (!text) return null;
+  const compact = text.replaceAll(',', '');
+  const pct = compact.match(/^(-?\d+(?:\.\d+)?)\s*%$/);
+  if (pct) return Number(pct[1]);
+  const bytes = compact.match(/^(-?\d+(?:\.\d+)?)\s*(b|kb|mb|gb|tb)$/i);
+  if (bytes) {
+    const n = Number(bytes[1]);
+    const unit = String(bytes[2] || '').toLowerCase();
+    const mul = unit === 'tb' ? 1024 ** 4 : unit === 'gb' ? 1024 ** 3 : unit === 'mb' ? 1024 ** 2 : unit === 'kb' ? 1024 : 1;
+    if (Number.isFinite(n)) return n * mul;
+  }
+  const plain = compact.match(/^-?\d+(?:\.\d+)?$/);
+  if (plain) return Number(compact);
+  return null;
+}
+
+function parseSortToken(value) {
+  const text = String(value ?? '').trim();
+  const num = parseNumberLike(text);
+  if (Number.isFinite(num)) return { kind: 'num', value: num };
+  return { kind: 'str', value: text.toLocaleLowerCase() };
+}
+
+function getTablePref(tableId, colCount) {
+  const key = String(tableId || '').trim();
+  if (!key) {
+    return {
+      sortCol: null,
+      sortDir: 'asc',
+      page: 1,
+      pageSize: DEFAULT_PAGE_SIZE,
+      colOrder: Array.from({ length: colCount }, (_, i) => i),
+    };
+  }
+  const raw = state.tablePrefs[key];
+  const defOrder = Array.from({ length: colCount }, (_, i) => i);
+  const pref = {
+    sortCol: null,
+    sortDir: 'asc',
+    page: 1,
+    pageSize: DEFAULT_PAGE_SIZE,
+    colOrder: defOrder,
+    ...(raw && typeof raw === 'object' ? raw : {}),
+  };
+  pref.sortDir = pref.sortDir === 'desc' ? 'desc' : 'asc';
+  pref.pageSize = PAGE_SIZE_OPTIONS.includes(Number(pref.pageSize)) ? Number(pref.pageSize) : DEFAULT_PAGE_SIZE;
+  pref.page = Math.max(1, Number(pref.page) || 1);
+  const used = new Set();
+  const fixedOrder = [];
+  for (const v of Array.isArray(pref.colOrder) ? pref.colOrder : []) {
+    const idx = Number(v);
+    if (!Number.isInteger(idx) || idx < 0 || idx >= colCount || used.has(idx)) continue;
+    used.add(idx);
+    fixedOrder.push(idx);
+  }
+  for (let i = 0; i < colCount; i += 1) {
+    if (!used.has(i)) fixedOrder.push(i);
+  }
+  pref.colOrder = fixedOrder;
+  if (!Number.isInteger(pref.sortCol) || pref.sortCol < 0 || pref.sortCol >= colCount) {
+    pref.sortCol = null;
+  }
+  state.tablePrefs[key] = pref;
+  return pref;
+}
+
+function saveTablePref(tableId, pref) {
+  const key = String(tableId || '').trim();
+  if (!key) return;
+  state.tablePrefs[key] = {
+    sortCol: pref.sortCol,
+    sortDir: pref.sortDir,
+    page: pref.page,
+    pageSize: pref.pageSize,
+    colOrder: Array.isArray(pref.colOrder) ? pref.colOrder.slice() : [],
+  };
+}
+
+function moveArrayItem(items, fromIndex, toIndex) {
+  const out = items.slice();
+  if (fromIndex < 0 || fromIndex >= out.length || toIndex < 0 || toIndex >= out.length) return out;
+  const [picked] = out.splice(fromIndex, 1);
+  out.splice(toIndex, 0, picked);
+  return out;
+}
+
+function enhanceTable(table, { pageId, index }) {
+  if (!table || !(table instanceof HTMLTableElement)) return;
+  const tbody = table.tBodies && table.tBodies[0];
+  const thead = table.tHead;
+  if (!tbody || !thead || !thead.rows || !thead.rows.length) return;
+  const headerRow = thead.rows[0];
+  const headerCells = Array.from(headerRow.cells);
+  const bodyRows = Array.from(tbody.rows);
+  const colCount = headerCells.length;
+  if (colCount <= 0) return;
+
+  const tableId = String(table.dataset.tableId || `${pageId}_table_${index + 1}`).trim();
+  table.dataset.tableId = tableId;
+  const pref = getTablePref(tableId, colCount);
+  const rowCells = bodyRows.map((row) => Array.from(row.cells));
+
+  const sortableCols = new Set();
+  headerCells.forEach((th, originalCol) => {
+    th.classList.add('dt-th');
+    th.draggable = true;
+    if (th.dataset.noSort === 'true') return;
+    if (th.querySelector('input, select, textarea')) return;
+    if (th.querySelector('button.th-sort')) return;
+    sortableCols.add(originalCol);
+  });
+
+  const wrap = table.closest('.table-wrap');
+  let pager = null;
+  if (wrap) {
+    const existingPager = wrap.parentElement?.querySelector(`.table-pager[data-table-id="${cssEsc(tableId)}"]`);
+    if (existingPager) existingPager.remove();
+    pager = document.createElement('div');
+    pager.className = 'table-pager';
+    pager.dataset.tableId = tableId;
+    pager.innerHTML = `
+      <div class="table-pager-left">
+        <label>Rows
+          <select class="table-page-size">
+            ${PAGE_SIZE_OPTIONS.map((n) => `<option value="${n}" ${Number(pref.pageSize) === n ? 'selected' : ''}>${n}</option>`).join('')}
+          </select>
+        </label>
+      </div>
+      <div class="table-pager-right">
+        <button type="button" class="btn table-page-prev">Prev</button>
+        <span class="table-page-info muted">Page 1 / 1</span>
+        <button type="button" class="btn table-page-next">Next</button>
+      </div>
+    `;
+    wrap.insertAdjacentElement('afterend', pager);
+  }
+
+  const render = () => {
+    const order = pref.colOrder.slice();
+    headerRow.append(...order.map((i) => headerCells[i]));
+    for (let r = 0; r < bodyRows.length; r += 1) {
+      const row = bodyRows[r];
+      const cells = rowCells[r] || [];
+      row.append(...order.map((i) => cells[i]).filter(Boolean));
+    }
+
+    const sortedRows = bodyRows.slice();
+    if (Number.isInteger(pref.sortCol) && sortableCols.has(pref.sortCol)) {
+      const sortCol = Number(pref.sortCol);
+      sortedRows.sort((a, b) => {
+        const ia = bodyRows.indexOf(a);
+        const ib = bodyRows.indexOf(b);
+        const ca = rowCells[ia]?.[sortCol];
+        const cb = rowCells[ib]?.[sortCol];
+        const va = parseSortToken(ca?.textContent || '');
+        const vb = parseSortToken(cb?.textContent || '');
+        let cmp = 0;
+        if (va.kind === 'num' && vb.kind === 'num') {
+          cmp = Number(va.value) - Number(vb.value);
+        } else {
+          cmp = String(va.value).localeCompare(String(vb.value), undefined, { sensitivity: 'base', numeric: true });
+        }
+        if (cmp === 0) {
+          cmp = ia - ib;
+        }
+        return pref.sortDir === 'desc' ? -cmp : cmp;
+      });
+    }
+    for (const row of sortedRows) tbody.appendChild(row);
+
+    const totalRows = sortedRows.length;
+    const pageSize = Math.max(1, Number(pref.pageSize) || DEFAULT_PAGE_SIZE);
+    const totalPages = Math.max(1, Math.ceil(totalRows / pageSize));
+    pref.page = Math.min(totalPages, Math.max(1, Number(pref.page) || 1));
+    const start = (pref.page - 1) * pageSize;
+    const end = start + pageSize;
+    sortedRows.forEach((row, idx) => {
+      row.classList.toggle('dt-row-hidden', idx < start || idx >= end);
+    });
+
+    if (pager) {
+      const info = pager.querySelector('.table-page-info');
+      const prev = pager.querySelector('.table-page-prev');
+      const next = pager.querySelector('.table-page-next');
+      const sizeSelect = pager.querySelector('.table-page-size');
+      if (info) info.textContent = `Page ${pref.page} / ${totalPages} (${totalRows} rows)`;
+      if (prev) prev.disabled = pref.page <= 1;
+      if (next) next.disabled = pref.page >= totalPages;
+      if (sizeSelect && Number(sizeSelect.value) !== pageSize) sizeSelect.value = String(pageSize);
+    }
+
+    headerCells.forEach((th, originalCol) => {
+      th.classList.toggle('dt-sortable', sortableCols.has(originalCol));
+      th.classList.toggle('dt-sorted', Number(pref.sortCol) === originalCol && sortableCols.has(originalCol));
+      th.classList.remove('dt-sort-asc', 'dt-sort-desc');
+      if (Number(pref.sortCol) === originalCol && sortableCols.has(originalCol)) {
+        th.classList.add(pref.sortDir === 'desc' ? 'dt-sort-desc' : 'dt-sort-asc');
+      }
+    });
+    saveTablePref(tableId, pref);
+  };
+
+  headerCells.forEach((th) => {
+    th.addEventListener('dragstart', (evt) => {
+      const displayIndex = Array.from(headerRow.cells).indexOf(th);
+      evt.dataTransfer?.setData('text/plain', String(displayIndex));
+      evt.dataTransfer.effectAllowed = 'move';
+      th.classList.add('dt-dragging');
+    });
+    th.addEventListener('dragend', () => {
+      th.classList.remove('dt-dragging');
+      headerCells.forEach((cell) => cell.classList.remove('dt-drop-target'));
+    });
+    th.addEventListener('dragover', (evt) => {
+      evt.preventDefault();
+      const target = evt.currentTarget;
+      if (!(target instanceof HTMLTableCellElement)) return;
+      headerCells.forEach((cell) => cell.classList.remove('dt-drop-target'));
+      target.classList.add('dt-drop-target');
+    });
+    th.addEventListener('dragleave', () => {
+      th.classList.remove('dt-drop-target');
+    });
+    th.addEventListener('drop', (evt) => {
+      evt.preventDefault();
+      headerCells.forEach((cell) => cell.classList.remove('dt-drop-target'));
+      const fromDisplay = Number(evt.dataTransfer?.getData('text/plain'));
+      const toDisplay = Array.from(headerRow.cells).indexOf(th);
+      if (!Number.isInteger(fromDisplay) || fromDisplay < 0 || toDisplay < 0 || fromDisplay === toDisplay) return;
+      pref.colOrder = moveArrayItem(pref.colOrder, fromDisplay, toDisplay);
+      render();
+    });
+  });
+
+  headerCells.forEach((th, originalCol) => {
+    if (!sortableCols.has(originalCol)) return;
+    th.addEventListener('click', (evt) => {
+      if (evt.target instanceof HTMLElement && evt.target.closest('button, a, input, select, textarea')) return;
+      if (pref.sortCol === originalCol) {
+        pref.sortDir = pref.sortDir === 'asc' ? 'desc' : 'asc';
+      } else {
+        pref.sortCol = originalCol;
+        pref.sortDir = 'asc';
+      }
+      pref.page = 1;
+      render();
+    });
+  });
+
+  if (pager) {
+    pager.querySelector('.table-page-prev')?.addEventListener('click', () => {
+      pref.page = Math.max(1, Number(pref.page || 1) - 1);
+      render();
+    });
+    pager.querySelector('.table-page-next')?.addEventListener('click', () => {
+      pref.page = Math.max(1, Number(pref.page || 1) + 1);
+      render();
+    });
+    pager.querySelector('.table-page-size')?.addEventListener('change', (evt) => {
+      const value = Number(evt.target?.value || DEFAULT_PAGE_SIZE);
+      pref.pageSize = PAGE_SIZE_OPTIONS.includes(value) ? value : DEFAULT_PAGE_SIZE;
+      pref.page = 1;
+      render();
+    });
+  }
+
+  render();
+}
+
+function enhanceTablesForPage(page) {
+  const pageEl = document.getElementById(`page-${page}`);
+  if (!pageEl) return;
+  const tables = Array.from(pageEl.querySelectorAll('.table-wrap table'));
+  tables.forEach((table, idx) => enhanceTable(table, { pageId: page, index: idx }));
+}
+
+function collectScopesFromPage(page) {
+  const out = new Set();
+  const pageEl = document.getElementById(`page-${page}`);
+  if (pageEl) {
+    pageEl.querySelectorAll('[data-ws-scope]').forEach((node) => {
+      const raw = String(node.getAttribute('data-ws-scope') || '');
+      raw.split(',').map((x) => x.trim()).filter(Boolean).forEach((scope) => out.add(scope));
+    });
+  }
+  const defaults = PAGE_SCOPES[page] || [];
+  defaults.forEach((scope) => out.add(scope));
+  return Array.from(out);
+}
 
 function showFlash(text, isError = false) {
   const root = els.toastRoot;
@@ -114,23 +442,31 @@ function setAutoRefreshText(text) {
 }
 
 function refreshAutoRefreshUi() {
-  const sec = Math.floor(state.autoRefreshMs / 1000);
-  if (state.autoRefreshRunning && state.autoRefreshEnabled) {
-    setAutoRefreshText('Auto: updating...');
-  } else if (state.autoRefreshEnabled) {
-    setAutoRefreshText(`Auto: ${sec}s`);
+  const realtime = state.realtime || {};
+  const channels = Object.values(realtime.channels || {});
+  const anyConnected = channels.some((ch) => !!ch?.wsConnected);
+  const anyConnecting = channels.some((ch) => !!ch?.wsConnecting);
+  const anyConfigured = channels.some((ch) => !!ch?.wsConfigured);
+  if (!state.autoRefreshEnabled) {
+    setAutoRefreshText('Realtime: paused');
+  } else if (anyConnected) {
+    setAutoRefreshText('Realtime: live');
+  } else if (anyConnecting) {
+    setAutoRefreshText('Realtime: connecting...');
+  } else if (anyConfigured) {
+    setAutoRefreshText('Realtime: reconnecting...');
   } else {
-    setAutoRefreshText(`Auto: paused (${sec}s)`);
+    setAutoRefreshText('Realtime: disconnected');
   }
   if (!els.toggleAutoRefreshBtn) return;
   if (state.autoRefreshEnabled) {
     els.toggleAutoRefreshBtn.textContent = '⏸';
-    els.toggleAutoRefreshBtn.title = 'Pause auto refresh';
-    els.toggleAutoRefreshBtn.setAttribute('aria-label', 'Pause auto refresh');
+    els.toggleAutoRefreshBtn.title = 'Pause realtime updates';
+    els.toggleAutoRefreshBtn.setAttribute('aria-label', 'Pause realtime updates');
   } else {
     els.toggleAutoRefreshBtn.textContent = '▶';
-    els.toggleAutoRefreshBtn.title = 'Resume auto refresh';
-    els.toggleAutoRefreshBtn.setAttribute('aria-label', 'Resume auto refresh');
+    els.toggleAutoRefreshBtn.title = 'Resume realtime updates';
+    els.toggleAutoRefreshBtn.setAttribute('aria-label', 'Resume realtime updates');
   }
 }
 
@@ -318,6 +654,12 @@ function formatDuration(secValue) {
   return `${secs}s`;
 }
 
+function formatPercent(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return '-';
+  return `${n.toFixed(1)}%`;
+}
+
 function badgeByStatus(status) {
   const s = String(status || '').toLowerCase();
   if (s === 'ok' || s === 'sent' || s === 'active') return `<span class="badge ok">${esc(status)}</span>`;
@@ -421,6 +763,75 @@ async function loadSync() {
     api('/api/sync/reviews?limit=100&only_open=true'),
   ]);
   state.sync = { stats: stats.stats || {}, reviews: reviews.reviews || [] };
+}
+
+async function loadMonitor() {
+  const params = new URLSearchParams();
+  params.set('limit', '500');
+  if (state.monitorFilters.route) params.set('route', state.monitorFilters.route);
+  if (state.monitorFilters.status) params.set('status', state.monitorFilters.status);
+  if (state.monitorFilters.search) params.set('search', state.monitorFilters.search);
+  if (state.monitorFilters.activeOnly) params.set('active_only', 'true');
+  const data = await api(`/api/monitor/messages?${params.toString()}`);
+  state.monitor = {
+    messages: data.messages || [],
+    summary: data.summary || {},
+    latestSeq: Number(data.latest_seq || 0),
+  };
+  state.monitorEventSeq = Math.max(Number(state.monitorEventSeq || 0), Number(data.latest_seq || 0));
+}
+
+function notificationTextFromMonitorEvent(evt) {
+  const route = String(evt.route_name || '-');
+  const msgId = String(evt.message_id || '-');
+  const status = String(evt.status || '').toLowerCase();
+  const stage = String(evt.stage || '-');
+  const err = String(evt.error || '').trim();
+  const details = String(evt.details || '').trim();
+  if (status === 'sent') {
+    return `✅ ${route} | msg ${msgId} sent`;
+  }
+  if (status === 'blocked') {
+    return `⛔ ${route} | msg ${msgId} blocked${err ? ` | ${err}` : ''}`;
+  }
+  if (status === 'failed') {
+    return `❌ ${route} | msg ${msgId} failed${err ? ` | ${err}` : ''}`;
+  }
+  if (status === 'ambiguous') {
+    return `⚠️ ${route} | msg ${msgId} needs review${err ? ` | ${err}` : ''}`;
+  }
+  if (evt.event_type === 'stage' && (stage === 'dispatch' || stage === 'guard' || stage === 'channel_script')) {
+    return `ℹ️ ${route} | msg ${msgId} ${stage}${details ? ` | ${details}` : ''}`;
+  }
+  return '';
+}
+
+async function pollMonitorEvents() {
+  const params = new URLSearchParams();
+  params.set('after_seq', String(Math.max(0, Number(state.monitorEventSeq || 0))));
+  params.set('limit', '300');
+  const data = await api(`/api/monitor/events?${params.toString()}`);
+  const events = Array.isArray(data.events) ? data.events : [];
+  state.monitorEventSeq = Math.max(Number(state.monitorEventSeq || 0), Number(data.latest_seq || 0));
+  applyMonitorEvents(events);
+}
+
+function applyMonitorEvents(events) {
+  for (const evt of (Array.isArray(events) ? events : [])) {
+    const seq = Number(evt.seq || 0);
+    if (!Number.isFinite(seq) || seq <= 0) continue;
+    if (state.monitorEventSeen.has(seq)) continue;
+    state.monitorEventSeen.add(seq);
+    const text = notificationTextFromMonitorEvent(evt);
+    if (!text) continue;
+    const status = String(evt.status || '').toLowerCase();
+    const isErr = status === 'failed' || status === 'blocked' || status === 'ambiguous';
+    showFlash(text, isErr);
+  }
+  if (state.monitorEventSeen.size > 5000) {
+    const keep = Array.from(state.monitorEventSeen).sort((a, b) => b - a).slice(0, 2500);
+    state.monitorEventSeen = new Set(keep);
+  }
 }
 
 async function loadLogs() {
@@ -532,7 +943,7 @@ function toggleRouteSort(key) {
 
 function routeSortValue(route, metrics, key) {
   if (key === 'name') return String(route?.name || '');
-  if (key === 'source') return String(route?.source_channel_username || '');
+  if (key === 'source') return String(route?.source_channel_username || route?.source_channel_id || '');
   if (key === 'destination') return String(route?.destination_channel_username || route?.destination_channel_id || '');
   if (key === 'channel_script') return String(route?.channel_script || '');
   if (key === 'guard') return String(route?.gaurd_script || '');
@@ -562,6 +973,7 @@ function renderRoutesPage(opts = {}) {
     const hay = [
       r?.name,
       r?.source_channel_username,
+      r?.source_channel_id,
       r?.destination_channel_username,
       r?.destination_channel_id,
       r?.channel_script,
@@ -593,7 +1005,7 @@ function renderRoutesPage(opts = {}) {
   const rows = sorted.map((r) => {
     const routeKey = encodeURIComponent(String(r.name || ''));
     const name = esc(r.name || '-');
-    const source = esc(r.source_channel_username || '-');
+    const source = esc(r.source_channel_username || r.source_channel_id || '-');
     const dest = esc(r.destination_channel_username || r.destination_channel_id || '-');
     const cs = esc(r.channel_script || '-');
     const gs = esc(r.gaurd_script || '-');
@@ -639,7 +1051,7 @@ function renderRoutesPage(opts = {}) {
       </div>
       <div class="meta-line">Showing ${filtered.length} of ${state.routes.length} routes</div>
       <div class="table-wrap routes-table-wrap">
-        <table class="routes-table">
+        <table class="routes-table" data-table-id="routes-main" data-ws-scope="routes_table">
           <thead>
             <tr>
               <th class="route-col-name"><button class="th-sort" data-sort-key="name">Name <span class="sort-arrow">${routeSortIndicator('name')}</span></button></th>
@@ -749,7 +1161,7 @@ function renderRoutesPage(opts = {}) {
 function openRouteEditor(route) {
   const isEdit = !!route;
   const r = route || {
-    name: '', status: 'synced', source_channel_username: '',
+    name: '', status: 'synced', source_channel_username: '', source_channel_id: '',
     destination_channel_username: '', destination_channel_id: '',
     channel_script: '', gaurd_script: 'default_guard.py', max_message_mb: 15,
     backfill_count: 50, interval_sec: 1, batch_size: 1, retry_attempts: 2,
@@ -766,6 +1178,7 @@ function openRouteEditor(route) {
         <label>Route name <input name="name" required value="${esc(r.name || '')}" ${isEdit ? 'readonly' : ''}></label>
         <label>Status <select name="status"><option value="deactive" ${String(r.status || '') === 'deactive' ? 'selected' : ''}>deactive</option><option value="syncing" ${String(r.status || '') === 'syncing' ? 'selected' : ''}>syncing</option><option value="synced" ${String(r.status || '') === 'synced' ? 'selected' : ''}>synced</option></select></label>
         <label>source username <input name="source_channel_username" value="${esc(r.source_channel_username || '')}"></label>
+        <label>source id <input name="source_channel_id" value="${esc(r.source_channel_id || '')}" placeholder="-1001234567890"></label>
         <label>destination username <input name="destination_channel_username" value="${esc(r.destination_channel_username || '')}"></label>
         <label>destination id <input name="destination_channel_id" value="${esc(r.destination_channel_id || '')}"></label>
         <label>channel script <input name="channel_script" value="${esc(r.channel_script || '')}"></label>
@@ -792,6 +1205,7 @@ function openRouteEditor(route) {
         name: String(fd.get('name') || '').trim(),
         status: String(fd.get('status') || 'deactive'),
         source_channel_username: (String(fd.get('source_channel_username') || '').trim() || null),
+        source_channel_id: (String(fd.get('source_channel_id') || '').trim() || null),
         destination_channel_username: (String(fd.get('destination_channel_username') || '').trim() || null),
         destination_channel_id: (String(fd.get('destination_channel_id') || '').trim() || null),
         channel_script: (String(fd.get('channel_script') || '').trim() || null),
@@ -805,8 +1219,8 @@ function openRouteEditor(route) {
       if (!payload.name) {
         throw new Error('Route name is required');
       }
-      if (!payload.source_channel_username) {
-        throw new Error('Source username is required');
+      if (!payload.source_channel_username && !payload.source_channel_id) {
+        throw new Error('At least one of source username or source id is required');
       }
       if (!payload.destination_channel_id && !payload.destination_channel_username) {
         throw new Error('At least one of destination username or destination id is required');
@@ -950,7 +1364,7 @@ function renderKeywordsPage() {
       </div>
       <div class="meta-line">Mappings: ${links.length} | Keywords: ${totalKeywords}</div>
       <div class="table-wrap" style="margin-top:8px">
-        <table>
+        <table data-table-id="keywords-main" data-ws-scope="keywords_table">
           <thead>
             <tr>
               <th>Destination</th>
@@ -1104,6 +1518,182 @@ function openKeywordMappingModal(editIndex) {
   });
 }
 
+function monitorStatusBadge(status) {
+  const s = String(status || '').toLowerCase();
+  if (s === 'sent') return '<span class="badge ok">sent</span>';
+  if (s === 'blocked') return '<span class="badge err">blocked</span>';
+  if (s === 'failed') return '<span class="badge err">failed</span>';
+  if (s === 'ambiguous') return '<span class="badge warn">ambiguous</span>';
+  if (s === 'processing') return '<span class="badge warn">processing</span>';
+  if (s === 'queued') return '<span class="badge">queued</span>';
+  return `<span class="badge">${esc(status || '-')}</span>`;
+}
+
+function renderProgressBar(value) {
+  const pct = Math.max(0, Math.min(100, Number(value || 0)));
+  return `
+    <div class="monitor-progress" title="${pct.toFixed(1)}%">
+      <div class="monitor-progress-fill" style="width:${pct.toFixed(1)}%"></div>
+    </div>
+    <div class="muted">${pct.toFixed(1)}%</div>
+  `;
+}
+
+function buildSourceMessageLink(item) {
+  const messageId = Number(item?.message_id || 0);
+  if (!Number.isFinite(messageId) || messageId <= 0) return null;
+  const usernameRaw = String(item?.source_channel_username || '').trim();
+  if (usernameRaw.startsWith('@') && usernameRaw.length > 1) {
+    return `https://t.me/${encodeURIComponent(usernameRaw.slice(1))}/${Math.trunc(messageId)}`;
+  }
+  const sourceId = String(item?.source_channel_id || '').trim();
+  if (sourceId.startsWith('-100')) {
+    const tail = sourceId.slice(4);
+    if (/^\d+$/.test(tail)) {
+      return `https://t.me/c/${tail}/${Math.trunc(messageId)}`;
+    }
+  }
+  return null;
+}
+
+function renderMonitorPage() {
+  const page = document.getElementById('page-monitor');
+  const monitor = state.monitor || {};
+  const summary = monitor.summary || {};
+  const rowsDataRaw = Array.isArray(monitor.messages) ? monitor.messages : [];
+  const monitorOrder = { processing: 0, failed: 1, ambiguous: 2, queued: 3, blocked: 4, sent: 5 };
+  const rowsData = rowsDataRaw.slice().sort((a, b) => {
+    const sa = String(a?.status || '').toLowerCase();
+    const sb = String(b?.status || '').toLowerCase();
+    const pa = Number.isFinite(monitorOrder[sa]) ? monitorOrder[sa] : 99;
+    const pb = Number.isFinite(monitorOrder[sb]) ? monitorOrder[sb] : 99;
+    if (pa !== pb) return pa - pb;
+    const ua = String(a?.updated_at || '');
+    const ub = String(b?.updated_at || '');
+    return ub.localeCompare(ua);
+  });
+  const statusCounts = summary.status_counts || {};
+  const routeOptions = Array.from(new Set(rowsData.map((m) => String(m.route_name || '').trim()).filter(Boolean))).sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' }));
+  const rows = rowsData.map((item) => {
+    const history = Array.isArray(item.stage_history) ? item.stage_history : [];
+    const timeline = history.slice(-5).map((h) => `<span class="badge">${esc(h.stage)}:${esc(h.status)}</span>`).join('');
+    const textPreview = String(item.text_preview || '').trim();
+    const textCell = textPreview ? `<div class="monitor-preview">${esc(textPreview)}</div>` : '<span class="muted">-</span>';
+    const downloadBytes = Number(item.download_bytes || 0);
+    const uploadBytes = Number(item.upload_bytes || 0);
+    const totalBytes = downloadBytes + uploadBytes;
+    const sourceLink = buildSourceMessageLink(item);
+    const sourceLinkHtml = sourceLink
+      ? `<a href="${esc(sourceLink)}" target="_blank" rel="noreferrer">open source</a>`
+      : '<span class="muted">-</span>';
+    return `
+      <tr>
+        <td class="monitor-col-message">
+          <div><strong>${esc(item.route_name || '-')}</strong></div>
+          <div class="muted">msg=${esc(item.message_id || '-')} | ${esc(item.source_channel_username || item.source_channel_id || '-')}</div>
+          <div class="muted">src: ${sourceLinkHtml}</div>
+          <div class="muted">${esc(item.dedupe_key || '-')}</div>
+        </td>
+        <td>${monitorStatusBadge(item.status)}</td>
+        <td>${esc(item.current_stage || '-')}</td>
+        <td>${renderProgressBar(item.progress_pct)}</td>
+        <td>${esc(item.attempt_count || 0)}</td>
+        <td>
+          <div class="muted">↓ ${formatBytes(downloadBytes)}</div>
+          <div class="muted">↑ ${formatBytes(uploadBytes)}</div>
+          <div><strong>${formatBytes(totalBytes)}</strong></div>
+        </td>
+        <td>${timeline || '<span class="muted">-</span>'}</td>
+        <td>${esc(item.last_error || '-')}</td>
+        <td>
+          <div class="muted">${formatDateTime(item.first_seen_at)}</div>
+          <div class="muted">${formatDateTime(item.updated_at)}</div>
+          <div class="muted">${formatDateTime(item.completed_at)}</div>
+        </td>
+        <td>${textCell}</td>
+      </tr>
+    `;
+  }).join('');
+
+  page.innerHTML = `
+    <div class="grid cols-4">
+      ${card('Tracked Messages', summary.total ?? 0, 'monitor memory')}
+      ${card('Queued', statusCounts.queued ?? 0, 'waiting in queue')}
+      ${card('Processing', statusCounts.processing ?? 0, 'in worker pipeline')}
+      ${card('Failed/Review', (Number(statusCounts.failed || 0) + Number(statusCounts.ambiguous || 0)), 'needs retry/review')}
+    </div>
+    <div class="grid cols-4" style="margin-top:10px">
+      ${card('Sent', statusCounts.sent ?? 0, 'delivered')}
+      ${card('Blocked', statusCounts.blocked ?? 0, 'policy/routing blocked')}
+      ${card('Download Traffic', formatBytes(summary.total_download_bytes || 0), 'tracked per message')}
+      ${card('Upload Traffic', formatBytes(summary.total_upload_bytes || 0), 'tracked per message')}
+    </div>
+    <div class="card" style="margin-top:10px">
+      <div class="row" style="justify-content:space-between">
+        <h3>Per-message Pipeline Monitor</h3>
+        <div class="row">
+          <button id="monitorReloadBtn" class="btn">Reload</button>
+        </div>
+      </div>
+      <div class="row" style="margin-top:6px">
+        <select id="monitorRouteFilter" class="compact-input" style="width:220px">
+          <option value="">All routes</option>
+          ${routeOptions.map((name) => `<option value="${esc(name)}" ${state.monitorFilters.route === name ? 'selected' : ''}>${esc(name)}</option>`).join('')}
+        </select>
+        <select id="monitorStatusFilter" class="compact-input" style="width:180px">
+          <option value="" ${state.monitorFilters.status === '' ? 'selected' : ''}>All statuses</option>
+          <option value="queued" ${state.monitorFilters.status === 'queued' ? 'selected' : ''}>queued</option>
+          <option value="processing" ${state.monitorFilters.status === 'processing' ? 'selected' : ''}>processing</option>
+          <option value="failed" ${state.monitorFilters.status === 'failed' ? 'selected' : ''}>failed</option>
+          <option value="ambiguous" ${state.monitorFilters.status === 'ambiguous' ? 'selected' : ''}>ambiguous</option>
+          <option value="blocked" ${state.monitorFilters.status === 'blocked' ? 'selected' : ''}>blocked</option>
+          <option value="sent" ${state.monitorFilters.status === 'sent' ? 'selected' : ''}>sent</option>
+        </select>
+        <label class="monitor-active-flag"><input id="monitorActiveOnly" type="checkbox" ${state.monitorFilters.activeOnly ? 'checked' : ''}> active only</label>
+        <input id="monitorSearchInput" class="compact-input" style="width:340px" placeholder="search dedupe/route/message/error/text..." value="${esc(state.monitorFilters.search || '')}">
+        <button id="monitorApplyBtn" class="btn">Apply</button>
+      </div>
+      <div class="table-wrap" style="margin-top:8px">
+        <table class="monitor-table" data-table-id="monitor-main" data-ws-scope="monitor_messages_table">
+          <thead>
+            <tr>
+              <th class="monitor-col-message">Message</th>
+              <th>Status</th>
+              <th>Stage</th>
+              <th>Progress</th>
+              <th>Attempts</th>
+              <th>Traffic</th>
+              <th>Timeline</th>
+              <th>Error</th>
+              <th>Timestamps</th>
+              <th>Preview</th>
+            </tr>
+          </thead>
+          <tbody>${rows || '<tr><td colspan="10"><span class="muted">No tracked messages yet</span></td></tr>'}</tbody>
+        </table>
+      </div>
+    </div>
+  `;
+
+  const applyFilters = async () => {
+    state.monitorFilters.route = String(document.getElementById('monitorRouteFilter')?.value || '').trim();
+    state.monitorFilters.status = String(document.getElementById('monitorStatusFilter')?.value || '').trim();
+    state.monitorFilters.search = String(document.getElementById('monitorSearchInput')?.value || '').trim();
+    state.monitorFilters.activeOnly = !!document.getElementById('monitorActiveOnly')?.checked;
+    await runAction(async () => {
+      await reloadPageData('monitor');
+    }, 'Failed to load monitor data');
+  };
+  document.getElementById('monitorReloadBtn')?.addEventListener('click', applyFilters);
+  document.getElementById('monitorApplyBtn')?.addEventListener('click', applyFilters);
+  document.getElementById('monitorRouteFilter')?.addEventListener('change', applyFilters);
+  document.getElementById('monitorStatusFilter')?.addEventListener('change', applyFilters);
+  document.getElementById('monitorActiveOnly')?.addEventListener('change', applyFilters);
+  document.getElementById('monitorSearchInput')?.addEventListener('keydown', async (e) => {
+    if (e.key === 'Enter') await applyFilters();
+  });
+}
+
 function renderSyncPage() {
   const page = document.getElementById('page-sync');
   const stats = state.sync?.stats || {};
@@ -1134,7 +1724,7 @@ function renderSyncPage() {
     <div class="card" style="margin-top:10px">
       <h3>Review Queue</h3>
       <div class="table-wrap">
-        <table>
+        <table data-table-id="sync-reviews" data-ws-scope="sync_reviews_table">
           <thead><tr><th>ID</th><th>Route</th><th>Reason</th><th>Error</th><th>Created</th><th>Actions</th></tr></thead>
           <tbody>${reviewRows}</tbody>
         </table>
@@ -1186,7 +1776,7 @@ function renderLogsPage() {
       ${iconBtn({ title: 'Clear filters', icon: '⌫', attrs: 'id="logsClearFilterBtn"' })}
     </div>
     <div class="table-wrap">
-      <table>
+      <table data-table-id="logs-main" data-ws-scope="logs_table">
         <thead><tr><th>ts</th><th>level</th><th>logger</th><th>message</th></tr></thead>
         <tbody>${rows}</tbody>
       </table>
@@ -1255,7 +1845,7 @@ function renderStoragePage() {
     <div class="card" style="margin-top:10px">
       <h3>Recent Runs</h3>
       <div class="table-wrap">
-        <table>
+        <table data-table-id="storage-runs" data-ws-scope="storage_runs_table">
           <thead><tr><th>Updated</th><th>Route</th><th>Channel</th><th>Run</th><th>Message</th><th>Files</th></tr></thead>
           <tbody>${rows}</tbody>
         </table>
@@ -1346,7 +1936,7 @@ function renderTrafficPage() {
       <h3>Service Run Traffic History</h3>
       <div class="meta-line">Previous runs: ${esc(previousRuns.length)} | Current run id: ${esc(t.run_id || '-')}</div>
       <div class="table-wrap">
-        <table>
+        <table data-table-id="traffic-runs" data-ws-scope="traffic_runs_table">
           <thead><tr><th>#</th><th>Run ID</th><th>Started At</th><th>Stopped At</th><th>Duration</th><th>Status</th><th>Download</th><th>Upload</th><th>Total</th><th>Routes</th></tr></thead>
           <tbody>${runRows}</tbody>
         </table>
@@ -1355,7 +1945,7 @@ function renderTrafficPage() {
     <div class="card" style="margin-top:10px">
       <h3>Per-route Traffic</h3>
       <div class="table-wrap">
-        <table>
+        <table data-table-id="traffic-routes" data-ws-scope="traffic_routes_table">
           <thead><tr><th>Route</th><th>Total Download</th><th>Total Upload</th><th>Today Download</th><th>Today Upload</th><th>Total Traffic</th></tr></thead>
           <tbody>${rows}</tbody>
         </table>
@@ -1404,7 +1994,7 @@ function renderWorkersPage() {
     <div class="card" style="margin-top:10px">
       <h3>Sync Ledger Status Counts</h3>
       <div class="table-wrap">
-        <table>
+        <table data-table-id="workers-status" data-ws-scope="workers_status_table">
           <thead><tr><th>Status</th><th>Count</th></tr></thead>
           <tbody>${statusRows}</tbody>
         </table>
@@ -1454,7 +2044,7 @@ function renderAdminsPage() {
         ${iconBtn({ title: 'Add admin', icon: '+', attrs: 'id="openAddAdminBtn"' })}
       </div>
       <div class="table-wrap">
-        <table>
+        <table data-table-id="admins-main" data-ws-scope="admins_table">
           <thead><tr><th>Username</th><th>Action</th></tr></thead>
           <tbody>${rows}</tbody>
         </table>
@@ -1508,17 +2098,20 @@ function renderAdminsPage() {
 }
 
 function renderCurrentPage() {
-  if (state.currentPage === 'dashboard') return renderDashboardPage();
-  if (state.currentPage === 'routes') return renderRoutesPage();
-  if (state.currentPage === 'scripts') return renderScriptsPage();
-  if (state.currentPage === 'keywords') return renderKeywordsPage();
-  if (state.currentPage === 'sync') return renderSyncPage();
-  if (state.currentPage === 'logs') return renderLogsPage();
-  if (state.currentPage === 'traffic') return renderTrafficPage();
-  if (state.currentPage === 'workers') return renderWorkersPage();
-  if (state.currentPage === 'storage') return renderStoragePage();
-  if (state.currentPage === 'system') return renderSystemPage();
-  if (state.currentPage === 'admins') return renderAdminsPage();
+  if (state.currentPage === 'dashboard') renderDashboardPage();
+  else if (state.currentPage === 'routes') renderRoutesPage();
+  else if (state.currentPage === 'scripts') renderScriptsPage();
+  else if (state.currentPage === 'keywords') renderKeywordsPage();
+  else if (state.currentPage === 'sync') renderSyncPage();
+  else if (state.currentPage === 'monitor') renderMonitorPage();
+  else if (state.currentPage === 'logs') renderLogsPage();
+  else if (state.currentPage === 'traffic') renderTrafficPage();
+  else if (state.currentPage === 'workers') renderWorkersPage();
+  else if (state.currentPage === 'storage') renderStoragePage();
+  else if (state.currentPage === 'system') renderSystemPage();
+  else if (state.currentPage === 'admins') renderAdminsPage();
+  enhanceTablesForPage(state.currentPage);
+  refreshRealtimeSubscriptions();
 }
 
 async function reloadPageData(page = state.currentPage) {
@@ -1529,6 +2122,7 @@ async function reloadPageData(page = state.currentPage) {
     if (page === 'scripts') await loadScriptsMeta();
     if (page === 'keywords') await loadKeywords();
     if (page === 'sync') await loadSync();
+    if (page === 'monitor') await loadMonitor();
     if (page === 'logs') await loadLogs();
     if (page === 'traffic') await loadTraffic();
     if (page === 'workers') await loadWorkers();
@@ -1552,11 +2146,77 @@ function canAutoRefresh(page = state.currentPage) {
   return true;
 }
 
-function startAutoRefresh() {
-  if (state.autoRefreshTimer) clearInterval(state.autoRefreshTimer);
-  refreshAutoRefreshUi();
-  state.autoRefreshTimer = setInterval(async () => {
-    if (!canAutoRefresh()) return;
+function ensureRealtimeChannel(scope) {
+  const key = String(scope || '').trim();
+  if (!key) return null;
+  const existing = state.realtime.channels[key];
+  if (existing) return existing;
+  const created = {
+    ws: null,
+    wsConnected: false,
+    wsConnecting: false,
+    wsConfigured: false,
+    reconnectAttempt: 0,
+    wsReconnectTimer: null,
+    wsLastCloseAt: 0,
+    wsLastCloseText: '',
+    reloadDebounceTimer: null,
+  };
+  state.realtime.channels[key] = created;
+  return created;
+}
+
+function forEachRealtimeChannel(cb) {
+  Object.entries(state.realtime.channels || {}).forEach(([scope, channel]) => {
+    cb(String(scope), channel);
+  });
+}
+
+function clearRealtimeReconnectTimer(scope) {
+  const ch = ensureRealtimeChannel(scope);
+  if (!ch) return;
+  if (ch.wsReconnectTimer) {
+    clearTimeout(ch.wsReconnectTimer);
+    ch.wsReconnectTimer = null;
+  }
+}
+
+function closeScopeSocket(scope, reason = 'client_close') {
+  const key = String(scope || '').trim();
+  const ch = ensureRealtimeChannel(key);
+  if (!ch) return;
+  clearRealtimeReconnectTimer(key);
+  if (ch.reloadDebounceTimer) {
+    clearTimeout(ch.reloadDebounceTimer);
+    ch.reloadDebounceTimer = null;
+  }
+  const ws = ch.ws;
+  ch.ws = null;
+  ch.wsConnected = false;
+  ch.wsConnecting = false;
+  ch.wsConfigured = false;
+  ch.reconnectAttempt = 0;
+  if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
+    try {
+      ws.close(1000, reason);
+    } catch (_) {
+      // no-op
+    }
+  }
+}
+
+function closeRealtimeSocket() {
+  forEachRealtimeChannel((scope) => {
+    closeScopeSocket(scope, 'client_close');
+  });
+}
+
+function scheduleRealtimePageReload() {
+  if (!canAutoRefresh(state.currentPage)) return;
+  if (state.realtime.pageReloadDebounceTimer) return;
+  state.realtime.pageReloadDebounceTimer = setTimeout(async () => {
+    state.realtime.pageReloadDebounceTimer = null;
+    if (!canAutoRefresh(state.currentPage)) return;
     state.autoRefreshRunning = true;
     refreshAutoRefreshUi();
     try {
@@ -1565,7 +2225,256 @@ function startAutoRefresh() {
       state.autoRefreshRunning = false;
       refreshAutoRefreshUi();
     }
-  }, state.autoRefreshMs);
+  }, 220);
+}
+
+function scheduleScopePageReload(scope) {
+  const key = String(scope || '').trim();
+  const scopes = collectScopesFromPage(state.currentPage);
+  if (!scopes.includes(key)) return;
+  const ch = ensureRealtimeChannel(key);
+  if (!ch || ch.reloadDebounceTimer) return;
+  ch.reloadDebounceTimer = setTimeout(async () => {
+    ch.reloadDebounceTimer = null;
+    await scheduleRealtimePageReload();
+  }, 180);
+}
+
+function scheduleRealtimeReconnect(scope) {
+  const key = String(scope || '').trim();
+  if (!key || !state.user || !state.autoRefreshEnabled) return;
+  const ch = ensureRealtimeChannel(key);
+  if (!ch || ch.wsReconnectTimer) return;
+  const attempt = Number(ch.reconnectAttempt || 0) + 1;
+  ch.reconnectAttempt = attempt;
+  const baseDelay = 1500;
+  const maxDelay = 30000;
+  const delay = Math.min(maxDelay, Math.round(baseDelay * (2 ** Math.min(6, attempt - 1))));
+  ch.wsReconnectTimer = setTimeout(() => {
+    ch.wsReconnectTimer = null;
+    connectScopeSocket(key);
+  }, delay);
+}
+
+function handleRealtimeMessage(msg, scope) {
+  if (!msg || typeof msg !== 'object') return;
+  const type = String(msg.type || '').trim().toLowerCase();
+  if (type === 'hello') {
+    const latestSeq = Number(msg.latest_seq || 0);
+    if (Number.isFinite(latestSeq) && latestSeq > 0) {
+      state.monitorEventSeq = Math.max(Number(state.monitorEventSeq || 0), latestSeq);
+    }
+    scheduleScopePageReload(scope);
+    return;
+  }
+  if (type === 'monitor_events') {
+    const latestSeq = Number(msg.latest_seq || 0);
+    if (Number.isFinite(latestSeq) && latestSeq > 0) {
+      state.monitorEventSeq = Math.max(Number(state.monitorEventSeq || 0), latestSeq);
+    }
+    applyMonitorEvents(Array.isArray(msg.events) ? msg.events : []);
+    scheduleScopePageReload(scope);
+    return;
+  }
+  if (type === 'refresh_hint') {
+    const scopes = Array.isArray(msg.scopes) ? msg.scopes.map((x) => String(x || '').trim()) : [];
+    if (!scopes.length || scopes.includes(scope)) {
+      scheduleScopePageReload(scope);
+    }
+  }
+}
+
+async function getRealtimeConfig(forceRefresh = false) {
+  const now = Date.now();
+  const maxAgeMs = 4 * 60 * 1000;
+  if (!forceRefresh && state.realtime.config && (now - Number(state.realtime.configFetchedAt || 0) < maxAgeMs)) {
+    return state.realtime.config;
+  }
+  const config = await api('/api/realtime/config');
+  state.realtime.config = config;
+  state.realtime.configFetchedAt = now;
+  return config;
+}
+
+function buildScopedWsCandidates(config, scope) {
+  const base = buildRealtimeWsCandidates(config);
+  const out = [];
+  for (const item of base) {
+    try {
+      const parsed = new URL(item);
+      parsed.searchParams.set('scope', String(scope || '').trim());
+      out.push(parsed.toString());
+    } catch (_) {
+      // no-op
+    }
+  }
+  return out;
+}
+
+async function connectScopeSocket(scope, forceConfigRefresh = false) {
+  const key = String(scope || '').trim();
+  if (!key || !state.user || !state.autoRefreshEnabled) return;
+  const ch = ensureRealtimeChannel(key);
+  if (!ch || ch.wsConnected || ch.wsConnecting) return;
+  ch.wsConnecting = true;
+  refreshAutoRefreshUi();
+  let config;
+  try {
+    config = await getRealtimeConfig(forceConfigRefresh);
+  } catch (_) {
+    ch.wsConnecting = false;
+    ch.wsConfigured = false;
+    refreshAutoRefreshUi();
+    scheduleRealtimeReconnect(key);
+    return;
+  }
+
+  const enabled = !!config?.enabled;
+  const candidates = buildScopedWsCandidates(config, key);
+  if (!enabled || !candidates.length) {
+    ch.wsConnecting = false;
+    ch.wsConfigured = false;
+    refreshAutoRefreshUi();
+    if (location.protocol === 'https:') {
+      const now = Date.now();
+      const text = `No secure websocket endpoint available for scope=${key}`;
+      if (now - Number(ch.wsLastCloseAt || 0) > 20000 || ch.wsLastCloseText !== text) {
+        ch.wsLastCloseAt = now;
+        ch.wsLastCloseText = text;
+        showFlash(text, true);
+      }
+    }
+    scheduleRealtimeReconnect(key);
+    return;
+  }
+
+  const idx = Math.max(0, Number(ch.reconnectAttempt || 0)) % candidates.length;
+  const wsUrl = String(candidates[idx] || candidates[0]);
+  ch.wsConfigured = true;
+  let ws;
+  try {
+    ws = new WebSocket(wsUrl);
+  } catch (_) {
+    ch.wsConnecting = false;
+    ch.wsConnected = false;
+    refreshAutoRefreshUi();
+    scheduleRealtimeReconnect(key);
+    return;
+  }
+  ch.ws = ws;
+
+  ws.onopen = () => {
+    ch.wsConnected = true;
+    ch.wsConnecting = false;
+    ch.reconnectAttempt = 0;
+    refreshAutoRefreshUi();
+  };
+  ws.onmessage = (evt) => {
+    try {
+      const msg = JSON.parse(String(evt.data || '{}'));
+      handleRealtimeMessage(msg, key);
+    } catch (_) {
+      // no-op
+    }
+  };
+  ws.onerror = () => {
+    // close handler handles reconnect
+  };
+  ws.onclose = (evt) => {
+    const wasConnected = !!ch.wsConnected;
+    const code = Number(evt?.code || 0);
+    const reason = String(evt?.reason || '').trim();
+    ch.ws = null;
+    ch.wsConnected = false;
+    ch.wsConnecting = false;
+    refreshAutoRefreshUi();
+    if (!state.user || !state.autoRefreshEnabled) return;
+    const now = Date.now();
+    const closeText = `${key}: code=${code}${reason ? ` reason=${reason}` : ''}`;
+    const shouldNotify = (wasConnected || code === 1008) && (now - Number(ch.wsLastCloseAt || 0) > 7000 || ch.wsLastCloseText !== closeText);
+    if (shouldNotify) {
+      ch.wsLastCloseAt = now;
+      ch.wsLastCloseText = closeText;
+      showFlash(`Realtime disconnected (${closeText})`, true);
+    }
+    if (code === 1008) {
+      state.realtime.config = null;
+      state.realtime.configFetchedAt = 0;
+    }
+    scheduleRealtimeReconnect(key);
+  };
+}
+
+function refreshRealtimeSubscriptions() {
+  const disabledPages = new Set(['scripts', 'keywords', 'admins']);
+  if (!state.user || !state.autoRefreshEnabled || disabledPages.has(String(state.currentPage || ''))) {
+    closeRealtimeSocket();
+    return;
+  }
+  const desiredScopes = collectScopesFromPage(state.currentPage);
+  const desiredSet = new Set(desiredScopes);
+  forEachRealtimeChannel((scope) => {
+    if (!desiredSet.has(scope)) {
+      closeScopeSocket(scope, 'scope_changed');
+      delete state.realtime.channels[scope];
+    }
+  });
+  desiredScopes.forEach((scope) => {
+    ensureRealtimeChannel(scope);
+    connectScopeSocket(scope);
+  });
+  refreshAutoRefreshUi();
+}
+
+function buildRealtimeWsCandidates(config) {
+  const out = [];
+  const securePage = location.protocol === 'https:';
+  const add = (value) => {
+    const text = String(value || '').trim();
+    if (!text) return;
+    if (!/^wss?:\/\//i.test(text)) return;
+    if (securePage && text.startsWith('ws://')) return;
+    if (!out.includes(text)) out.push(text);
+  };
+  add(config?.ws_url);
+  const apiCandidates = Array.isArray(config?.ws_candidates) ? config.ws_candidates : [];
+  for (const c of apiCandidates) add(c);
+
+  const port = Number(config?.ws_port || 0);
+  const path = String(config?.ws_path || '/ws').trim() || '/ws';
+  const ticket = String(config?.ticket || '').trim();
+  const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const querySep = path.includes('?') ? '&' : '?';
+  const suffix = ticket ? `${querySep}ticket=${encodeURIComponent(ticket)}` : '';
+
+  try {
+    const sameOrigin = new URL(path + suffix, `${protocol}//${location.host}`);
+    add(String(sameOrigin.toString()));
+  } catch (_) {
+    // no-op
+  }
+  if (Number.isFinite(port) && port > 0) {
+    try {
+      const withPort = new URL(path + suffix, `${protocol}//${location.host}`);
+      withPort.port = String(Math.trunc(port));
+      add(String(withPort.toString()));
+    } catch (_) {
+      // no-op
+    }
+  }
+  return out;
+}
+
+function startAutoRefresh() {
+  if (state.autoRefreshTimer) clearInterval(state.autoRefreshTimer);
+  state.autoRefreshTimer = null;
+  closeRealtimeSocket();
+  forEachRealtimeChannel((scope) => {
+    clearRealtimeReconnectTimer(scope);
+  });
+  refreshAutoRefreshUi();
+  if (!state.autoRefreshEnabled) return;
+  refreshRealtimeSubscriptions();
 }
 
 async function verifyAuth() {
@@ -1588,6 +2497,17 @@ async function bootstrap() {
   });
   document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape' && isModalOpen()) closeModal();
+  });
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) return;
+    if (!state.user || !state.autoRefreshEnabled) return;
+    refreshRealtimeSubscriptions();
+  });
+  window.addEventListener('beforeunload', () => {
+    closeRealtimeSocket();
+    forEachRealtimeChannel((scope) => {
+      clearRealtimeReconnectTimer(scope);
+    });
   });
 
   els.loginForm.addEventListener('submit', async (e) => {
@@ -1618,8 +2538,16 @@ async function bootstrap() {
   });
   els.toggleAutoRefreshBtn?.addEventListener('click', () => {
     state.autoRefreshEnabled = !state.autoRefreshEnabled;
+    if (state.autoRefreshEnabled) {
+      startAutoRefresh();
+    } else {
+      closeRealtimeSocket();
+      forEachRealtimeChannel((scope) => {
+        clearRealtimeReconnectTimer(scope);
+      });
+    }
     refreshAutoRefreshUi();
-    showFlash(state.autoRefreshEnabled ? 'Auto refresh resumed' : 'Auto refresh paused');
+    showFlash(state.autoRefreshEnabled ? 'Realtime updates resumed' : 'Realtime updates paused');
   });
   els.stopServiceBtn.addEventListener('click', async () => {
     if (!confirm('Stop Kiwi service?')) return;
@@ -1642,7 +2570,7 @@ async function enterApp() {
   els.loginView.classList.add('hidden');
   els.app.classList.remove('hidden');
   els.meInfo.textContent = `User: ${state.user}`;
-  await Promise.all([loadDashboard(), loadRoutes(), loadScriptsMeta(), loadKeywords(), loadSync(), loadLogs(), loadTraffic(), loadWorkers(), loadStorage(), loadSystem(), loadAdmins()]);
+  await Promise.all([loadDashboard(), loadRoutes(), loadScriptsMeta(), loadKeywords(), loadSync(), loadMonitor(), loadLogs(), loadTraffic(), loadWorkers(), loadStorage(), loadSystem(), loadAdmins()]);
   navigate(state.currentPage);
   startAutoRefresh();
   refreshAutoRefreshUi();

@@ -2990,6 +2990,158 @@ def test_service_dispatch_http_500_is_not_ambiguous(tmp_path: Path) -> None:
     )
 
 
+def test_service_dispatch_http_413_is_blocked(tmp_path: Path) -> None:
+    class OversizeBaleClient(FakeBaleClient):
+        async def send_video(self, chat_id: str, video_path: Path, caption: str | None = None):
+            raise PlatformApiError(
+                "sendVideo HTTP 413: <html><h1>413 Request Entity Too Large</h1></html>"
+            )
+
+    settings = _settings(tmp_path)
+    route = ChannelRoute(
+        name="dispatch-http413",
+        enabled=True,
+        source_channel_id="-1001",
+        source_channel_username=None,
+        destination_channel_id="-2001",
+        destination_channel_username=None,
+        channel_script=None,
+        max_message_mb=50,
+    )
+    service = KiwiService(
+        settings=settings,
+        routes=_route_registry(route),
+        telegram_client=FakeTelegramClient([], b"video-bytes"),
+        bale_client=OversizeBaleClient(),
+        storage=StorageManager(settings.storage_dir),
+        guard_runner=GuardRunner(settings.gaurd_scripts_dir, timeout_sec=5),
+        script_runner=ScriptRunner(settings.scripts_dir, timeout_sec=5),
+        state_store=StateStore(settings.state_path),
+    )
+    incoming = IncomingChannelMessage(
+        update_id=2201,
+        source_channel_id="-1001",
+        source_channel_username=None,
+        message_id=501,
+        date=None,
+        text=None,
+        caption=None,
+        medias=[
+            IncomingMedia(
+                kind=MediaKind.VIDEO,
+                file_id="v1",
+                file_size=1024,
+                file_name="clip.mp4",
+                mime_type="video/mp4",
+                duration=12,
+            )
+        ],
+        raw={},
+        media_group_id=None,
+    )
+    status, error = asyncio.run(service._process_route_message_detailed(incoming, route))  # noqa: SLF001
+    assert status == "blocked"
+    assert "413" in str(error).lower()
+
+
+def test_service_marks_ai_generation_required_as_failed_without_inner_retry(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    route = ChannelRoute(
+        name="no-retry-ai-permanent",
+        enabled=True,
+        source_channel_id="-1001",
+        source_channel_username=None,
+        destination_channel_id="-2001",
+        destination_channel_username=None,
+        channel_script="football.py",
+        max_message_mb=10,
+    )
+    service = KiwiService(
+        settings=settings,
+        routes=_route_registry(route),
+        telegram_client=FakeTelegramClient([], b""),
+        bale_client=FakeBaleClient(),
+        storage=StorageManager(settings.storage_dir),
+        guard_runner=GuardRunner(settings.gaurd_scripts_dir, timeout_sec=5),
+        script_runner=ScriptRunner(settings.scripts_dir, timeout_sec=5),
+        state_store=StateStore(settings.state_path),
+    )
+    incoming = IncomingChannelMessage(
+        update_id=3201,
+        source_channel_id="-1001",
+        source_channel_username=None,
+        message_id=777,
+        date=None,
+        text="test",
+        caption=None,
+        medias=[],
+        raw={},
+        media_group_id=None,
+    )
+    calls = {"count": 0}
+
+    async def _fake_detailed(*args, **kwargs):
+        calls["count"] += 1
+        return ("failed", "ai_generation_required_failed")
+
+    service._process_route_message_detailed = _fake_detailed  # type: ignore[method-assign]  # noqa: SLF001
+    status, error = asyncio.run(
+        service._process_route_message_with_retries(incoming, route, retries=5)  # noqa: SLF001
+    )
+    assert status == "failed"
+    assert error == "ai_generation_required_failed"
+    assert calls["count"] == 1
+
+
+def test_service_blocks_non_retryable_ai_output_errors(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    route = ChannelRoute(
+        name="block-ai-output-unacceptable",
+        enabled=True,
+        source_channel_id="-1001",
+        source_channel_username=None,
+        destination_channel_id="-2001",
+        destination_channel_username=None,
+        channel_script="football.py",
+        max_message_mb=10,
+    )
+    service = KiwiService(
+        settings=settings,
+        routes=_route_registry(route),
+        telegram_client=FakeTelegramClient([], b""),
+        bale_client=FakeBaleClient(),
+        storage=StorageManager(settings.storage_dir),
+        guard_runner=GuardRunner(settings.gaurd_scripts_dir, timeout_sec=5),
+        script_runner=ScriptRunner(settings.scripts_dir, timeout_sec=5),
+        state_store=StateStore(settings.state_path),
+    )
+    incoming = IncomingChannelMessage(
+        update_id=3202,
+        source_channel_id="-1001",
+        source_channel_username=None,
+        message_id=778,
+        date=None,
+        text="test",
+        caption=None,
+        medias=[],
+        raw={},
+        media_group_id=None,
+    )
+    calls = {"count": 0}
+
+    async def _fake_detailed(*args, **kwargs):
+        calls["count"] += 1
+        return ("failed", "ai_output_not_acceptable")
+
+    service._process_route_message_detailed = _fake_detailed  # type: ignore[method-assign]  # noqa: SLF001
+    status, error = asyncio.run(
+        service._process_route_message_with_retries(incoming, route, retries=5)  # noqa: SLF001
+    )
+    assert status == "blocked"
+    assert error == "ai_output_not_acceptable"
+    assert calls["count"] == 1
+
+
 def test_service_dispatch_timeout_is_ambiguous(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
     route = ChannelRoute(

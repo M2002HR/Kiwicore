@@ -80,6 +80,11 @@ class KiwiService:
         self._bale_bot_user_id = self._parse_bot_user_id(settings.bale_bot_token)
         self._dispatch_permission_cache_ttl_sec = max(60.0, float(os.getenv("DISPATCH_PERMISSION_CACHE_TTL_SEC", "300")))
         self._dispatch_permission_cache: dict[str, tuple[float, bool, str | None]] = {}
+        try:
+            ai_retry_cap = int(os.getenv("SYNC_AI_REQUIRED_MAX_ATTEMPTS", "6"))
+        except Exception:
+            ai_retry_cap = 6
+        self._ai_required_max_attempts = max(1, min(50, ai_retry_cap))
         self.admin_handler = admin_handler
         self._route_patch_callback = route_patch_callback
 
@@ -778,6 +783,30 @@ class KiwiService:
                 return 1
 
             attempts = int((self.sync_ledger.get_record(item.dedupe_key) or record).attempt_count)
+            if self._is_ai_generation_required_error_text(last_error) and attempts >= self._ai_required_max_attempts:
+                # Keep retries bounded for transient AI outages to avoid endless loops.
+                self.sync_ledger.mark_status(
+                    item.dedupe_key,
+                    status="blocked",
+                    last_error=last_error,
+                    trace_id=f"sync:{item.dedupe_key}",
+                )
+                self.message_monitor.note_status(
+                    dedupe_key=item.dedupe_key,
+                    status="blocked",
+                    error=last_error,
+                    details=(
+                        "AI generation failed repeatedly; blocked after "
+                        f"{attempts} attempt(s)"
+                    ),
+                    progress_pct=100.0,
+                    trace_id=f"sync:{item.dedupe_key}",
+                )
+                self.sync_ledger.set_route_checkpoint(
+                    route.name,
+                    self._checkpoint_target_with_pending_groups(route.name, int(incoming.message_id)),
+                )
+                return 1
             self.sync_ledger.mark_status(
                 item.dedupe_key,
                 status="retry_wait",
@@ -982,6 +1011,10 @@ class KiwiService:
             )
             if status in {"ok", "blocked"}:
                 return status, err
+            if status == "failed" and self._is_permanent_channel_script_error_text(err):
+                # Permanent script validation failures should not be retried forever.
+                # Treat them as blocked so queue checkpoint can advance.
+                return "blocked", err
             if self._is_retryable_channel_script_error_text(err):
                 if idx < attempts - 1:
                     await asyncio.sleep(0.8 * (idx + 1))
@@ -1102,15 +1135,37 @@ class KiwiService:
         )
 
     @staticmethod
+    def _is_request_too_large_error_text(error_text: str | None) -> bool:
+        text = str(error_text or "").lower()
+        if not text:
+            return False
+        return (
+            "http 413" in text
+            or "request entity too large" in text
+            or "payload too large" in text
+            or "entity too large" in text
+        )
+
+    @staticmethod
+    def _is_permanent_channel_script_error_text(error_text: str | None) -> bool:
+        text = str(error_text or "").lower().strip()
+        if not text:
+            return False
+        return "ai_output_not_acceptable" in text
+
+    @staticmethod
+    def _is_ai_generation_required_error_text(error_text: str | None) -> bool:
+        text = str(error_text or "").lower().strip()
+        if not text:
+            return False
+        return "ai_generation_required_failed" in text
+
+    @staticmethod
     def _is_retryable_channel_script_error_text(error_text: str | None) -> bool:
         text = str(error_text or "").lower().strip()
         if not text:
             return False
-        return (
-            "ai_generation_required_failed" in text
-            or "ai_output_not_acceptable" in text
-            or "channel_script_timeout" in text
-        )
+        return "channel_script_timeout" in text
 
     @staticmethod
     def _classify_local_processing_error(stage_name: str, exc: Exception) -> tuple[str, str] | None:
@@ -1908,7 +1963,8 @@ class KiwiService:
             stage_timings_ms["total"] = round((time.monotonic() - started_at) * 1000.0, 2)
             error_text = str(exc)
             is_permission = stage_name == "dispatch" and self._is_permission_error_text(error_text)
-            if is_permission:
+            is_request_too_large = stage_name == "dispatch" and self._is_request_too_large_error_text(error_text)
+            if is_permission or is_request_too_large:
                 status = "blocked"
             else:
                 status = "failed"
@@ -1917,7 +1973,15 @@ class KiwiService:
                 status=status,
                 incoming=incoming,
                 route=route,
-                reason=("Destination permission denied (permission_denied)" if is_permission else f"Platform error: {exc}"),
+                reason=(
+                    "Destination permission denied (permission_denied)"
+                    if is_permission
+                    else (
+                        "Destination payload too large (request_too_large)"
+                        if is_request_too_large
+                        else f"Platform error: {exc}"
+                    )
+                ),
                 trace_id=trace_id,
                 stage_timings_ms=stage_timings_ms,
             )

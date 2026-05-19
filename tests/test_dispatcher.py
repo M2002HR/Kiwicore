@@ -295,6 +295,28 @@ def test_dispatcher_does_not_fallback_to_document_when_send_audio_fails(tmp_path
     assert client.calls == []
 
 
+def test_dispatcher_falls_back_to_text_on_http_413_when_enabled(tmp_path: Path) -> None:
+    class OversizeVideoClient(FakeBaleClient):
+        async def send_video(self, chat_id: str, video_path: Path, caption: str | None = None):
+            raise PlatformApiError("sendVideo HTTP 413: Request Entity Too Large")
+
+    client = OversizeVideoClient()
+    dispatcher = BaleDispatcher(client)
+    dispatcher.media_upload_fallback_mode = "text"
+
+    input_dir = tmp_path / "input"
+    output_dir = tmp_path / "output"
+    input_dir.mkdir()
+    output_dir.mkdir()
+    (output_dir / "big.mp4").write_bytes(b"abc")
+
+    messages = [
+        ScriptOutputMessage(type=OutputMessageKind.VIDEO, path="big.mp4", caption="video cap"),
+    ]
+    asyncio.run(dispatcher.dispatch("@chan", messages, output_dir=output_dir, input_dir=input_dir))
+    assert client.calls == [("text", "@chan", "video cap\n@chan")]
+
+
 def test_dispatcher_skips_empty_text_message(tmp_path: Path) -> None:
     client = FakeBaleClient()
     dispatcher = BaleDispatcher(client)

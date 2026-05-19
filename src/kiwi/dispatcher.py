@@ -300,7 +300,14 @@ class BaleDispatcher:
 
     @staticmethod
     def _is_upload_bytes_error(exc: PlatformApiError) -> bool:
-        return "failed to upload file bytes" in str(exc).lower()
+        text = str(exc).lower()
+        return (
+            "failed to upload file bytes" in text
+            or "http 413" in text
+            or "request entity too large" in text
+            or "payload too large" in text
+            or "entity too large" in text
+        )
 
     @staticmethod
     def _build_media_fallback_text(*, caption: str | None, media_kind: str, path: Path) -> str:

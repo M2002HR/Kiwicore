@@ -350,6 +350,25 @@ def test_football_script_media_without_caption_passthroughs_without_ai(tmp_path:
     assert out == [{"type": "photo", "path": "a.jpg"}]
 
 
+def test_football_script_media_only_passthroughs_in_mandatory_mode(tmp_path: Path, monkeypatch) -> None:
+    mod = _load_module()
+    monkeypatch.setenv("CHANNEL_SCRIPT_AI_ENABLED", "true")
+    monkeypatch.setenv("CHANNEL_SCRIPT_AI_MANDATORY", "true")
+    monkeypatch.setenv("CHANNEL_SCRIPT_AI_ENDPOINT", "http://fake.local/proxy/gemini")
+
+    def fake_call(*, endpoint: str, body: dict, timeout_sec: float):
+        raise AssertionError("AI should not be called for media-only messages without text/caption")
+
+    monkeypatch.setattr(mod, "_call_gemini_text", fake_call)
+    payload = {
+        "route": {"destination_target": "@dest"},
+        "message": {},
+        "inputs": [{"kind": "photo", "local_name": "a.jpg"}],
+    }
+    out = mod.build_messages(payload, input_dir=tmp_path)
+    assert out == [{"type": "photo", "path": "a.jpg"}]
+
+
 def test_football_script_non_photo_without_caption_passthroughs_without_ai(tmp_path: Path, monkeypatch) -> None:
     mod = _load_module()
     monkeypatch.setenv("CHANNEL_SCRIPT_AI_ENABLED", "true")

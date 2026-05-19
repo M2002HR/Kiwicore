@@ -1223,7 +1223,12 @@ def build_messages(payload: dict, *, input_dir: Path) -> list[dict]:
     destination = _destination_signature(payload)
 
     if ai_mandatory and (generated is None or not generated):
-        raise RuntimeError("ai_generation_required_failed")
+        # Mandatory AI should not hard-fail media-only updates that have no
+        # textual source to rewrite. In that case passthrough media safely.
+        if not has_textual_source and _has_any_media(base):
+            out = base
+        else:
+            raise RuntimeError("ai_generation_required_failed")
     else:
         if generated is None:
             out = base

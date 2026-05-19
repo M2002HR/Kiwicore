@@ -322,6 +322,22 @@ def _has_textual_source(payload: dict) -> bool:
     return bool(text or caption)
 
 
+def _has_video_input(payload: dict) -> bool:
+    inputs = payload.get("inputs")
+    if not isinstance(inputs, list):
+        return False
+    for item in inputs:
+        if not isinstance(item, dict):
+            continue
+        kind = str(item.get("kind") or "").strip().lower()
+        if kind in {"video", "video_note"}:
+            return True
+        mime = str(item.get("mime_type") or "").strip().lower()
+        if mime.startswith("video/"):
+            return True
+    return False
+
+
 def _is_promotional_text(text: str) -> bool:
     combined = str(text or "").strip().lower()
     if not combined:
@@ -1192,6 +1208,13 @@ def build_messages(payload: dict, *, input_dir: Path) -> list[dict]:
     # Treat them as a safe skip instead of failing the sync pipeline.
     if not _has_meaningful_source(payload):
         return []
+
+    # Video posts must never go through AI generation path.
+    # Keep them as passthrough to avoid mandatory-AI failures on video-only updates.
+    if _has_video_input(payload):
+        if _is_promotional_messages(base):
+            return []
+        return base
 
     generated = _generate_football_text(payload=payload, input_dir=input_dir, base_messages=base)
     ai_mandatory = _ai_mandatory_mode()

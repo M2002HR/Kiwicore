@@ -338,6 +338,7 @@ def _is_signal_promo_advertisement(combined: str) -> bool:
 
 def _is_obvious_gambling_advertisement(combined: str) -> bool:
     strong_brand_signals = (
+        "spinarium",
         "bc.game",
         "bc game",
         "bcgame",
@@ -379,6 +380,26 @@ def _is_obvious_gambling_advertisement(combined: str) -> bool:
     )
     if any(token in combined for token in strong_brand_signals):
         # Brand/site names are strong enough to block on their own.
+        return True
+
+    has_age_gate = bool(re.search(r"(\bad[\.\s]*18\+|18\+)", combined))
+    has_free_spins = bool(re.search(r"(\bfree\s*spins?\b|\b\d+\s*fs\b)", combined))
+    has_slot_context = any(
+        token in combined
+        for token in (
+            "reel",
+            "reels",
+            "spin",
+            "spins",
+            "slot machine",
+            "jackpot",
+            "🎰",
+        )
+    )
+    has_claim_cta = any(token in combined for token in ("claim", "welcome", "gift", "join now", "register now", "sign up"))
+    if has_age_gate and (has_free_spins or has_slot_context):
+        return True
+    if has_free_spins and (has_slot_context or has_claim_cta):
         return True
 
     generic_gambling_signals = (

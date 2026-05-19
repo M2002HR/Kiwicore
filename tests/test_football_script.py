@@ -369,6 +369,26 @@ def test_football_script_non_photo_without_caption_passthroughs_without_ai(tmp_p
     assert out == [{"type": "video", "path": "a.mp4"}]
 
 
+def test_football_script_video_with_caption_bypasses_ai_even_in_mandatory_mode(tmp_path: Path, monkeypatch) -> None:
+    mod = _load_module()
+    monkeypatch.setenv("CHANNEL_SCRIPT_AI_ENABLED", "true")
+    monkeypatch.setenv("CHANNEL_SCRIPT_AI_MANDATORY", "true")
+    monkeypatch.setenv("CHANNEL_SCRIPT_AI_ENDPOINT", "http://fake.local/proxy/gemini")
+
+    def fake_call(*, endpoint: str, body: dict, timeout_sec: float):
+        raise AssertionError("AI should not be called for video inputs")
+
+    monkeypatch.setattr(mod, "_call_gemini_text", fake_call)
+    payload = {
+        "route": {"destination_target": "@dest"},
+        "message": {"caption": "Pep laughed about the tattoo moment 😅"},
+        "inputs": [{"kind": "video", "local_name": "clip.mp4"}],
+    }
+
+    out = mod.build_messages(payload, input_dir=tmp_path)
+    assert out == [{"type": "video", "path": "clip.mp4", "caption": "Pep laughed about the tattoo moment 😅"}]
+
+
 def test_football_script_raises_when_mandatory_ai_unavailable_for_album_caption(
     tmp_path: Path, monkeypatch
 ) -> None:

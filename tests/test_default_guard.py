@@ -96,3 +96,20 @@ def test_default_guard_does_not_block_normal_sports_news_with_odds_word() -> Non
         }
     }
     assert m._is_obvious_advertisement(payload) is False
+
+
+def test_default_guard_blocks_spinarium_free_spins_ad_style_message() -> None:
+    m = _load_guard_module()
+    payload = {
+        "message": {
+            "text": None,
+            "caption": (
+                "Welcome to Spinarium\n\n"
+                "Spinarium 🎰\n\n"
+                "The reels are set. The gift is wrapped.\n"
+                "50 FS are yours — just walk in and claim them.\n"
+                "Ad. 18+"
+            ),
+        }
+    }
+    assert m._is_obvious_advertisement(payload) is True

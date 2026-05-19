@@ -1209,16 +1209,17 @@ def build_messages(payload: dict, *, input_dir: Path) -> list[dict]:
     if not _has_meaningful_source(payload):
         return []
 
-    # Video posts must never go through AI generation path.
-    # Keep them as passthrough to avoid mandatory-AI failures on video-only updates.
-    if _has_video_input(payload):
+    has_textual_source = _has_textual_source(payload)
+
+    # For video posts, only send textual context (caption/text) to AI.
+    # Video-only updates without text/caption should stay passthrough.
+    if _has_video_input(payload) and not has_textual_source:
         if _is_promotional_messages(base):
             return []
         return base
 
     generated = _generate_football_text(payload=payload, input_dir=input_dir, base_messages=base)
     ai_mandatory = _ai_mandatory_mode()
-    has_textual_source = _has_textual_source(payload)
 
     destination = _destination_signature(payload)
 

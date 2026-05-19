@@ -180,6 +180,9 @@ def _is_obvious_advertisement(payload: dict) -> bool:
     if not combined.strip():
         return False
 
+    if _has_explicit_ad_disclosure(combined):
+        return True
+
     strong_signals = (
         "#ad",
         "#sponsored",
@@ -205,6 +208,10 @@ def _is_obvious_advertisement(payload: dict) -> bool:
         "order now",
         "limited offer",
         "join now",
+        "download",
+        "download app",
+        "try demo",
+        "demo now",
         "join",
         "follow us",
         "follow",
@@ -271,6 +278,18 @@ def _is_obvious_advertisement(payload: dict) -> bool:
         return True
 
     return False
+
+
+def _has_explicit_ad_disclosure(combined: str) -> bool:
+    # Many Telegram ad injections carry explicit disclosure lines like "Ad. 18+" or "Ad by ...".
+    disclosure_patterns = (
+        r"\bad\s*[.:-]?\s*18\+\b",
+        r"\bad\s+by\b",
+        r"\badvertisement\b",
+        r"\bsponsored\b",
+        r"\bpromoted\s+post\b",
+    )
+    return any(re.search(pattern, combined) for pattern in disclosure_patterns)
 
 
 def _normalize_ad_text(text: str) -> str:

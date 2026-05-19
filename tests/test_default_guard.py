@@ -113,3 +113,30 @@ def test_default_guard_blocks_spinarium_free_spins_ad_style_message() -> None:
         }
     }
     assert m._is_obvious_advertisement(payload) is True
+
+
+def test_default_guard_blocks_explicit_ad_disclosure_for_ptxai_style_caption() -> None:
+    m = _load_guard_module()
+    payload = {
+        "message": {
+            "text": None,
+            "caption": (
+                "Smart Trading With AI\n\n"
+                "Ptxai\n\n"
+                "Download the ptxai app and try the demo now.\n"
+                "Ad. 18+"
+            ),
+        }
+    }
+    assert m._is_obvious_advertisement(payload) is True
+
+
+def test_default_guard_does_not_flag_adidas_or_regular_news_as_explicit_ad() -> None:
+    m = _load_guard_module()
+    payload = {
+        "message": {
+            "text": "Adidas unveiled the new Real Madrid kit for the 2026 season.",
+            "caption": None,
+        }
+    }
+    assert m._is_obvious_advertisement(payload) is False

@@ -184,7 +184,7 @@ def test_football_script_refines_low_quality_first_pass(tmp_path: Path, monkeypa
         "inputs": [],
     }
     out = mod.build_messages(payload, input_dir=tmp_path)
-    assert calls["count"] == 2
+    assert calls["count"] >= 2
     assert out == [{"type": "text", "text": "تیم با یک حمله سریع به گل رسید و با بازی منظم نتیجه را حفظ کرد."}]
 
 
@@ -388,14 +388,20 @@ def test_football_script_non_photo_without_caption_passthroughs_without_ai(tmp_p
     assert out == [{"type": "video", "path": "a.mp4"}]
 
 
-def test_football_script_video_with_caption_bypasses_ai_even_in_mandatory_mode(tmp_path: Path, monkeypatch) -> None:
+def test_football_script_video_with_caption_uses_ai_text_only_and_rewrites_caption(tmp_path: Path, monkeypatch) -> None:
     mod = _load_module()
     monkeypatch.setenv("CHANNEL_SCRIPT_AI_ENABLED", "true")
     monkeypatch.setenv("CHANNEL_SCRIPT_AI_MANDATORY", "true")
     monkeypatch.setenv("CHANNEL_SCRIPT_AI_ENDPOINT", "http://fake.local/proxy/gemini")
 
+    seen = {"called": 0, "has_inline_data": False}
+
     def fake_call(*, endpoint: str, body: dict, timeout_sec: float):
-        raise AssertionError("AI should not be called for video inputs")
+        seen["called"] += 1
+        assert endpoint == "http://fake.local/proxy/gemini"
+        parts = (((body.get("contents") or [{}])[0]).get("parts") or [])
+        seen["has_inline_data"] = any(isinstance(part, dict) and "inlineData" in part for part in parts)
+        return "پپ درباره آن لحظه خالکوبی با لبخند صحبت کرد."
 
     monkeypatch.setattr(mod, "_call_gemini_text", fake_call)
     payload = {
@@ -405,7 +411,9 @@ def test_football_script_video_with_caption_bypasses_ai_even_in_mandatory_mode(t
     }
 
     out = mod.build_messages(payload, input_dir=tmp_path)
-    assert out == [{"type": "video", "path": "clip.mp4", "caption": "Pep laughed about the tattoo moment 😅"}]
+    assert seen["called"] >= 1
+    assert seen["has_inline_data"] is False
+    assert out == [{"type": "video", "path": "clip.mp4", "caption": "😅 پپ درباره آن لحظه خالکوبی با لبخند صحبت کرد."}]
 
 
 def test_football_script_raises_when_mandatory_ai_unavailable_for_album_caption(

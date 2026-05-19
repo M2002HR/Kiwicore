@@ -439,7 +439,7 @@ class SyncLedger:
                     conn,
                     """
                     SELECT dedupe_key FROM sync_message_ledger
-                    WHERE status IN ('queued', 'failed', 'retry_wait')
+                    WHERE status IN ('queued', 'failed', 'retry_wait', 'ambiguous')
                     ORDER BY first_seen_at ASC
                     LIMIT ?
                     """,

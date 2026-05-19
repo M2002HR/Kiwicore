@@ -573,7 +573,7 @@ def test_service_sync_enforces_order_before_checkpoint_advance(tmp_path: Path) -
         state_store=StateStore(settings.state_path),
     )
 
-    async def _ok_once(incoming, route_obj, retries):  # noqa: ARG001
+    async def _ok_once(incoming, route_obj, retries, **kwargs):  # noqa: ARG001
         return ("ok", None)
 
     service._process_route_message_with_retries = _ok_once  # type: ignore[method-assign]  # noqa: SLF001
@@ -1191,7 +1191,7 @@ def test_service_flow_skips_missing_source_media_without_unexpected_error(tmp_pa
     assert error == "source_media_unavailable"
 
 
-def test_service_marks_football_ai_generation_required_as_ambiguous(tmp_path: Path) -> None:
+def test_service_marks_football_ai_generation_required_as_failed(tmp_path: Path) -> None:
     scripts_dir = tmp_path / "scripts"
     scripts_dir.mkdir()
     (scripts_dir / "football.py").write_text(
@@ -1243,7 +1243,7 @@ sys.exit(2)
     )
 
     status, error = asyncio.run(service._process_route_message_detailed(incoming, route))  # noqa: SLF001
-    assert status == "ambiguous"
+    assert status == "failed"
     assert error == "ai_generation_required_failed"
     assert bale.sent == []
 
@@ -2558,7 +2558,7 @@ def test_service_sync_ledger_dedupes_same_message_after_sent(tmp_path: Path) -> 
     assert bale.sent == [("-2001", "hello\n-2001")]
 
 
-def test_service_sync_marks_ambiguous_and_creates_review(tmp_path: Path) -> None:
+def test_service_sync_treats_ambiguous_as_retryable_failed(tmp_path: Path) -> None:
     channels_path = tmp_path / "channels.json"
     channels_path.write_text(
         json.dumps(
@@ -2613,10 +2613,9 @@ def test_service_sync_marks_ambiguous_and_creates_review(tmp_path: Path) -> None
     key = service.sync_ledger.dedupe_key(route.name, incoming.source_channel_id, incoming.message_id, None)  # noqa: SLF001
     record = service.sync_ledger.get_record(key)  # noqa: SLF001
     assert record is not None
-    assert record.status == "ambiguous"
+    assert record.status == "retry_wait"
     reviews = service.sync_ledger.list_review(limit=10, only_open=True)  # noqa: SLF001
-    assert len(reviews) == 1
-    assert reviews[0]["dedupe_key"] == key
+    assert len(reviews) == 0
 
 
 def test_service_sync_does_not_seed_checkpoint_from_stored_messages(tmp_path: Path) -> None:
@@ -2959,3 +2958,58 @@ def test_service_classifies_download_timeout_as_retryable(tmp_path: Path) -> Non
     )
     classified = service._classify_local_processing_error("download", asyncio.TimeoutError())  # noqa: SLF001
     assert classified == ("failed", "download_timeout")
+
+
+def test_service_dispatch_http_500_is_not_ambiguous(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    route = ChannelRoute(
+        name="dispatch-http500",
+        enabled=True,
+        source_channel_id="-1001",
+        source_channel_username=None,
+        destination_channel_id="-2001",
+        destination_channel_username=None,
+        channel_script=None,
+        max_message_mb=10,
+    )
+    service = KiwiService(
+        settings=settings,
+        routes=_route_registry(route),
+        telegram_client=FakeTelegramClient([], b""),
+        bale_client=FakeBaleClient(),
+        storage=StorageManager(settings.storage_dir),
+        guard_runner=GuardRunner(settings.gaurd_scripts_dir, timeout_sec=5),
+        script_runner=ScriptRunner(settings.scripts_dir, timeout_sec=5),
+        state_store=StateStore(settings.state_path),
+    )
+    assert (
+        service._is_ambiguous_dispatch_error_text(  # noqa: SLF001
+            'sendDocument HTTP 500: {"ok":false,"error_code":500,"description":"Internal Error: failed to upload file bytes"}'
+        )
+        is False
+    )
+
+
+def test_service_dispatch_timeout_is_ambiguous(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    route = ChannelRoute(
+        name="dispatch-timeout",
+        enabled=True,
+        source_channel_id="-1001",
+        source_channel_username=None,
+        destination_channel_id="-2001",
+        destination_channel_username=None,
+        channel_script=None,
+        max_message_mb=10,
+    )
+    service = KiwiService(
+        settings=settings,
+        routes=_route_registry(route),
+        telegram_client=FakeTelegramClient([], b""),
+        bale_client=FakeBaleClient(),
+        storage=StorageManager(settings.storage_dir),
+        guard_runner=GuardRunner(settings.gaurd_scripts_dir, timeout_sec=5),
+        script_runner=ScriptRunner(settings.scripts_dir, timeout_sec=5),
+        state_store=StateStore(settings.state_path),
+    )
+    assert service._is_ambiguous_dispatch_error_text("sendDocument network error: ReadTimeout") is True  # noqa: SLF001

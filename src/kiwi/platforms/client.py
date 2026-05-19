@@ -252,7 +252,8 @@ class BotApiClient:
             try:
                 with file_path.open("rb") as fh:
                     mime = self._guess_upload_mime(file_path, media_type=field_name)
-                    files = {field_name: (file_path.name, fh, mime)}
+                    upload_name = self._safe_upload_filename(file_path, media_type=field_name)
+                    files = {field_name: (upload_name, fh, mime)}
                     response = await self._post(method, data=data, files=files)
                 break
             except PlatformApiError as exc:
@@ -310,6 +311,32 @@ class BotApiClient:
             "video_note": "video/mp4",
         }
         return defaults.get(media_type, "application/octet-stream")
+
+    @staticmethod
+    def _safe_upload_filename(file_path: Path, *, media_type: str) -> str:
+        raw_name = str(file_path.name or "").strip()
+        cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", raw_name).strip("._")
+        suffix = str(file_path.suffix or "").strip()
+        if suffix and not cleaned.lower().endswith(suffix.lower()):
+            cleaned = f"{cleaned}{suffix}" if cleaned else f"file{suffix}"
+        if not cleaned:
+            default_ext = {
+                "photo": ".jpg",
+                "video": ".mp4",
+                "audio": ".mp3",
+                "voice": ".ogg",
+                "animation": ".mp4",
+                "document": ".bin",
+                "video_note": ".mp4",
+            }.get(media_type, ".bin")
+            cleaned = f"file{default_ext}"
+        if len(cleaned) <= 120:
+            return cleaned
+        if "." not in cleaned:
+            return cleaned[:120]
+        stem, ext = cleaned.rsplit(".", 1)
+        keep_stem = max(1, 120 - len(ext) - 1)
+        return f"{stem[:keep_stem]}.{ext}"
 
     async def download_file(self, file_path: str, output_path: Path, max_bytes: int) -> int:
         output_path.parent.mkdir(parents=True, exist_ok=True)

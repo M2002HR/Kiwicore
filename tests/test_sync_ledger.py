@@ -36,3 +36,19 @@ def test_sync_ledger_requeues_stale_processing_record(tmp_path: Path) -> None:
     record = ledger.get_record(key)
     assert record is not None
     assert record.status == "failed"
+
+
+def test_sync_ledger_list_retryable_includes_ambiguous_legacy_records(tmp_path: Path) -> None:
+    ledger = SyncLedger(str(tmp_path / "sync_ledger.sqlite3"))
+    payload = {"update_id": 1, "message_id": 1}
+    created, key, _ = ledger.register_message(
+        route_name="r1",
+        source_channel_id="-1001",
+        message_id=1,
+        media_group_id=None,
+        payload=payload,
+    )
+    assert created is True
+    ledger.mark_status(key, status="ambiguous", last_error="legacy_ambiguous")
+    keys = ledger.list_retryable_keys(limit=10)
+    assert key in keys

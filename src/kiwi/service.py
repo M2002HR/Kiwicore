@@ -400,8 +400,6 @@ class KiwiService:
         )
         if not created and status in TERMINAL_STATUSES:
             return
-        if status == "ambiguous":
-            return
         due_at = time.time()
         self.message_monitor.note_stage(
             dedupe_key=dedupe_key,
@@ -627,7 +625,7 @@ class KiwiService:
         record = self.sync_ledger.get_record(item.dedupe_key)
         if record is None:
             return 0
-        if record.status in TERMINAL_STATUSES or record.status == "ambiguous":
+        if record.status in TERMINAL_STATUSES:
             return 0
         self.message_monitor.note_stage(
             dedupe_key=item.dedupe_key,
@@ -777,30 +775,6 @@ class KiwiService:
                     route.name,
                     self._checkpoint_target_with_pending_groups(route.name, int(incoming.message_id)),
                 )
-                return 1
-
-            if status == "ambiguous":
-                self.sync_ledger.mark_status(
-                    item.dedupe_key,
-                    status="ambiguous",
-                    last_error=last_error,
-                    trace_id=f"sync:{item.dedupe_key}",
-                )
-                self.message_monitor.note_status(
-                    dedupe_key=item.dedupe_key,
-                    status="ambiguous",
-                    error=last_error,
-                    details="Ambiguous dispatch result; review required",
-                    progress_pct=100.0,
-                    trace_id=f"sync:{item.dedupe_key}",
-                )
-                review_id = self.sync_ledger.add_review(
-                    dedupe_key=item.dedupe_key,
-                    route_name=route.name,
-                    reason="dispatch_ambiguous",
-                    last_error=last_error,
-                )
-                await self._notify_review_alert(route=route, review_id=review_id, dedupe_key=item.dedupe_key, error=last_error)
                 return 1
 
             attempts = int((self.sync_ledger.get_record(item.dedupe_key) or record).attempt_count)
@@ -1015,10 +989,10 @@ class KiwiService:
                 # Exhausted route-level retries; keep this item retryable by queue policy.
                 return "failed", "channel_script_retry_exhausted"
             if status == "ambiguous":
-                if idx < attempts - 1 and self._is_transient_error_text(err):
+                if idx < attempts - 1:
                     await asyncio.sleep(0.8 * (idx + 1))
                     continue
-                return status, err
+                return "failed", (err or "ambiguous_result_exhausted")
             if idx < attempts - 1 and self._is_transient_error_text(err):
                 await asyncio.sleep(0.8 * (idx + 1))
                 continue
@@ -1102,6 +1076,18 @@ class KiwiService:
             or "http 503" in text
             or "http 504" in text
             or "failed to upload file bytes" in text
+        )
+
+    @staticmethod
+    def _is_ambiguous_dispatch_error_text(error_text: str | None) -> bool:
+        text = str(error_text or "").lower()
+        if not text:
+            return False
+        return (
+            "network error" in text
+            or "connecttimeout" in text
+            or "readtimeout" in text
+            or "timeout" in text
         )
 
     @staticmethod
@@ -1921,11 +1907,8 @@ class KiwiService:
         except PlatformApiError as exc:
             stage_timings_ms["total"] = round((time.monotonic() - started_at) * 1000.0, 2)
             error_text = str(exc)
-            is_ambiguous = stage_name == "dispatch" and self._is_transient_error_text(error_text)
             is_permission = stage_name == "dispatch" and self._is_permission_error_text(error_text)
-            if is_ambiguous:
-                status = "ambiguous"
-            elif is_permission:
+            if is_permission:
                 status = "blocked"
             else:
                 status = "failed"
@@ -1970,7 +1953,7 @@ class KiwiService:
                     msg = ""
                 lowered = msg.lower()
                 if "ai_generation_required_failed" in lowered:
-                    status = "ambiguous"
+                    status = "failed"
                     error_text = "ai_generation_required_failed"
                 elif "ai_output_not_acceptable" in lowered:
                     status = "failed"
@@ -1985,8 +1968,8 @@ class KiwiService:
                 incoming=incoming,
                 route=route,
                 reason=(
-                    "Channel script required AI generation but no AI output was produced (kept for retry)"
-                    if status == "ambiguous"
+                    "Channel script required AI generation but no AI output was produced"
+                    if error_text == "ai_generation_required_failed"
                     else "Channel script execution failed"
                 ),
                 trace_id=trace_id,

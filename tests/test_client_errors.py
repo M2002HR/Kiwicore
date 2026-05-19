@@ -205,3 +205,24 @@ def test_send_photo_sets_markdown_parse_mode_for_inline_link_caption(tmp_path: P
     data = recorder.calls[0].get("data")
     assert isinstance(data, dict)
     assert data.get("parse_mode") == "Markdown"
+
+
+def test_send_document_uses_safe_ascii_filename_for_upload(tmp_path: Path) -> None:
+    client = BotApiClient(
+        token="t",
+        api_base_url="https://api.telegram.org",
+        file_base_url="https://api.telegram.org/file",
+    )
+    recorder = RecordingHttpClient(_ok_response({"message_id": 3}))
+    client.client = recorder
+
+    doc_path = tmp_path / "گزارش نهایی 2026?.pdf"
+    doc_path.write_bytes(b"abc")
+
+    asyncio.run(client.send_document("@dest", doc_path))
+    assert recorder.calls
+    files = recorder.calls[0].get("files")
+    assert isinstance(files, dict)
+    payload = files.get("document")
+    assert isinstance(payload, tuple)
+    assert payload[0] == "2026_.pdf"

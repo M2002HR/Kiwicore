@@ -140,3 +140,14 @@ def test_default_guard_does_not_flag_adidas_or_regular_news_as_explicit_ad() -> 
         }
     }
     assert m._is_obvious_advertisement(payload) is False
+
+
+def test_default_guard_blocks_promo_tag_only_message() -> None:
+    m = _load_guard_module()
+    payload = {
+        "message": {
+            "text": "#promo",
+            "caption": None,
+        }
+    }
+    assert m._is_obvious_advertisement(payload) is True

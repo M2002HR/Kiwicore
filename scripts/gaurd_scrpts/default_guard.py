@@ -186,6 +186,8 @@ def _is_obvious_advertisement(payload: dict) -> bool:
     strong_signals = (
         "#ad",
         "#sponsored",
+        "#promo",
+        "#promoted",
         "sponsored",
         "sponsor",
         "affiliate",
@@ -200,6 +202,8 @@ def _is_obvious_advertisement(payload: dict) -> bool:
         "تخفیف ویژه",
     )
     if any(token in combined for token in strong_signals):
+        return True
+    if _has_promo_marker_tag(combined):
         return True
 
     cta_signals = (
@@ -290,6 +294,16 @@ def _has_explicit_ad_disclosure(combined: str) -> bool:
         r"\bpromoted\s+post\b",
     )
     return any(re.search(pattern, combined) for pattern in disclosure_patterns)
+
+
+def _has_promo_marker_tag(combined: str) -> bool:
+    # Short promo labels are ad markers even when no link exists (e.g. "#promo").
+    if re.search(r"(^|\s)#promo(\b|[^a-z0-9_])", combined):
+        return True
+    if re.search(r"(^|\s)#promoted(\b|[^a-z0-9_])", combined):
+        return True
+    compact = re.sub(r"[\s\W_]+", "", combined)
+    return compact in {"promo", "promoted", "promotion", "promotional"}
 
 
 def _normalize_ad_text(text: str) -> str:

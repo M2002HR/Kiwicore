@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import threading
 import time
 from datetime import datetime, timezone
@@ -80,6 +81,17 @@ class KiwiService:
         self._bale_bot_user_id = self._parse_bot_user_id(settings.bale_bot_token)
         self._dispatch_permission_cache_ttl_sec = max(60.0, float(os.getenv("DISPATCH_PERMISSION_CACHE_TTL_SEC", "300")))
         self._dispatch_permission_cache: dict[str, tuple[float, bool, str | None]] = {}
+        self._media_cache_enabled = os.getenv("SYNC_MEDIA_CACHE_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+        self._media_cache_dir = Path(settings.storage_dir) / "media_cache"
+        self._media_cache_dir.mkdir(parents=True, exist_ok=True)
+        self._media_cache_ttl_sec = self._read_bounded_int_env("SYNC_MEDIA_CACHE_TTL_SEC", default=259200, low=3600, high=1209600)
+        self._media_cache_prune_interval_sec = self._read_bounded_int_env(
+            "SYNC_MEDIA_CACHE_PRUNE_INTERVAL_SEC",
+            default=900,
+            low=60,
+            high=43200,
+        )
+        self._media_cache_last_prune_at = 0.0
         try:
             ai_retry_cap = int(os.getenv("SYNC_AI_REQUIRED_MAX_ATTEMPTS", "6"))
         except Exception:
@@ -116,6 +128,15 @@ class KiwiService:
             started_at_ts=self._started_at_ts,
         )
         self.message_monitor = MessageMonitor()
+
+    @staticmethod
+    def _read_bounded_int_env(name: str, *, default: int, low: int, high: int) -> int:
+        raw = os.getenv(name, str(default)).strip()
+        try:
+            value = int(raw)
+        except Exception:
+            value = default
+        return max(low, min(high, value))
 
     async def stop(self) -> None:
         self._stop_event.set()
@@ -837,6 +858,164 @@ class KiwiService:
         exp = max(0, int(attempt_count) - 1)
         return min(base * (2 ** exp), 300.0)
 
+    def _media_cache_key(self, *, media: IncomingMedia, file_path: str) -> str:
+        source = str(media.source or "bot_api").strip().lower()
+        file_id = str(media.file_id or "").strip()
+        file_name = str(media.file_name or "").strip().lower()
+        mime = str(media.mime_type or "").strip().lower()
+        size = int(media.file_size or 0)
+        duration = int(media.duration or 0)
+        source_ref = media.source_ref if isinstance(media.source_ref, dict) else {}
+        source_ref_key = json.dumps(source_ref, ensure_ascii=False, sort_keys=True) if source_ref else ""
+        material = "|".join(
+            [
+                source,
+                media.kind.value,
+                file_id,
+                str(file_path or "").strip().lower(),
+                file_name,
+                mime,
+                str(size),
+                str(duration),
+                source_ref_key,
+            ]
+        )
+        return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _default_media_extension(kind: MediaKind) -> str:
+        return {
+            MediaKind.PHOTO: ".jpg",
+            MediaKind.VIDEO: ".mp4",
+            MediaKind.VOICE: ".ogg",
+            MediaKind.AUDIO: ".mp3",
+            MediaKind.DOCUMENT: ".bin",
+            MediaKind.ANIMATION: ".mp4",
+            MediaKind.STICKER: ".webp",
+            MediaKind.VIDEO_NOTE: ".mp4",
+        }.get(kind, ".bin")
+
+    def _media_cache_path(self, *, cache_key: str, preferred_name: str, media_kind: MediaKind) -> Path:
+        suffix = str(Path(preferred_name).suffix or "").strip().lower()
+        if not suffix:
+            suffix = self._default_media_extension(media_kind)
+        subdir = self._media_cache_dir / media_kind.value / cache_key[:2]
+        return subdir / f"{cache_key}{suffix}"
+
+    @staticmethod
+    def _materialize_local_file(*, source_path: Path, target_path: Path) -> None:
+        if target_path.exists():
+            target_path.unlink()
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.link(source_path, target_path)
+            return
+        except Exception:
+            pass
+        shutil.copy2(source_path, target_path)
+
+    def _restore_media_from_cache(self, *, cache_path: Path, target_path: Path, remaining: int) -> int | None:
+        if not self._media_cache_enabled:
+            return None
+        if not cache_path.exists() or not cache_path.is_file():
+            return None
+        try:
+            st = cache_path.stat()
+        except Exception:
+            return None
+        now = time.time()
+        age_sec = now - float(st.st_mtime)
+        if age_sec < 0:
+            age_sec = 0
+        if age_sec > float(self._media_cache_ttl_sec):
+            try:
+                cache_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            return None
+        size = int(st.st_size)
+        if size <= 0:
+            return None
+        if size > remaining:
+            raise MessageTooLargeError(f"Message exceeded size limit ({size} > {remaining} bytes)")
+        self._materialize_local_file(source_path=cache_path, target_path=target_path)
+        try:
+            os.utime(cache_path, None)
+        except Exception:
+            pass
+        return size
+
+    def _save_media_to_cache(self, *, cache_path: Path, source_path: Path) -> None:
+        if not self._media_cache_enabled:
+            return
+        try:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            if cache_path.exists():
+                try:
+                    os.utime(cache_path, None)
+                except Exception:
+                    pass
+                return
+            tmp_path = cache_path.with_name(f"{cache_path.name}.tmp-{time.time_ns()}")
+            self._materialize_local_file(source_path=source_path, target_path=tmp_path)
+            tmp_path.replace(cache_path)
+        except Exception:
+            logger.debug("Media cache store skipped", exc_info=True)
+        finally:
+            try:
+                if 'tmp_path' in locals():
+                    tmp_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+    def _prune_media_cache(self) -> None:
+        if not self._media_cache_enabled:
+            return
+        now_mono = time.monotonic()
+        if now_mono - self._media_cache_last_prune_at < float(self._media_cache_prune_interval_sec):
+            return
+        self._media_cache_last_prune_at = now_mono
+        ttl = float(self._media_cache_ttl_sec)
+        now_ts = time.time()
+        try:
+            files = list(self._media_cache_dir.rglob("*"))
+        except Exception:
+            return
+        removed = 0
+        for path in files:
+            if not path.is_file():
+                continue
+            try:
+                st = path.stat()
+            except Exception:
+                continue
+            if now_ts - float(st.st_mtime) <= ttl:
+                continue
+            try:
+                path.unlink(missing_ok=True)
+                removed += 1
+            except Exception:
+                continue
+        for path in sorted(files, reverse=True):
+            if not path.is_dir():
+                continue
+            try:
+                if path != self._media_cache_dir:
+                    path.rmdir()
+            except Exception:
+                continue
+        if removed > 0:
+            logger.info(
+                "Media cache prune completed",
+                extra={
+                    "details": {
+                        "removed_files": removed,
+                        "cache_dir": str(self._media_cache_dir),
+                        "ttl_sec": int(ttl),
+                    }
+                },
+            )
+
     async def _download_input_media_with_retries(
         self,
         *,
@@ -1491,9 +1670,11 @@ class KiwiService:
         }
 
         downloaded_total = 0
+        network_downloaded_total = 0
         used_local_names: set[str] = set()
         download_started = time.monotonic()
         try:
+            self._prune_media_cache()
             for idx, media in enumerate(incoming.medias, start=1):
                 if media.kind == MediaKind.STICKER:
                     logger.info(
@@ -1527,6 +1708,12 @@ class KiwiService:
                 remaining = max_total_bytes - downloaded_total
                 if remaining <= 0:
                     raise MessageTooLargeError(f"Message exceeded size limit ({max_mb} MB)")
+                cache_key = self._media_cache_key(media=media, file_path=file_path)
+                cache_path = self._media_cache_path(
+                    cache_key=cache_key,
+                    preferred_name=str(target_rel),
+                    media_kind=media.kind,
+                )
 
                 timeout_raw = os.getenv("SYNC_MEDIA_DOWNLOAD_TIMEOUT_SEC", "").strip()
                 if timeout_raw:
@@ -1558,36 +1745,64 @@ class KiwiService:
                 else:
                     timeout_sec = base_timeout_sec
 
-                downloaded = await self._download_input_media_with_retries(
-                    media=media,
-                    file_path=file_path,
+                cache_hit = False
+                downloaded = self._restore_media_from_cache(
+                    cache_path=cache_path,
                     target_path=target_path,
                     remaining=remaining,
-                    timeout_sec=timeout_sec,
-                    route=route,
-                    incoming=incoming,
-                    trace_id=trace_id,
-                    media_index=idx,
                 )
+                if downloaded is not None:
+                    cache_hit = True
+                    logger.info(
+                        "Media reused from local cache",
+                        extra={
+                            "details": {
+                                "trace_id": trace_id,
+                                "route": route.name,
+                                "update_id": incoming.update_id,
+                                "message_id": incoming.message_id,
+                                "media_index": idx,
+                                "kind": media.kind.value,
+                                "bytes": int(downloaded),
+                                "local_path": str(target_path),
+                                "cache_path": str(cache_path),
+                            }
+                        },
+                    )
+                else:
+                    downloaded = await self._download_input_media_with_retries(
+                        media=media,
+                        file_path=file_path,
+                        target_path=target_path,
+                        remaining=remaining,
+                        timeout_sec=timeout_sec,
+                        route=route,
+                        incoming=incoming,
+                        trace_id=trace_id,
+                        media_index=idx,
+                    )
+                    network_downloaded_total += int(downloaded)
+                    self._save_media_to_cache(cache_path=cache_path, source_path=target_path)
                 downloaded_total += downloaded
-                logger.info(
-                    "Media downloaded",
-                    extra={
-                        "details": {
-                            "trace_id": trace_id,
-                            "route": route.name,
-                            "update_id": incoming.update_id,
-                            "message_id": incoming.message_id,
-                            "media_index": idx,
-                            "kind": media.kind.value,
-                            "source": media.source or "bot_api",
-                            "bytes": downloaded,
-                            "local_path": str(target_path),
-                            "downloaded_total_bytes": downloaded_total,
-                            "max_total_bytes": max_total_bytes,
-                        }
-                    },
-                )
+                if not cache_hit:
+                    logger.info(
+                        "Media downloaded",
+                        extra={
+                            "details": {
+                                "trace_id": trace_id,
+                                "route": route.name,
+                                "update_id": incoming.update_id,
+                                "message_id": incoming.message_id,
+                                "media_index": idx,
+                                "kind": media.kind.value,
+                                "source": media.source or "bot_api",
+                                "bytes": downloaded,
+                                "local_path": str(target_path),
+                                "downloaded_total_bytes": downloaded_total,
+                                "max_total_bytes": max_total_bytes,
+                            }
+                        },
+                    )
 
                 payload["inputs"].append(
                     {
@@ -1599,20 +1814,22 @@ class KiwiService:
                         "size_bytes": downloaded,
                         "local_path": str(target_path),
                         "local_name": str(target_rel),
+                        "cache_hit": cache_hit,
                     }
                 )
 
             payload["downloaded_total_bytes"] = downloaded_total
+            payload["network_downloaded_total_bytes"] = network_downloaded_total
             payload["max_total_bytes"] = max_total_bytes
             self.storage.write_payload(paths, payload)
-            self._record_traffic(route_name=route.name, download_bytes=downloaded_total, upload_bytes=0)
+            self._record_traffic(route_name=route.name, download_bytes=network_downloaded_total, upload_bytes=0)
             stage_timings_ms["download"] = round((time.monotonic() - download_started) * 1000.0, 2)
             _monitor_stage(
                 stage="download",
                 status="processing",
                 progress_pct=40.0,
-                details=f"Downloaded {downloaded_total} bytes",
-                download_bytes=downloaded_total,
+                details=f"Prepared {downloaded_total} bytes (network {network_downloaded_total} bytes)",
+                download_bytes=network_downloaded_total,
             )
             logger.info(
                 "Inputs prepared for scripts",
@@ -1625,6 +1842,7 @@ class KiwiService:
                         "output_dir": paths.output_dir,
                         "inputs_count": len(payload["inputs"]),
                         "downloaded_total_bytes": downloaded_total,
+                        "network_downloaded_total_bytes": network_downloaded_total,
                         "download_ms": stage_timings_ms["download"],
                     }
                 },

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import time
 from pathlib import Path
 from unittest.mock import patch
 
@@ -27,6 +29,7 @@ class FakeTelegramClient:
         self._done = False
         self.file_bytes = file_bytes
         self.get_file_calls = 0
+        self.download_calls = 0
         self.audit_messages: list[tuple[str, str]] = []
 
     async def get_updates(self, offset, timeout, allowed_updates):
@@ -40,6 +43,7 @@ class FakeTelegramClient:
         return {"file_path": f"files/{file_id}.bin"}
 
     async def download_file(self, file_path: str, output_path: Path, max_bytes: int) -> int:
+        self.download_calls += 1
         if len(self.file_bytes) > max_bytes:
             raise MessageTooLargeError("too large")
         output_path.write_bytes(self.file_bytes)
@@ -3165,3 +3169,193 @@ def test_service_dispatch_timeout_is_ambiguous(tmp_path: Path) -> None:
         state_store=StateStore(settings.state_path),
     )
     assert service._is_ambiguous_dispatch_error_text("sendDocument network error: ReadTimeout") is True  # noqa: SLF001
+
+
+def test_service_media_cache_reuses_file_across_route_retries(tmp_path: Path, monkeypatch) -> None:
+    class TimeoutPhotoBaleClient(FakeBaleClient):
+        async def send_photo(self, chat_id: str, photo_path: Path, caption: str | None = None):
+            raise PlatformApiError("sendPhoto network error: ReadTimeout: ")
+
+    monkeypatch.setenv("SYNC_MEDIA_CACHE_ENABLED", "true")
+    monkeypatch.setenv("SYNC_MEDIA_CACHE_TTL_SEC", "86400")
+
+    settings = _settings(tmp_path)
+    route = ChannelRoute(
+        name="cache-retry-route",
+        enabled=True,
+        source_channel_id="-1001",
+        source_channel_username=None,
+        destination_channel_id="-2001",
+        destination_channel_username=None,
+        channel_script=None,
+        max_message_mb=10,
+    )
+    tg = FakeTelegramClient([], b"photo-bytes")
+    service = KiwiService(
+        settings=settings,
+        routes=_route_registry(route),
+        telegram_client=tg,
+        bale_client=TimeoutPhotoBaleClient(),
+        storage=StorageManager(settings.storage_dir),
+        guard_runner=GuardRunner(settings.gaurd_scripts_dir, timeout_sec=5),
+        script_runner=ScriptRunner(settings.scripts_dir, timeout_sec=5),
+        state_store=StateStore(settings.state_path),
+    )
+    incoming = IncomingChannelMessage(
+        update_id=5101,
+        source_channel_id="-1001",
+        source_channel_username=None,
+        message_id=501,
+        date=None,
+        text=None,
+        caption=None,
+        medias=[
+            IncomingMedia(
+                kind=MediaKind.PHOTO,
+                file_id="f-cache-1",
+                file_size=32,
+                file_name="a.jpg",
+                mime_type="image/jpeg",
+                duration=None,
+            )
+        ],
+        raw={},
+        media_group_id=None,
+    )
+    status, _ = asyncio.run(service._process_route_message_with_retries(incoming, route, retries=2))  # noqa: SLF001
+    assert status == "failed"
+    assert tg.download_calls == 1
+
+    payload_files = sorted((Path(settings.storage_dir) / "messages" / "-1001").glob("*/payload.json"))
+    assert len(payload_files) >= 2
+    cache_hit_count = 0
+    for payload_path in payload_files:
+        obj = json.loads(payload_path.read_text(encoding="utf-8"))
+        for item in obj.get("inputs") or []:
+            if bool(item.get("cache_hit")):
+                cache_hit_count += 1
+    assert cache_hit_count >= 1
+
+
+def test_service_media_cache_reuses_file_across_different_routes(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("SYNC_MEDIA_CACHE_ENABLED", "true")
+    monkeypatch.setenv("SYNC_MEDIA_CACHE_TTL_SEC", "86400")
+
+    settings = _settings(tmp_path)
+    route1 = ChannelRoute(
+        name="cache-route-1",
+        enabled=True,
+        source_channel_id="-1001",
+        source_channel_username=None,
+        destination_channel_id="-2001",
+        destination_channel_username=None,
+        channel_script=None,
+        max_message_mb=10,
+    )
+    route2 = ChannelRoute(
+        name="cache-route-2",
+        enabled=True,
+        source_channel_id="-1002",
+        source_channel_username=None,
+        destination_channel_id="-2002",
+        destination_channel_username=None,
+        channel_script=None,
+        max_message_mb=10,
+    )
+    tg = FakeTelegramClient([], b"shared-photo")
+    service = KiwiService(
+        settings=settings,
+        routes=_route_registry([route1, route2]),
+        telegram_client=tg,
+        bale_client=FakeBaleClient(),
+        storage=StorageManager(settings.storage_dir),
+        guard_runner=GuardRunner(settings.gaurd_scripts_dir, timeout_sec=5),
+        script_runner=ScriptRunner(settings.scripts_dir, timeout_sec=5),
+        state_store=StateStore(settings.state_path),
+    )
+    incoming1 = IncomingChannelMessage(
+        update_id=5201,
+        source_channel_id="-1001",
+        source_channel_username=None,
+        message_id=601,
+        date=None,
+        text=None,
+        caption=None,
+        medias=[
+            IncomingMedia(
+                kind=MediaKind.PHOTO,
+                file_id="shared_file_id",
+                file_size=16,
+                file_name="p.jpg",
+                mime_type="image/jpeg",
+                duration=None,
+            )
+        ],
+        raw={},
+        media_group_id=None,
+    )
+    incoming2 = IncomingChannelMessage(
+        update_id=5202,
+        source_channel_id="-1002",
+        source_channel_username=None,
+        message_id=602,
+        date=None,
+        text=None,
+        caption=None,
+        medias=[
+            IncomingMedia(
+                kind=MediaKind.PHOTO,
+                file_id="shared_file_id",
+                file_size=16,
+                file_name="p.jpg",
+                mime_type="image/jpeg",
+                duration=None,
+            )
+        ],
+        raw={},
+        media_group_id=None,
+    )
+
+    status1, err1 = asyncio.run(service._process_route_message_detailed(incoming1, route1))  # noqa: SLF001
+    status2, err2 = asyncio.run(service._process_route_message_detailed(incoming2, route2))  # noqa: SLF001
+    assert status1 == "ok", err1
+    assert status2 == "ok", err2
+    assert tg.download_calls == 1
+
+
+def test_service_media_cache_prunes_files_older_than_ttl(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("SYNC_MEDIA_CACHE_ENABLED", "true")
+    monkeypatch.setenv("SYNC_MEDIA_CACHE_TTL_SEC", "3600")
+    monkeypatch.setenv("SYNC_MEDIA_CACHE_PRUNE_INTERVAL_SEC", "60")
+
+    settings = _settings(tmp_path)
+    route = ChannelRoute(
+        name="cache-prune-route",
+        enabled=True,
+        source_channel_id="-1001",
+        source_channel_username=None,
+        destination_channel_id="-2001",
+        destination_channel_username=None,
+        channel_script=None,
+        max_message_mb=10,
+    )
+    service = KiwiService(
+        settings=settings,
+        routes=_route_registry(route),
+        telegram_client=FakeTelegramClient([], b""),
+        bale_client=FakeBaleClient(),
+        storage=StorageManager(settings.storage_dir),
+        guard_runner=GuardRunner(settings.gaurd_scripts_dir, timeout_sec=5),
+        script_runner=ScriptRunner(settings.scripts_dir, timeout_sec=5),
+        state_store=StateStore(settings.state_path),
+    )
+
+    stale_file = service._media_cache_dir / "photo" / "ab" / "stale.jpg"  # noqa: SLF001
+    stale_file.parent.mkdir(parents=True, exist_ok=True)
+    stale_file.write_bytes(b"stale")
+    old = time.time() - 7200
+    os.utime(stale_file, (old, old))
+
+    service._media_cache_last_prune_at = 0.0  # noqa: SLF001
+    service._prune_media_cache()  # noqa: SLF001
+    assert not stale_file.exists()

@@ -273,6 +273,10 @@ class BaleDispatcher:
             return True
         except PlatformApiError as exc:
             mode = str(self.media_upload_fallback_mode or "none").strip().lower()
+            # Never downgrade photos to document fallback. This avoids sending
+            # images as generic files when transient upload issues happen.
+            if media_kind == OutputMessageKind.PHOTO.value and mode == "document":
+                mode = "none"
             if mode not in {"text", "document"} or not self._is_upload_bytes_error(exc):
                 raise
             if mode == "document":

@@ -13,6 +13,16 @@ class _Peer:
     channel_id: int
 
 
+class _ChannelEntity:
+    def __init__(self, key: str, channel_id: int = 555) -> None:
+        self._key = key
+        self.id = int(channel_id)
+        self.broadcast = True
+
+    def __str__(self) -> str:
+        return self._key
+
+
 class _Msg:
     def __init__(self, message_id: int, text: str = "") -> None:
         self.id = message_id
@@ -30,6 +40,14 @@ class _Msg:
         self.document = None
         self.grouped_id = None
         self.date = None
+
+
+class _PhotoMsg(_Msg):
+    def __init__(self, message_id: int, *, grouped_id: int | None, text: str = "") -> None:
+        super().__init__(message_id=message_id, text=text)
+        self.grouped_id = grouped_id
+        self.photo = object()
+        self.file = type("F", (), {"size": 123, "name": f"{message_id}.jpg", "mime_type": "image/jpeg", "duration": None})()
 
 
 class _DownloadMsg(_Msg):
@@ -50,20 +68,33 @@ class _FakeTelethonClient:
         self.by_id: dict[tuple[str, int], _Msg] = {}
 
     async def get_entity(self, entity):
-        return str(entity)
+        key = str(entity)
+        if key.startswith("PeerChannel(channel_id=") and key.endswith(")"):
+            try:
+                cid = int(key.removeprefix("PeerChannel(channel_id=").removesuffix(")"))
+            except Exception:
+                cid = 555
+            return _ChannelEntity(key, channel_id=cid)
+        return _ChannelEntity(key, channel_id=555)
 
-    async def get_messages(self, entity, limit=None, ids=None):
+    async def get_messages(self, entity, limit=None, ids=None, min_id=None, max_id=None):
         key = str(entity)
         if ids is not None:
             return self.by_id.get((key, int(ids)))
         hist = list(self.history_by_entity.get(key, []))
+        if min_id is not None:
+            hist = [m for m in hist if int(m.id) > int(min_id)]
+        if max_id is not None:
+            hist = [m for m in hist if int(m.id) < int(max_id)]
         if limit is None:
             return list(reversed(hist))
         return list(reversed(hist))[: int(limit)]
 
-    def iter_messages(self, entity, min_id=0, limit=50, reverse=False):
+    def iter_messages(self, entity, min_id=0, max_id=None, limit=50, reverse=False):
         key = str(entity)
         hist = [m for m in self.history_by_entity.get(key, []) if int(m.id) > int(min_id)]
+        if max_id is not None:
+            hist = [m for m in hist if int(m.id) < int(max_id)]
         hist.sort(key=lambda m: int(m.id), reverse=not bool(reverse))
         hist = hist[: int(limit)]
 
@@ -83,6 +114,7 @@ class _DialogEntity:
     def __init__(self, channel_id: int, key: str) -> None:
         self.id = int(channel_id)
         self._key = key
+        self.broadcast = True
 
     def __str__(self) -> str:
         return self._key
@@ -148,13 +180,15 @@ def test_download_media_accepts_telethon_generated_filename(tmp_path: Path) -> N
     assert out.exists()
     assert out.read_bytes() == b"abc123"
 
-
 def test_poll_messages_can_resolve_via_source_channel_id() -> None:
     class _ChannelIdFake(_FakeTelethonClient):
         async def get_entity(self, entity):
             if str(entity) == "-100555":
                 raise ValueError("not resolvable as plain numeric string")
-            return str(entity)
+            key = str(entity)
+            if key.startswith("PeerChannel(channel_id=") and key.endswith(")"):
+                return _ChannelEntity(key, channel_id=555)
+            return _ChannelEntity(key, channel_id=555)
 
     source = TelethonSourceClient(api_id=1, api_hash="x", session_path="./tmp.session")
     fake = _ChannelIdFake()
@@ -254,3 +288,32 @@ def test_latest_message_id_reports_standard_unresolvable_entity_error() -> None:
         raise AssertionError("expected ValueError")
     except ValueError as exc:
         assert "Unable to resolve source entity" in str(exc)
+
+
+def test_expand_media_group_merges_all_group_members_into_single_incoming() -> None:
+    source = TelethonSourceClient(api_id=1, api_hash="x", session_path="./tmp.session")
+    fake = _FakeTelethonClient()
+    grouped_id = 14005268120515820
+    fake.history_by_entity["@stored_src"] = [
+        _PhotoMsg(7218, grouped_id=None),
+        _PhotoMsg(7219, grouped_id=grouped_id),
+        _PhotoMsg(7220, grouped_id=grouped_id),
+        _PhotoMsg(7221, grouped_id=grouped_id),
+        _PhotoMsg(7222, grouped_id=grouped_id, text="album caption"),
+        _PhotoMsg(7223, grouped_id=None),
+    ]
+    source._client = fake  # noqa: SLF001
+    source._ensure_connected = lambda: asyncio.sleep(0)  # type: ignore[method-assign]  # noqa: SLF001
+
+    route = _route()
+    incoming = asyncio.run(source._to_incoming(fake.history_by_entity["@stored_src"][2], source_key="@stored_src", source_username=route.source_channel_username))  # noqa: SLF001
+    assert incoming is not None
+    assert incoming.message_id == 7220
+    assert len(incoming.medias) == 1
+
+    expanded = asyncio.run(source.expand_media_group(incoming, source_username=route.source_channel_username))
+    assert expanded.message_id == 7222
+    assert expanded.update_id == 7222
+    assert expanded.media_group_id == str(grouped_id)
+    assert len(expanded.medias) == 4
+    assert expanded.caption == "album caption"

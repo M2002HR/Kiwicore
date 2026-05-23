@@ -1486,6 +1486,7 @@ class KiwiService:
         *,
         dedupe_key: str | None = None,
     ) -> tuple[str, str | None]:
+        incoming = await self._maybe_expand_telethon_media_group(incoming=incoming, route=route)
         trace_id = self._build_trace_id(route, incoming)
         started_at = time.monotonic()
         stage_timings_ms: dict[str, float] = {}
@@ -2372,6 +2373,65 @@ class KiwiService:
                 details=f"{stage_name}_unexpected_error",
             )
             return "failed", f"{stage_name}_unexpected_error"
+
+    async def _maybe_expand_telethon_media_group(
+        self,
+        *,
+        incoming: IncomingChannelMessage,
+        route: ChannelRoute,
+    ) -> IncomingChannelMessage:
+        if not incoming.media_group_id:
+            return incoming
+        if len(incoming.medias) > 1:
+            return incoming
+        if not any(
+            str(media.source or "").strip().lower() == "telethon" and isinstance(media.source_ref, dict)
+            for media in incoming.medias
+        ):
+            return incoming
+        if self.source_client is None:
+            return incoming
+
+        expand_func = getattr(self.source_client, "expand_media_group", None)
+        if not callable(expand_func):
+            return incoming
+
+        try:
+            expanded = await expand_func(incoming, source_username=route.source_channel_username)
+        except Exception:
+            logger.exception(
+                "Failed to expand telethon media group; continuing with original incoming message",
+                extra={
+                    "details": {
+                        "route": route.name,
+                        "source_channel_id": incoming.source_channel_id,
+                        "message_id": incoming.message_id,
+                        "media_group_id": incoming.media_group_id,
+                    }
+                },
+            )
+            return incoming
+
+        if not isinstance(expanded, IncomingChannelMessage):
+            return incoming
+        if len(expanded.medias) <= len(incoming.medias):
+            return incoming
+
+        logger.info(
+            "Expanded telethon media group before processing",
+            extra={
+                "details": {
+                    "route": route.name,
+                    "source_channel_id": incoming.source_channel_id,
+                    "media_group_id": incoming.media_group_id,
+                    "original_message_id": incoming.message_id,
+                    "expanded_message_id": expanded.message_id,
+                    "original_media_count": len(incoming.medias),
+                    "expanded_media_count": len(expanded.medias),
+                }
+            },
+        )
+        return expanded
 
     def _collect_ready_messages(
         self,

@@ -312,6 +312,83 @@ class TelethonSourceClient:
         )
         return await self._latest_message_id(entity)
 
+    async def expand_media_group(
+        self,
+        incoming: IncomingChannelMessage,
+        *,
+        source_username: str | None = None,
+        search_window: int = 18,
+    ) -> IncomingChannelMessage:
+        if not incoming.media_group_id:
+            return incoming
+        if int(len(incoming.medias or [])) > 1:
+            return incoming
+
+        await self._ensure_connected()
+        assert self._client is not None
+
+        source_key = self._infer_source_key_from_incoming(incoming, source_username=source_username)
+        if not source_key:
+            return incoming
+
+        try:
+            entity = await self._resolve_entity(
+                source_key,
+                username=source_username or incoming.source_channel_username,
+                channel_id=incoming.source_channel_id,
+            )
+        except Exception:
+            return incoming
+
+        center_id = max(1, int(incoming.message_id))
+        window = max(6, min(60, int(search_window)))
+        min_id = max(0, center_id - window - 1)
+        max_id = center_id + window + 1
+
+        try:
+            fetched = await self._client.get_messages(entity, limit=(window * 4), min_id=min_id, max_id=max_id)
+        except Exception:
+            return incoming
+        if not fetched:
+            return incoming
+
+        if isinstance(fetched, list):
+            raw_messages = list(fetched)
+        else:
+            raw_messages = list(fetched or [])
+
+        same_group = []
+        target_gid = str(incoming.media_group_id)
+        for msg in raw_messages:
+            gid = getattr(msg, "grouped_id", None)
+            if gid is None:
+                continue
+            if str(gid).strip() != target_gid:
+                continue
+            same_group.append(msg)
+
+        if len(same_group) <= 1:
+            return incoming
+
+        parsed_members: list[IncomingChannelMessage] = []
+        for msg in same_group:
+            parsed = await self._to_incoming(
+                msg,
+                source_key=source_key,
+                source_username=source_username or incoming.source_channel_username,
+            )
+            if parsed is None:
+                continue
+            parsed_members.append(parsed)
+
+        if len(parsed_members) <= 1:
+            return incoming
+
+        merged = self._merge_media_group_members(parsed_members)
+        if len(merged.medias) <= len(incoming.medias):
+            return incoming
+        return merged
+
     async def download_media(self, source_ref: dict, output_path: Path, max_bytes: int) -> int:
         await self._ensure_connected()
         assert self._client is not None
@@ -685,6 +762,74 @@ class TelethonSourceClient:
             raw={"telethon": True, "source_key": source_key, "message_id": message_id},
             media_group_id=media_group_id,
         )
+
+    @staticmethod
+    def _merge_media_group_members(messages: list[IncomingChannelMessage]) -> IncomingChannelMessage:
+        ordered = sorted(messages, key=lambda m: (int(m.message_id), int(m.update_id)))
+        first = ordered[0]
+        last = ordered[-1]
+        text = next((msg.text for msg in ordered if msg.text), None)
+        caption = next((msg.caption for msg in ordered if msg.caption), None)
+        merged_medias: list[IncomingMedia] = []
+        for msg in ordered:
+            merged_medias.extend(msg.medias)
+
+        group_ids = [int(msg.message_id) for msg in ordered]
+        raw_updates: list[dict] = []
+        for msg in ordered:
+            if isinstance(msg.raw, dict):
+                raw_updates.append(msg.raw)
+
+        return IncomingChannelMessage(
+            # Use max id to let checkpoint advance past all members in this album.
+            update_id=max(int(msg.update_id) for msg in ordered),
+            source_channel_id=first.source_channel_id,
+            source_channel_username=first.source_channel_username,
+            message_id=max(group_ids),
+            date=last.date if last.date is not None else first.date,
+            text=text,
+            caption=caption,
+            medias=merged_medias,
+            raw={
+                "group_updates": raw_updates,
+                "group_message_ids": group_ids,
+                "group_message_start_id": int(first.message_id),
+                "group_message_end_id": int(max(group_ids)),
+            },
+            media_group_id=first.media_group_id,
+        )
+
+    @staticmethod
+    def _infer_source_key_from_incoming(incoming: IncomingChannelMessage, *, source_username: str | None = None) -> str | None:
+        if isinstance(incoming.raw, dict):
+            raw_key = str(incoming.raw.get("source_key") or "").strip()
+            if raw_key:
+                return raw_key
+            group_updates = incoming.raw.get("group_updates")
+            if isinstance(group_updates, list):
+                for item in group_updates:
+                    if not isinstance(item, dict):
+                        continue
+                    raw_key = str(item.get("source_key") or "").strip()
+                    if raw_key:
+                        return raw_key
+
+        for media in incoming.medias:
+            if str(media.source or "").strip().lower() != "telethon":
+                continue
+            if not isinstance(media.source_ref, dict):
+                continue
+            raw_key = str(media.source_ref.get("source_key") or "").strip()
+            if raw_key:
+                return raw_key
+
+        normalized_username = normalize_channel_username(source_username or incoming.source_channel_username or "")
+        if normalized_username:
+            return normalized_username
+        normalized_channel_id = normalize_channel_id(incoming.source_channel_id)
+        if normalized_channel_id:
+            return normalized_channel_id
+        return None
 
     @staticmethod
     def _route_source_key(route: ChannelRoute) -> str | None:

@@ -313,6 +313,82 @@ def _source_layout_instruction(payload: dict) -> str:
     return f"فرمت خروجی را مثل ورودی نگه دار و حدود {target_lines} خط خوانا با newline مناسب بده."
 
 
+def _source_tone_instruction(payload: dict) -> str:
+    source = _collect_source_content_text(payload)
+    if not source:
+        return "لحن خروجی را هم‌لحن با ورودی نگه دار."
+
+    normalized = str(source)
+    lowered = normalized.lower()
+    token_count = len(re.findall(r"\S+", normalized))
+
+    formal_markers = (
+        "می باشد",
+        "می‌باشد",
+        "خواهد شد",
+        "اعلام کرد",
+        "اعلام کرد که",
+        "گزارش",
+        "رسانه",
+        "باشگاه",
+        "سرمربی",
+        "دیدار",
+        "مسابقه",
+        "بر اساس",
+        "به گفته",
+        "طبق",
+    )
+    casual_markers = (
+        "خیلی",
+        "باحال",
+        "خفن",
+        "دمش گرم",
+        "بچه‌ها",
+        "بچه ها",
+        "رفیقا",
+        "داداش",
+        "وای",
+        "عه",
+        "وااای",
+        "هههه",
+        "خخخ",
+        "lol",
+        "lmao",
+        "ngl",
+        "bro",
+    )
+
+    formal_score = sum(1 for marker in formal_markers if marker in normalized or marker in lowered)
+    casual_score = sum(1 for marker in casual_markers if marker in normalized or marker in lowered)
+
+    emoji_count = len(_extract_emoji_tokens(normalized))
+    exclamations = normalized.count("!") + normalized.count("！")
+    question_marks = normalized.count("?") + normalized.count("؟")
+    if emoji_count >= 1:
+        casual_score += 1
+    if exclamations >= 2:
+        casual_score += 1
+    if question_marks >= 2:
+        casual_score += 1
+    if token_count >= 14 and emoji_count == 0 and exclamations == 0:
+        formal_score += 1
+
+    if casual_score >= formal_score + 2:
+        return (
+            "لحن خروجی را خودمانی و غیررسمیِ کنترل‌شده نگه دار؛ "
+            "جمله‌ها صمیمی و هماهنگ با ورودی باشند و بی‌دلیل رسمی‌سازی نکن."
+        )
+    if formal_score >= casual_score + 1:
+        return (
+            "لحن خروجی را رسمی، حرفه‌ای و خبری/تحلیلی نگه دار؛ "
+            "از واژه‌های محاوره‌ای و خودمانیِ اضافی پرهیز کن."
+        )
+    return (
+        "لحن خروجی را با لحن ورودی هماهنگ نگه دار؛ "
+        "نه بیش از حد رسمی و نه بیش از حد محاوره‌ای."
+    )
+
+
 def _has_textual_source(payload: dict) -> bool:
     message = payload.get("message")
     if not isinstance(message, dict):
@@ -990,11 +1066,12 @@ def _generate_football_text(*, payload: dict, input_dir: Path, base_messages: li
     target_lines, prefer_multiline = _source_layout_hint(payload)
     length_instruction = _source_length_instruction(source_content)
     layout_instruction = _source_layout_instruction(payload)
+    tone_instruction = _source_tone_instruction(payload)
     prompt = _football_prompt(
         source_text,
         destination=destination,
         length_instruction=length_instruction,
-        layout_instruction=layout_instruction,
+        layout_instruction=f"{layout_instruction}\n{tone_instruction}",
     )
 
     if not _football_ai_enabled():
@@ -1070,7 +1147,8 @@ def _generate_football_text(*, payload: dict, input_dir: Path, base_messages: li
             "هیچ خط انگلیسی یا توضیح فرامتنی نیاور.\n"
             "اگر امضای مقصد وجود دارد، فقط یک‌بار در خط آخر بیاور.\n\n"
             f"{length_instruction}\n"
-            f"{layout_instruction}\n\n"
+            f"{layout_instruction}\n"
+            f"{tone_instruction}\n\n"
             f"متن:\n{cleaned or source_text or 'از روی تصویر یک کپشن فوتبالی بساز'}"
         )
         refine_parts = _prompt_parts(refine_prompt)
@@ -1112,7 +1190,8 @@ def _generate_football_text(*, payload: dict, input_dir: Path, base_messages: li
                 "حداکثر 4 جمله.\n\n"
                 "ایموجی‌های موجود را حذف نکن.\n\n"
                 f"{length_instruction}\n"
-                f"{layout_instruction}\n\n"
+                f"{layout_instruction}\n"
+                f"{tone_instruction}\n\n"
                 f"متن:\n{strict_source}"
             )
             strict_parts = _prompt_parts(strict_prompt)
@@ -1148,7 +1227,8 @@ def _generate_football_text(*, payload: dict, input_dir: Path, base_messages: li
             "هیچ توضیح اضافه نده.\n"
             "فقط نسخه نهایی را بده.\n"
             f"طول خروجی باید بین {low} تا {high} کاراکتر باشد.\n"
-            f"{layout_instruction}\n\n"
+            f"{layout_instruction}\n"
+            f"{tone_instruction}\n\n"
             f"متن:\n{cleaned}"
         )
         adjust_parts = _prompt_parts(adjust_prompt)

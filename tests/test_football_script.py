@@ -497,6 +497,28 @@ def test_football_script_length_bounds_follow_source_size() -> None:
     assert high_s < high_m < high_l
 
 
+def test_football_script_tone_instruction_detects_formal_source() -> None:
+    mod = _load_module()
+    payload = {
+        "message": {
+            "text": "باشگاه اعلام کرد که سرمربی تیم پس از این دیدار، جزئیات برنامه آماده‌سازی را اعلام خواهد کرد."
+        }
+    }
+    tone = mod._source_tone_instruction(payload)
+    assert tone.startswith("لحن خروجی را رسمی")
+
+
+def test_football_script_tone_instruction_detects_casual_source() -> None:
+    mod = _load_module()
+    payload = {
+        "message": {
+            "caption": "وای بچه‌ها چه بازی خفنی بود 😍🔥 خیلی حال داد!!!"
+        }
+    }
+    tone = mod._source_tone_instruction(payload)
+    assert tone.startswith("لحن خروجی را خودمانی")
+
+
 def test_football_script_applies_newline_layout_when_source_is_multiline(tmp_path: Path, monkeypatch) -> None:
     mod = _load_module()
     monkeypatch.setenv("CHANNEL_SCRIPT_AI_ENABLED", "true")

@@ -247,6 +247,31 @@ class MessageMonitor:
             items = items[-take:]
         return {"events": items, "latest_seq": latest_seq}
 
+    def clear_route(self, route_name: str) -> dict[str, int]:
+        target = str(route_name or "").strip()
+        if not target:
+            return {"removed_messages": 0, "removed_events": 0}
+        removed_messages = 0
+        removed_events = 0
+        with self._lock:
+            keys = [
+                dedupe_key
+                for dedupe_key, item in self._messages.items()
+                if str(item.get("route_name") or "").strip() == target
+            ]
+            for key in keys:
+                self._messages.pop(key, None)
+                removed_messages += 1
+
+            kept_events: deque[dict[str, Any]] = deque(maxlen=self._events_max)
+            for event in self._events:
+                if str(event.get("route_name") or "").strip() == target:
+                    removed_events += 1
+                    continue
+                kept_events.append(event)
+            self._events = kept_events
+        return {"removed_messages": int(removed_messages), "removed_events": int(removed_events)}
+
     @staticmethod
     def _text_preview_from_payload(payload: dict[str, Any]) -> str | None:
         message = payload.get("message")

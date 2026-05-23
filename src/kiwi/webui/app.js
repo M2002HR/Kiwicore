@@ -914,7 +914,10 @@ function routeStatusPill(routeStatus) {
 
 function effectiveRouteStatus(routeStatus, metrics) {
   const normalized = String(routeStatus || 'deactive').toLowerCase();
-  if (normalized === 'deactive') return 'deactive';
+  if (normalized === 'deactive' || normalized === 'syncing' || normalized === 'synced') {
+    return normalized;
+  }
+  // Fallback for legacy/malformed statuses: infer from metrics.
   const remaining = Number(metrics?.remaining_unsynced ?? 0);
   if (Number.isFinite(remaining) && remaining > 0) return 'syncing';
   return 'synced';
@@ -1031,6 +1034,7 @@ function renderRoutesPage(opts = {}) {
           <div class="icon-actions">
             ${iconBtn({ act: 'edit', title: `Edit ${r.name || ''}`, icon: '✎', attrs: `data-route-name="${routeKey}"` })}
             ${iconBtn({ act: 'toggle', title: routeStatus === 'deactive' ? 'Start route' : 'Stop route', icon: routeStatus === 'deactive' ? '▶' : '⏸', attrs: `data-route-name="${routeKey}" data-status="${routeStatus}"` })}
+            ${iconBtn({ act: 'force-sync', title: 'Force sync', icon: '↻', attrs: `data-route-name="${routeKey}"` })}
             ${iconBtn({ act: 'delete', title: `Delete ${r.name || ''}`, icon: '✕', extraClass: 'btn-danger', attrs: `data-route-name="${routeKey}"` })}
           </div>
         </td>
@@ -1133,6 +1137,16 @@ function renderRoutesPage(opts = {}) {
           showFlash('Route status updated');
           await reloadPageData('routes');
         }, 'Failed to change route status');
+        return;
+      }
+      if (act === 'force-sync') {
+        if (!confirm(`Force sync route ${name}?\nThis clears checkpoint and queued sync data for this route.`)) return;
+        await runAction(async () => {
+          const out = await api(`/api/routes/${encodeURIComponent(name)}/sync/force`, { method: 'POST' });
+          const removed = Number(out?.reset?.deleted_ledger_rows || 0);
+          showFlash(`Force sync started${removed > 0 ? ` (${removed} records reset)` : ''}`);
+          await reloadPageData('routes');
+        }, 'Failed to force sync route');
         return;
       }
       if (act === 'edit') {

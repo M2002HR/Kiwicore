@@ -696,6 +696,13 @@ class AdminWebServer:
                         out = parent.management_api.start_route_sync(unquote(name))
                         self._send_json({"ok": True, "route": out})
                         return
+                    if route_name.endswith("/sync/force") and method == "POST":
+                        name = unquote(route_name[: -len("/sync/force")])
+                        out = parent._run_async(parent.management_api.force_route_sync(name), timeout=20.0)
+                        runtime_reset = parent._run_async(parent.service.force_sync_route_runtime_reset(name), timeout=8.0)
+                        backfill = parent._run_async(parent.service.force_sync_route_backfill(name), timeout=35.0)
+                        self._send_json({"ok": True, **out, "runtime_reset": runtime_reset, "backfill": backfill})
+                        return
                     if route_name.endswith("/sync/stop") and method == "POST":
                         name = route_name[: -len("/sync/stop")]
                         out = parent.management_api.stop_route_sync(unquote(name))

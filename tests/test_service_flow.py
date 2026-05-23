@@ -636,6 +636,122 @@ def test_service_sync_enforces_order_before_checkpoint_advance(tmp_path: Path) -
     assert int(service.sync_ledger.get_route_checkpoint(route.name) or 0) == 11  # noqa: SLF001
 
 
+def test_service_force_sync_route_backfill_seeds_and_processes_messages(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    route = ChannelRoute(
+        name="force-seed-route",
+        enabled=False,
+        source_channel_id="-1001",
+        source_channel_username="@srcchan",
+        destination_channel_id="-2001",
+        destination_channel_username=None,
+        channel_script=None,
+        max_message_mb=10,
+        sync_enabled=True,
+        sync_status="syncing",
+        sync_backfill_count=5,
+        sync_seeded=False,
+    )
+    seeded = [
+        IncomingChannelMessage(
+            update_id=5001,
+            source_channel_id="-1001",
+            source_channel_username="@srcchan",
+            message_id=44,
+            date=None,
+            text="seed hello",
+            caption=None,
+            medias=[],
+            raw={"telethon": True},
+            media_group_id=None,
+        )
+    ]
+    source = FakeTelethonSourceClient(messages=[], seeded_messages=seeded)
+    bale = FakeBaleClient()
+    service = KiwiService(
+        settings=settings,
+        routes=_route_registry(route),
+        telegram_client=FakeTelegramClient([], b""),
+        bale_client=bale,
+        source_client=source,
+        storage=StorageManager(settings.storage_dir),
+        guard_runner=GuardRunner(settings.gaurd_scripts_dir, timeout_sec=5),
+        script_runner=ScriptRunner(settings.scripts_dir, timeout_sec=5),
+        state_store=StateStore(settings.state_path),
+    )
+
+    out = asyncio.run(service.force_sync_route_backfill(route.name))  # noqa: SLF001
+    assert bool(out.get("seed_supported")) is True
+    assert int(out.get("seeded_messages") or 0) == 1
+    assert int(out.get("enqueued_messages") or 0) == 1
+    assert int(out.get("processed_now") or 0) >= 1
+    assert source.seed_calls == [(route.name, 5)]
+    assert bale.sent == [("-2001", "seed hello\n-2001")]
+    assert int(service.sync_ledger.get_route_checkpoint(route.name) or 0) >= 44  # noqa: SLF001
+
+
+def test_service_force_sync_route_backfill_retries_seed_on_transient_error(tmp_path: Path) -> None:
+    class FlakySource(FakeTelethonSourceClient):
+        def __init__(self) -> None:
+            seeded = [
+                IncomingChannelMessage(
+                    update_id=6001,
+                    source_channel_id="-1001",
+                    source_channel_username="@srcchan",
+                    message_id=55,
+                    date=None,
+                    text="retry seed",
+                    caption=None,
+                    medias=[],
+                    raw={"telethon": True},
+                    media_group_id=None,
+                )
+            ]
+            super().__init__(messages=[], seeded_messages=seeded)
+            self.calls = 0
+
+        async def seed_recent_messages(self, route: ChannelRoute, limit: int) -> list[IncomingChannelMessage]:
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("temporary_seed_failure")
+            return await super().seed_recent_messages(route, limit)
+
+    settings = _settings(tmp_path)
+    route = ChannelRoute(
+        name="force-seed-retry-route",
+        enabled=False,
+        source_channel_id="-1001",
+        source_channel_username="@srcchan",
+        destination_channel_id="-2001",
+        destination_channel_username=None,
+        channel_script=None,
+        max_message_mb=10,
+        sync_enabled=True,
+        sync_status="syncing",
+        sync_backfill_count=3,
+        sync_seeded=False,
+    )
+    source = FlakySource()
+    bale = FakeBaleClient()
+    service = KiwiService(
+        settings=settings,
+        routes=_route_registry(route),
+        telegram_client=FakeTelegramClient([], b""),
+        bale_client=bale,
+        source_client=source,
+        storage=StorageManager(settings.storage_dir),
+        guard_runner=GuardRunner(settings.gaurd_scripts_dir, timeout_sec=5),
+        script_runner=ScriptRunner(settings.scripts_dir, timeout_sec=5),
+        state_store=StateStore(settings.state_path),
+    )
+
+    out = asyncio.run(service.force_sync_route_backfill(route.name))  # noqa: SLF001
+    assert bool(out.get("seed_supported")) is True
+    assert int(out.get("seeded_messages") or 0) == 1
+    assert source.calls == 2
+    assert bale.sent == [("-2001", "retry seed\n-2001")]
+
+
 def test_service_sync_blocks_queued_record_older_than_checkpoint(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
     route = ChannelRoute(

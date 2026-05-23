@@ -2444,6 +2444,88 @@ class KiwiService:
     def set_routes(self, routes: RouteRegistry) -> None:
         self.routes = routes
 
+    async def force_sync_route_runtime_reset(self, route_name: str) -> dict[str, int | bool]:
+        target = str(route_name or "").strip()
+        if not target:
+            return {
+                "removed_pending_groups": 0,
+                "cleared_next_due": False,
+                "removed_monitor_messages": 0,
+                "removed_monitor_events": 0,
+            }
+
+        pending_keys = [key for key in self._pending_media_groups.keys() if str(key[0]) == target]
+        for key in pending_keys:
+            self._pending_media_groups.pop(key, None)
+        had_next_due = target in self._sync_next_due_at
+        self._sync_next_due_at.pop(target, None)
+        monitor = self.message_monitor.clear_route(target)
+        return {
+            "removed_pending_groups": int(len(pending_keys)),
+            "cleared_next_due": bool(had_next_due),
+            "removed_monitor_messages": int(monitor.get("removed_messages") or 0),
+            "removed_monitor_events": int(monitor.get("removed_events") or 0),
+        }
+
+    async def force_sync_route_backfill(self, route_name: str, *, limit: int | None = None) -> dict[str, int | bool | str]:
+        target = str(route_name or "").strip()
+        if not target:
+            return {"seed_supported": False, "seeded_messages": 0, "enqueued_messages": 0, "processed_now": 0}
+
+        route = self._find_route(target)
+        if route is None:
+            raise ValueError("route_not_found")
+        if route.is_deactive():
+            return {"seed_supported": False, "seeded_messages": 0, "enqueued_messages": 0, "processed_now": 0, "note": "route_deactive"}
+        if self.source_client is None:
+            return {"seed_supported": False, "seeded_messages": 0, "enqueued_messages": 0, "processed_now": 0, "note": "source_client_missing"}
+
+        seed_recent = getattr(self.source_client, "seed_recent_messages", None)
+        if not callable(seed_recent):
+            return {"seed_supported": False, "seeded_messages": 0, "enqueued_messages": 0, "processed_now": 0, "note": "seed_recent_not_supported"}
+
+        take = max(0, int(route.sync_backfill_count if limit is None else limit))
+        seeded: list[IncomingChannelMessage] | None = None
+        last_exc: Exception | None = None
+        for attempt in range(1, 4):
+            try:
+                out = await seed_recent(route, take)
+                seeded = out if isinstance(out, list) else []
+                break
+            except Exception as exc:
+                last_exc = exc
+                if attempt >= 3:
+                    break
+                logger.warning(
+                    "Force sync seed attempt failed; retrying",
+                    extra={
+                        "details": {
+                            "route": target,
+                            "attempt": attempt,
+                            "attempts_total": 3,
+                            "error": str(exc),
+                        }
+                    },
+                )
+                await asyncio.sleep(0.4 * attempt)
+        if seeded is None:
+            raise RuntimeError(f"force_sync_seed_failed:{last_exc}") from last_exc
+        if not isinstance(seeded, list):
+            seeded = []
+        seeded_sorted = sorted(
+            [item for item in seeded if isinstance(item, IncomingChannelMessage)],
+            key=lambda item: int(item.message_id),
+        )
+        for incoming in seeded_sorted:
+            await self._enqueue_sync_message(route, incoming)
+        processed_now = await self._tick_sync_drain() if seeded_sorted else 0
+        return {
+            "seed_supported": True,
+            "seeded_messages": int(len(seeded_sorted)),
+            "enqueued_messages": int(len(seeded_sorted)),
+            "processed_now": int(processed_now),
+        }
+
     def message_monitor_snapshot(
         self,
         *,

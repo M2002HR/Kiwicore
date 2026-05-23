@@ -473,6 +473,176 @@ tbody tr:hover { background: rgba(15,157,143,.05); }
   width: auto;
 }
 
+.lifecycle-shell {
+  display: grid;
+  gap: 12px;
+}
+.lifecycle-top {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 10px;
+}
+.lifecycle-id-block {
+  min-width: 0;
+}
+.lifecycle-status-block {
+  display: grid;
+  justify-items: end;
+  gap: 6px;
+}
+.lifecycle-kpis {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: 8px;
+}
+.lifecycle-kpi {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: rgba(255,255,255,.72);
+  padding: 8px;
+  display: grid;
+  gap: 4px;
+}
+.lifecycle-kpi span {
+  font-size: 11px;
+  color: var(--muted);
+}
+.lifecycle-kpi strong {
+  font-size: 14px;
+}
+.lifecycle-progress {
+  min-height: 11px;
+}
+.lifecycle-pipeline {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+  gap: 8px;
+}
+.lifecycle-stage {
+  border: 1px solid rgba(19,45,66,.15);
+  border-radius: 10px;
+  padding: 8px;
+  background: rgba(255,255,255,.65);
+  display: grid;
+  gap: 4px;
+  position: relative;
+}
+.lifecycle-stage .dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 999px;
+  background: rgba(19,45,66,.25);
+  display: inline-block;
+}
+.lifecycle-stage .stage-name {
+  font-size: 12px;
+  font-weight: 700;
+  text-transform: capitalize;
+}
+.lifecycle-stage .stage-meta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.lifecycle-stage.done {
+  border-color: rgba(65,180,89,.35);
+  background: rgba(210,241,218,.52);
+}
+.lifecycle-stage.done .dot {
+  background: rgba(65,180,89,.85);
+}
+.lifecycle-stage.active {
+  border-color: rgba(30,95,168,.45);
+  background: rgba(209,228,249,.56);
+}
+.lifecycle-stage.active .dot {
+  background: rgba(30,95,168,.9);
+  animation: lifecycle-pulse 1.35s ease-in-out infinite;
+}
+.lifecycle-stage.failed {
+  border-color: rgba(184,24,35,.35);
+  background: rgba(253,224,228,.62);
+}
+.lifecycle-stage.failed .dot {
+  background: rgba(184,24,35,.85);
+}
+.lifecycle-events-wrap h4 {
+  margin: 0 0 8px;
+  font-size: 14px;
+}
+.lifecycle-events {
+  position: relative;
+  display: grid;
+  gap: 10px;
+  padding-left: 22px;
+}
+.lifecycle-events::before {
+  content: "";
+  position: absolute;
+  left: 6px;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  background: linear-gradient(180deg, rgba(30,95,168,.45), rgba(15,157,143,.35));
+  border-radius: 999px;
+}
+.lifecycle-event {
+  position: relative;
+  display: grid;
+  grid-template-columns: 14px minmax(0, 1fr);
+  gap: 8px;
+}
+.lifecycle-event-node {
+  width: 12px;
+  height: 12px;
+  border-radius: 999px;
+  background: rgba(19,45,66,.38);
+  border: 2px solid rgba(255,255,255,.85);
+  margin-top: 4px;
+  z-index: 1;
+}
+.lifecycle-event-node.ok { background: rgba(65,180,89,.9); }
+.lifecycle-event-node.warn { background: rgba(196,143,9,.92); }
+.lifecycle-event-node.err { background: rgba(184,24,35,.88); }
+.lifecycle-event-body {
+  border: 1px solid rgba(19,45,66,.14);
+  border-radius: 10px;
+  background: rgba(255,255,255,.75);
+  padding: 8px;
+}
+.lifecycle-event-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.lifecycle-event-meta {
+  margin-top: 5px;
+  font-size: 12px;
+  color: var(--muted);
+}
+.lifecycle-event-details {
+  margin-top: 6px;
+  font-size: 12px;
+  line-height: 1.35;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.lifecycle-event.is-last .lifecycle-event-body {
+  border-color: rgba(30,95,168,.34);
+  box-shadow: 0 0 0 1px rgba(30,95,168,.08);
+  animation: lifecycle-enter .35s ease-out;
+}
+@keyframes lifecycle-pulse {
+  0%, 100% { transform: scale(1); opacity: 1; }
+  50% { transform: scale(1.2); opacity: 0.72; }
+}
+@keyframes lifecycle-enter {
+  from { transform: translateY(8px); opacity: 0.25; }
+  to { transform: translateY(0); opacity: 1; }
+}
+
 pre {
   margin: 0;
   white-space: pre-wrap;
@@ -498,4 +668,8 @@ pre {
   .keyword-row { grid-template-columns: minmax(0, 1fr) 110px 34px; }
   #monitorRouteFilter, #monitorStatusFilter, #monitorSearchInput { width: 100% !important; }
   .monitor-active-flag { width: 100%; }
+  .lifecycle-top { flex-direction: column; }
+  .lifecycle-status-block { justify-items: start; }
+  .lifecycle-kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .lifecycle-pipeline { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }

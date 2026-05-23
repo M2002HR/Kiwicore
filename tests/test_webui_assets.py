@@ -57,6 +57,9 @@ def test_other_sections_use_modal_for_edit_or_preview() -> None:
     assert "renderMonitorPage()" in js
     assert "/api/monitor/messages" in js
     assert "/api/monitor/events" in js
+    assert "openMonitorLifecycleModal(" in js
+    assert "data-monitor-view" in js
+    assert "renderMonitorLifecycleModalContent(" in js
     assert "/api/realtime/config" in js
     assert "buildSourceMessageLink(" in js
     assert "Service Run Traffic History" in js
@@ -82,3 +85,6 @@ def test_styles_define_compact_rows_and_modal_layout() -> None:
     assert ".toast.error" in css
     assert ".keyword-chip-wrap" in css
     assert ".keyword-row" in css
+    assert ".lifecycle-shell" in css
+    assert ".lifecycle-pipeline" in css
+    assert ".lifecycle-events" in css

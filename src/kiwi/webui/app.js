@@ -24,6 +24,7 @@ const state = {
   },
   monitorEventSeq: 0,
   monitorEventSeen: new Set(),
+  monitorLifecycle: null,
   realtime: {
     channels: {},
     pageReloadDebounceTimer: null,
@@ -586,6 +587,7 @@ function closeModal() {
   els.modalOverlay.classList.add('hidden');
   els.modalOverlay.setAttribute('aria-hidden', 'true');
   els.modalBody.innerHTML = '';
+  state.monitorLifecycle = null;
 }
 
 function buildMenu() {
@@ -816,17 +818,61 @@ async function pollMonitorEvents() {
   applyMonitorEvents(events);
 }
 
+function applyMonitorEventToTrackedMessage(evt) {
+  if (!evt || typeof evt !== "object") return;
+  const key = String(evt.dedupe_key || "").trim();
+  if (!key) return;
+  const item = getMonitorMessageByDedupeKey(key);
+  if (!item) return;
+
+  const status = String(evt.status || item.status || "").trim().toLowerCase() || "processing";
+  const stage = String(evt.stage || item.current_stage || "").trim().toLowerCase() || "processing";
+  const ts = String(evt.ts || "").trim();
+  const progressRaw = Number(evt.progress_pct);
+  const progress = Number.isFinite(progressRaw) ? Math.max(0, Math.min(100, progressRaw)) : Number(item.progress_pct || 0);
+
+  item.status = status;
+  item.current_stage = stage;
+  item.updated_at = ts || item.updated_at;
+  item.progress_pct = Number.isFinite(progress) ? progress : Number(item.progress_pct || 0);
+  if (Number.isFinite(Number(evt.attempt_count))) item.attempt_count = Math.max(0, Number(evt.attempt_count));
+  if (Number.isFinite(Number(evt.download_bytes))) item.download_bytes = Math.max(0, Number(evt.download_bytes));
+  if (Number.isFinite(Number(evt.upload_bytes))) item.upload_bytes = Math.max(0, Number(evt.upload_bytes));
+  const errorText = String(evt.error || "").trim();
+  if (errorText) item.last_error = errorText;
+  if (evt.is_terminal) item.completed_at = ts || item.completed_at || new Date().toISOString();
+
+  const details = String(evt.details || "").trim() || errorText;
+  const history = Array.isArray(item.stage_history) ? item.stage_history.slice() : [];
+  history.push({
+    ts: ts || new Date().toISOString(),
+    stage,
+    status,
+    progress_pct: Math.round((Number(item.progress_pct || 0) || 0) * 10) / 10,
+    details: details || null,
+  });
+  if (history.length > 120) {
+    item.stage_history = history.slice(-120);
+  } else {
+    item.stage_history = history;
+  }
+}
+
 function applyMonitorEvents(events) {
   for (const evt of (Array.isArray(events) ? events : [])) {
     const seq = Number(evt.seq || 0);
     if (!Number.isFinite(seq) || seq <= 0) continue;
     if (state.monitorEventSeen.has(seq)) continue;
     state.monitorEventSeen.add(seq);
+    applyMonitorEventToTrackedMessage(evt);
     const text = notificationTextFromMonitorEvent(evt);
     if (!text) continue;
     const status = String(evt.status || '').toLowerCase();
     const isErr = status === 'failed' || status === 'blocked' || status === 'ambiguous';
     showFlash(text, isErr);
+  }
+  if (state.monitorLifecycle && isModalOpen()) {
+    renderMonitorLifecycleModalContent();
   }
   if (state.monitorEventSeen.size > 5000) {
     const keep = Array.from(state.monitorEventSeen).sort((a, b) => b - a).slice(0, 2500);
@@ -1570,6 +1616,219 @@ function buildSourceMessageLink(item) {
   return null;
 }
 
+function monitorStatusClass(status) {
+  const s = String(status || "").toLowerCase();
+  if (s === "sent") return "ok";
+  if (s === "processing" || s === "queued") return "warn";
+  if (s === "failed" || s === "blocked" || s === "ambiguous") return "err";
+  return "";
+}
+
+function formatMonitorStageName(stage) {
+  const raw = String(stage || "").trim();
+  if (!raw) return "-";
+  return raw.replaceAll("_", " ");
+}
+
+function parseIsoTs(value) {
+  const text = String(value || "").trim();
+  if (!text) return Number.NaN;
+  const out = Date.parse(text);
+  return Number.isFinite(out) ? out : Number.NaN;
+}
+
+function normalizeLifecycleHistory(item) {
+  const raw = Array.isArray(item?.stage_history) ? item.stage_history : [];
+  const normalized = raw
+    .map((step) => ({
+      ts: String(step?.ts || "").trim(),
+      stage: String(step?.stage || "").trim().toLowerCase() || "processing",
+      status: String(step?.status || item?.status || "processing").trim().toLowerCase() || "processing",
+      progress_pct: Number(step?.progress_pct ?? item?.progress_pct ?? 0),
+      details: step?.details != null ? String(step.details) : "",
+    }))
+    .filter((step) => step.stage);
+  normalized.sort((a, b) => {
+    const ta = parseIsoTs(a.ts);
+    const tb = parseIsoTs(b.ts);
+    if (Number.isFinite(ta) && Number.isFinite(tb) && ta !== tb) return ta - tb;
+    return String(a.ts).localeCompare(String(b.ts));
+  });
+  return normalized;
+}
+
+function buildLifecyclePipelineStates(history, fallbackStatus = "") {
+  const base = ["queued", "resolve", "download", "guard", "channel_script", "dispatch", "status"];
+  const seen = new Set(base);
+  const ordered = base.slice();
+  for (const h of history) {
+    const stage = String(h?.stage || "").trim().toLowerCase();
+    if (!stage || seen.has(stage)) continue;
+    seen.add(stage);
+    ordered.push(stage);
+  }
+  const latestIndex = history.length ? ordered.indexOf(String(history[history.length - 1]?.stage || "").toLowerCase()) : -1;
+  const hasFailure = history.some((step) => {
+    const status = String(step?.status || "").toLowerCase();
+    return status === "failed" || status === "blocked" || status === "ambiguous";
+  });
+  return ordered.map((stageName, idx) => {
+    const stages = history.filter((h) => String(h?.stage || "").toLowerCase() === stageName);
+    const last = stages.length ? stages[stages.length - 1] : null;
+    const status = String(last?.status || fallbackStatus || "").toLowerCase();
+    const isFailure = status === "failed" || status === "blocked" || status === "ambiguous";
+    let stateKind = "pending";
+    if (stages.length > 0) stateKind = "done";
+    if (idx === latestIndex && stages.length > 0) stateKind = "active";
+    if (isFailure) stateKind = "failed";
+    if (hasFailure && stageName === "status" && stages.length > 0 && isFailure) stateKind = "failed";
+    return {
+      stage: stageName,
+      state: stateKind,
+      attempts: stages.length,
+      status,
+      details: String(last?.details || "").trim(),
+    };
+  });
+}
+
+function lifecycleSummaryFromHistory(history) {
+  let failedCount = 0;
+  let ambiguousCount = 0;
+  let blockedCount = 0;
+  for (const step of history) {
+    const status = String(step?.status || "").toLowerCase();
+    if (status === "failed") failedCount += 1;
+    if (status === "ambiguous") ambiguousCount += 1;
+    if (status === "blocked") blockedCount += 1;
+  }
+  return { failedCount, ambiguousCount, blockedCount };
+}
+
+function getMonitorMessageByDedupeKey(dedupeKey) {
+  const key = String(dedupeKey || "").trim();
+  if (!key) return null;
+  const rows = Array.isArray(state.monitor?.messages) ? state.monitor.messages : [];
+  return rows.find((item) => String(item?.dedupe_key || "").trim() === key) || null;
+}
+
+function resolveLifecycleMessage() {
+  const lifecycle = state.monitorLifecycle;
+  if (!lifecycle || !lifecycle.dedupeKey) return null;
+  const fromMonitor = getMonitorMessageByDedupeKey(lifecycle.dedupeKey);
+  if (fromMonitor) return fromMonitor;
+  return lifecycle.fallbackMessage || null;
+}
+
+function renderMonitorLifecycleModalContent() {
+  const root = document.getElementById("monitorLifecycleRoot");
+  if (!root) return;
+  const lifecycle = state.monitorLifecycle;
+  const message = resolveLifecycleMessage();
+  if (!lifecycle || !message) {
+    root.innerHTML = '<div class="muted">No lifecycle data available for this message.</div>';
+    return;
+  }
+
+  const status = String(message.status || "").toLowerCase();
+  const progress = Math.max(0, Math.min(100, Number(message.progress_pct || 0)));
+  const attempts = Math.max(0, Number(message.attempt_count || 0));
+  const history = normalizeLifecycleHistory(message);
+  const pipeline = buildLifecyclePipelineStates(history, status);
+  const retryInfo = lifecycleSummaryFromHistory(history);
+  const stageCards = pipeline.map((node) => {
+    const cls = node.state === "active" ? "active" : node.state === "done" ? "done" : node.state === "failed" ? "failed" : "";
+    const attemptsLabel = node.attempts > 1 ? `<span class="muted">x${node.attempts}</span>` : "";
+    return `
+      <div class="lifecycle-stage ${cls}">
+        <span class="dot"></span>
+        <div class="stage-name">${esc(formatMonitorStageName(node.stage))}</div>
+        <div class="stage-meta">
+          ${node.status ? `<span class="badge ${monitorStatusClass(node.status)}">${esc(node.status)}</span>` : '<span class="badge">-</span>'}
+          ${attemptsLabel}
+        </div>
+      </div>
+    `;
+  }).join("");
+
+  const steps = history.map((step, idx) => {
+    const statusClass = monitorStatusClass(step.status);
+    const isLast = idx === history.length - 1;
+    const details = String(step.details || "").trim();
+    const progressText = Number.isFinite(Number(step.progress_pct)) ? `${Number(step.progress_pct).toFixed(1)}%` : "-";
+    return `
+      <div class="lifecycle-event ${isLast ? "is-last" : ""}">
+        <div class="lifecycle-event-node ${statusClass}"></div>
+        <div class="lifecycle-event-body">
+          <div class="lifecycle-event-head">
+            <strong>${esc(formatMonitorStageName(step.stage))}</strong>
+            <span class="badge ${statusClass}">${esc(step.status || "-")}</span>
+            <span class="muted">${esc(formatDateTime(step.ts))}</span>
+          </div>
+          <div class="lifecycle-event-meta">
+            <span>progress: <strong>${esc(progressText)}</strong></span>
+          </div>
+          ${details ? `<div class="lifecycle-event-details">${esc(details)}</div>` : ""}
+        </div>
+      </div>
+    `;
+  }).join("");
+
+  const sourceLink = buildSourceMessageLink(message);
+  const sourceLinkHtml = sourceLink
+    ? `<a href="${esc(sourceLink)}" target="_blank" rel="noreferrer">Open source message</a>`
+    : '<span class="muted">Source link not available</span>';
+  const downloadBytes = Number(message.download_bytes || 0);
+  const uploadBytes = Number(message.upload_bytes || 0);
+
+  root.innerHTML = `
+    <section class="lifecycle-shell">
+      <div class="lifecycle-top">
+        <div class="lifecycle-id-block">
+          <div><strong>${esc(message.route_name || "-")}</strong> · msg ${esc(message.message_id || "-")}</div>
+          <div class="muted">${esc(message.dedupe_key || "-")}</div>
+          <div class="muted">${sourceLinkHtml}</div>
+        </div>
+        <div class="lifecycle-status-block">
+          <div>${monitorStatusBadge(message.status)}</div>
+          <div class="muted">attempts: ${esc(attempts)}</div>
+        </div>
+      </div>
+
+      <div class="lifecycle-kpis">
+        <div class="lifecycle-kpi"><span>Progress</span><strong>${esc(progress.toFixed(1))}%</strong></div>
+        <div class="lifecycle-kpi"><span>Failed</span><strong>${esc(retryInfo.failedCount)}</strong></div>
+        <div class="lifecycle-kpi"><span>Ambiguous</span><strong>${esc(retryInfo.ambiguousCount)}</strong></div>
+        <div class="lifecycle-kpi"><span>Blocked</span><strong>${esc(retryInfo.blockedCount)}</strong></div>
+        <div class="lifecycle-kpi"><span>Download</span><strong>${esc(formatBytes(downloadBytes))}</strong></div>
+        <div class="lifecycle-kpi"><span>Upload</span><strong>${esc(formatBytes(uploadBytes))}</strong></div>
+      </div>
+
+      <div class="monitor-progress lifecycle-progress" title="${progress.toFixed(1)}%">
+        <div class="monitor-progress-fill" style="width:${progress.toFixed(1)}%"></div>
+      </div>
+
+      <div class="lifecycle-pipeline">${stageCards || '<span class="muted">No stage data</span>'}</div>
+
+      <div class="lifecycle-events-wrap">
+        <h4>Live Lifecycle Timeline</h4>
+        <div class="lifecycle-events">${steps || '<div class="muted">No timeline events yet.</div>'}</div>
+      </div>
+    </section>
+  `;
+}
+
+function openMonitorLifecycleModal(item) {
+  const dedupeKey = String(item?.dedupe_key || "").trim();
+  if (!dedupeKey) return;
+  state.monitorLifecycle = {
+    dedupeKey,
+    fallbackMessage: item ? JSON.parse(JSON.stringify(item)) : null,
+  };
+  openModal("Message Lifecycle", '<div id="monitorLifecycleRoot"></div>');
+  renderMonitorLifecycleModalContent();
+}
+
 function renderMonitorPage() {
   const page = document.getElementById('page-monitor');
   const monitor = state.monitor || {};
@@ -1588,6 +1847,7 @@ function renderMonitorPage() {
   });
   const statusCounts = summary.status_counts || {};
   const routeOptions = Array.from(new Set(rowsData.map((m) => String(m.route_name || '').trim()).filter(Boolean))).sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' }));
+  const rowsByKey = new Map(rowsData.map((item) => [String(item?.dedupe_key || "").trim(), item]));
   const rows = rowsData.map((item) => {
     const history = Array.isArray(item.stage_history) ? item.stage_history : [];
     const timeline = history.slice(-5).map((h) => `<span class="badge">${esc(h.stage)}:${esc(h.status)}</span>`).join('');
@@ -1625,6 +1885,11 @@ function renderMonitorPage() {
           <div class="muted">${formatDateTime(item.completed_at)}</div>
         </td>
         <td>${textCell}</td>
+        <td class="actions-cell">
+          <div class="icon-actions">
+            ${iconBtn({ title: "View lifecycle", icon: "👁", attrs: `data-monitor-view="${esc(item.dedupe_key || "")}"` })}
+          </div>
+        </td>
       </tr>
     `;
   }).join('');
@@ -1681,9 +1946,10 @@ function renderMonitorPage() {
               <th>Error</th>
               <th>Timestamps</th>
               <th>Preview</th>
+              <th data-no-sort="true">Actions</th>
             </tr>
           </thead>
-          <tbody>${rows || '<tr><td colspan="10"><span class="muted">No tracked messages yet</span></td></tr>'}</tbody>
+          <tbody>${rows || '<tr><td colspan="11"><span class="muted">No tracked messages yet</span></td></tr>'}</tbody>
         </table>
       </div>
     </div>
@@ -1705,6 +1971,15 @@ function renderMonitorPage() {
   document.getElementById('monitorActiveOnly')?.addEventListener('change', applyFilters);
   document.getElementById('monitorSearchInput')?.addEventListener('keydown', async (e) => {
     if (e.key === 'Enter') await applyFilters();
+  });
+  page.querySelectorAll("button[data-monitor-view]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const key = String(btn.getAttribute("data-monitor-view") || "").trim();
+      if (!key) return;
+      const item = rowsByKey.get(key);
+      if (!item) return;
+      openMonitorLifecycleModal(item);
+    });
   });
 }
 

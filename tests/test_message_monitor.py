@@ -76,3 +76,33 @@ def test_message_monitor_active_filter_works() -> None:
     active = monitor.list_messages(limit=10, active_only=True)
     assert active["summary"]["total"] == 1
     assert active["messages"][0]["dedupe_key"] == "k-active"
+
+
+def test_message_monitor_keeps_extended_stage_history_for_lifecycle_modal() -> None:
+    monitor = MessageMonitor(max_messages=100, max_events=2000)
+    monitor.register_message(
+        dedupe_key="k-history",
+        route_name="r1",
+        source_channel_id="-1",
+        source_channel_username=None,
+        message_id=10,
+        media_group_id=None,
+        status="queued",
+        payload={},
+    )
+    for idx in range(1, 151):
+        monitor.note_stage(
+            dedupe_key="k-history",
+            stage=f"stage_{idx}",
+            status="processing",
+            progress_pct=min(99.0, float(idx)),
+            details=f"step {idx}",
+            attempt_count=idx,
+        )
+
+    snap = monitor.list_messages(limit=20)
+    row = snap["messages"][0]
+    history = row["stage_history"]
+    assert len(history) == 120
+    assert history[0]["stage"] == "stage_31"
+    assert history[-1]["stage"] == "stage_150"

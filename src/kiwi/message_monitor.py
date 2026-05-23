@@ -315,8 +315,8 @@ class MessageMonitor:
                 "details": details or None,
             }
         )
-        if len(history) > 16:
-            history = history[-16:]
+        if len(history) > 120:
+            history = history[-120:]
         item["stage_history"] = history
 
     def _emit_event_locked(

@@ -218,11 +218,19 @@ def _parse_messages(payload: dict) -> list[ScriptOutputMessage]:
         text = item.get("text")
         path = item.get("path")
         caption = item.get("caption")
+        append_footer_raw = item.get("append_destination_footer", True)
+        append_destination_footer = bool(append_footer_raw)
 
         if kind == OutputMessageKind.TEXT:
             if not isinstance(text, str) or not text.strip():
                 raise ScriptExecutionError(f"messages[{idx}] type=text requires non-empty 'text'")
-            result.append(ScriptOutputMessage(type=kind, text=text))
+            result.append(
+                ScriptOutputMessage(
+                    type=kind,
+                    text=text,
+                    append_destination_footer=append_destination_footer,
+                )
+            )
             continue
 
         if not isinstance(path, str) or not path.strip():
@@ -233,6 +241,7 @@ def _parse_messages(payload: dict) -> list[ScriptOutputMessage]:
                 type=kind,
                 path=path.strip(),
                 caption=caption.strip() if isinstance(caption, str) and caption.strip() else None,
+                append_destination_footer=append_destination_footer,
             )
         )
 

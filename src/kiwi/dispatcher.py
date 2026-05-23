@@ -64,7 +64,7 @@ class BaleDispatcher:
                 idx = j
                 continue
 
-            resolved_group: list[tuple[ScriptOutputMessage, Path, str | None]] = []
+            resolved_group: list[tuple[ScriptOutputMessage, Path, str | None, bool]] = []
             for item in group:
                 path = self._resolve_path(
                     item.path or "",
@@ -73,18 +73,25 @@ class BaleDispatcher:
                     extra_input_dirs=extra_input_dirs,
                 )
                 caption = item.caption.strip() if isinstance(item.caption, str) and item.caption.strip() else None
-                resolved_group.append((item, path, caption))
+                resolved_group.append((item, path, caption, bool(item.append_destination_footer)))
 
             # Album-level caption should be carried by the first media item.
             # Some clients/platforms ignore captions on non-first items.
-            group_caption_raw = next((cap for _, _, cap in resolved_group if cap), None)
+            group_caption_raw = None
+            group_append_footer = True
+            for _, _, cap, append_footer in resolved_group:
+                if cap:
+                    group_caption_raw = cap
+                    group_append_footer = append_footer
+                    break
             group_caption = self._with_destination_footer(
                 group_caption_raw,
                 destination_target=destination_target,
                 ensure_nonempty=False,
+                append_footer=group_append_footer,
             )
             media_group = []
-            for index, (item, path, _) in enumerate(resolved_group):
+            for index, (item, path, _, _) in enumerate(resolved_group):
                 media_group.append({"type": item.type.value, "path": path, "caption": group_caption if index == 0 else None})
 
             try:
@@ -98,7 +105,7 @@ class BaleDispatcher:
                 sent_any = False
                 sent_first_item = False
                 last_error: PlatformApiError | None = None
-                for index, (item, _, _) in enumerate(resolved_group):
+                for index, (item, _, _, _) in enumerate(resolved_group):
                     dispatch_item = item
                     if index == 0 and isinstance(group_caption, str) and group_caption.strip():
                         dispatch_item = ScriptOutputMessage(
@@ -144,7 +151,15 @@ class BaleDispatcher:
             raw_text = (message.text or "").strip()
             if not raw_text:
                 return False
-            text = self._with_destination_footer(raw_text, destination_target=destination_target, ensure_nonempty=False) or raw_text
+            text = (
+                self._with_destination_footer(
+                    raw_text,
+                    destination_target=destination_target,
+                    ensure_nonempty=False,
+                    append_footer=bool(message.append_destination_footer),
+                )
+                or raw_text
+            )
             await self.bale_client.send_message(destination_target, text)
             return True
 
@@ -160,7 +175,12 @@ class BaleDispatcher:
                 send_primary=self.bale_client.send_photo,
                 destination_target=destination_target,
                 path=path,
-                caption=self._with_destination_footer(message.caption, destination_target=destination_target, ensure_nonempty=False),
+                caption=self._with_destination_footer(
+                    message.caption,
+                    destination_target=destination_target,
+                    ensure_nonempty=False,
+                    append_footer=bool(message.append_destination_footer),
+                ),
                 media_kind=OutputMessageKind.PHOTO.value,
             )
         if message.type == OutputMessageKind.VIDEO:
@@ -168,7 +188,12 @@ class BaleDispatcher:
                 send_primary=self.bale_client.send_video,
                 destination_target=destination_target,
                 path=path,
-                caption=self._with_destination_footer(message.caption, destination_target=destination_target, ensure_nonempty=False),
+                caption=self._with_destination_footer(
+                    message.caption,
+                    destination_target=destination_target,
+                    ensure_nonempty=False,
+                    append_footer=bool(message.append_destination_footer),
+                ),
                 media_kind=OutputMessageKind.VIDEO.value,
             )
         if message.type == OutputMessageKind.VOICE:
@@ -176,7 +201,12 @@ class BaleDispatcher:
                 send_primary=self.bale_client.send_voice,
                 destination_target=destination_target,
                 path=path,
-                caption=self._with_destination_footer(message.caption, destination_target=destination_target, ensure_nonempty=False),
+                caption=self._with_destination_footer(
+                    message.caption,
+                    destination_target=destination_target,
+                    ensure_nonempty=False,
+                    append_footer=bool(message.append_destination_footer),
+                ),
                 media_kind=OutputMessageKind.VOICE.value,
             )
         if message.type == OutputMessageKind.AUDIO:
@@ -184,7 +214,12 @@ class BaleDispatcher:
                 send_primary=self.bale_client.send_audio,
                 destination_target=destination_target,
                 path=path,
-                caption=self._with_destination_footer(message.caption, destination_target=destination_target, ensure_nonempty=False),
+                caption=self._with_destination_footer(
+                    message.caption,
+                    destination_target=destination_target,
+                    ensure_nonempty=False,
+                    append_footer=bool(message.append_destination_footer),
+                ),
                 media_kind=OutputMessageKind.AUDIO.value,
             )
         if message.type == OutputMessageKind.DOCUMENT:
@@ -192,7 +227,12 @@ class BaleDispatcher:
                 send_primary=self.bale_client.send_document,
                 destination_target=destination_target,
                 path=path,
-                caption=self._with_destination_footer(message.caption, destination_target=destination_target, ensure_nonempty=False),
+                caption=self._with_destination_footer(
+                    message.caption,
+                    destination_target=destination_target,
+                    ensure_nonempty=False,
+                    append_footer=bool(message.append_destination_footer),
+                ),
                 media_kind=OutputMessageKind.DOCUMENT.value,
             )
         if message.type == OutputMessageKind.ANIMATION:
@@ -200,7 +240,12 @@ class BaleDispatcher:
                 send_primary=self.bale_client.send_animation,
                 destination_target=destination_target,
                 path=path,
-                caption=self._with_destination_footer(message.caption, destination_target=destination_target, ensure_nonempty=False),
+                caption=self._with_destination_footer(
+                    message.caption,
+                    destination_target=destination_target,
+                    ensure_nonempty=False,
+                    append_footer=bool(message.append_destination_footer),
+                ),
                 media_kind=OutputMessageKind.ANIMATION.value,
             )
         if message.type == OutputMessageKind.STICKER:
@@ -337,9 +382,14 @@ class BaleDispatcher:
         *,
         destination_target: str,
         ensure_nonempty: bool,
+        append_footer: bool = True,
     ) -> str | None:
         footer = str(destination_target or "").strip()
         base = str(value or "").strip()
+        if not append_footer:
+            if base:
+                return base
+            return "" if ensure_nonempty else None
         if not footer:
             return base or (None if not ensure_nonempty else "")
         if not base:

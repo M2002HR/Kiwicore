@@ -77,6 +77,29 @@ def test_dispatcher_sends_text_and_file(tmp_path: Path) -> None:
     assert client.calls[1] == ("photo", "-200", "cap\n-200")
 
 
+def test_dispatcher_can_skip_destination_footer_per_message(tmp_path: Path) -> None:
+    client = FakeBaleClient()
+    dispatcher = BaleDispatcher(client)
+
+    input_dir = tmp_path / "input"
+    output_dir = tmp_path / "output"
+    input_dir.mkdir()
+    output_dir.mkdir()
+    (output_dir / "x.jpg").write_bytes(b"123")
+
+    messages = [
+        ScriptOutputMessage(
+            type=OutputMessageKind.PHOTO,
+            path="x.jpg",
+            caption="به چنل سرزمین والپیپر بپیوندید.",
+            append_destination_footer=False,
+        ),
+    ]
+
+    asyncio.run(dispatcher.dispatch("@chan", messages, output_dir=output_dir, input_dir=input_dir))
+    assert client.calls == [("photo", "@chan", "به چنل سرزمین والپیپر بپیوندید.")]
+
+
 def test_dispatcher_blocks_sticker_and_sends_video_note(tmp_path: Path) -> None:
     client = FakeBaleClient()
     dispatcher = BaleDispatcher(client)

@@ -148,6 +148,7 @@ class ScriptOutputMessage:
     text: str | None = None
     path: str | None = None
     caption: str | None = None
+    append_destination_footer: bool = True
 
 
 @dataclass(slots=True)

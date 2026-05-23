@@ -1,167 +1,746 @@
 [
   {
-    "destination": "@Espnfc_news",
-    "link": "https://ble.ir/Espnfc_news",
-    "keywords": ["ای‌اس‌پی‌ان", "ای اس پی ان", "ای‌اس‌پی‌ان اف‌سی", "ای اس پی ان اف سی"]
-  },
-  {
     "destination": "@al_nassr",
     "link": "https://ble.ir/al_nassr",
-    "keywords": ["النصر", "باشگاه النصر", "تیم النصر", "نصری‌ها"]
+    "keywords": [
+      {
+        "keyword": "باشگاه النصر",
+        "priority": 0
+      },
+      {
+        "keyword": "تیم النصر",
+        "priority": 0
+      },
+      {
+        "keyword": "نصری‌ها",
+        "priority": 0
+      },
+      {
+        "keyword": "النصر",
+        "priority": 0
+      }
+    ]
   },
   {
     "destination": "@arsenal_fa",
     "link": "https://ble.ir/arsenal_fa",
-    "keywords": ["آرسنال", "باشگاه آرسنال", "توپچی‌ها", "گانرز"]
+    "keywords": [
+      {
+        "keyword": "باشگاه آرسنال",
+        "priority": 0
+      },
+      {
+        "keyword": "توپچی‌ها",
+        "priority": 0
+      },
+      {
+        "keyword": "آرسنال",
+        "priority": 0
+      },
+      {
+        "keyword": "گانرز",
+        "priority": 0
+      }
+    ]
   },
   {
     "destination": "@barcelona_fa",
     "link": "https://ble.ir/barcelona_fa",
-    "keywords": ["بارسلونا", "بارسا", "باشگاه بارسلونا", "آبی‌اناری‌ها", "کاتالان‌ها"]
+    "keywords": [
+      {
+        "keyword": "باشگاه بارسلونا",
+        "priority": 0
+      },
+      {
+        "keyword": "آبی‌اناری‌ها",
+        "priority": 0
+      },
+      {
+        "keyword": "کاتالان‌ها",
+        "priority": 0
+      },
+      {
+        "keyword": "بارسلونا",
+        "priority": 0
+      },
+      {
+        "keyword": "بارسا",
+        "priority": 0
+      }
+    ]
   },
   {
     "destination": "@bayern_munich_ir",
     "link": "https://ble.ir/bayern_munich_ir",
-    "keywords": ["بایرن", "بایرن مونیخ", "باشگاه بایرن", "مونیخی‌ها"]
+    "keywords": [
+      {
+        "keyword": "باشگاه بایرن",
+        "priority": 0
+      },
+      {
+        "keyword": "بایرن مونیخ",
+        "priority": 0
+      },
+      {
+        "keyword": "مونیخی‌ها",
+        "priority": 0
+      },
+      {
+        "keyword": "بایرن",
+        "priority": 0
+      }
+    ]
   },
   {
     "destination": "@borussia_dortmund",
     "link": "https://ble.ir/borussia_dortmund",
-    "keywords": ["دورتموند", "بروسیا دورتموند", "باشگاه دورتموند", "زنبورها"]
+    "keywords": [
+      {
+        "keyword": "بروسیا دورتموند",
+        "priority": 0
+      },
+      {
+        "keyword": "باشگاه دورتموند",
+        "priority": 0
+      },
+      {
+        "keyword": "دورتموند",
+        "priority": 0
+      },
+      {
+        "keyword": "زنبورها",
+        "priority": 0
+      }
+    ]
   },
   {
     "destination": "@bundesliga_ir",
     "link": "https://ble.ir/bundesliga_ir",
-    "keywords": ["بوندسلیگا", "لیگ آلمان", "بوندس لیگا"]
+    "keywords": [
+      {
+        "keyword": "بوندس لیگا",
+        "priority": 0
+      },
+      {
+        "keyword": "بوندسلیگا",
+        "priority": 0
+      },
+      {
+        "keyword": "لیگ آلمان",
+        "priority": 0
+      }
+    ]
   },
   {
     "destination": "@chelsea_ir",
     "link": "https://ble.ir/chelsea_ir",
-    "keywords": ["چلسی", "باشگاه چلسی", "آبی‌های لندن", "بلوها"]
+    "keywords": [
+      {
+        "keyword": "آبی‌های لندن",
+        "priority": 0
+      },
+      {
+        "keyword": "باشگاه چلسی",
+        "priority": 0
+      },
+      {
+        "keyword": "بلوها",
+        "priority": 0
+      },
+      {
+        "keyword": "چلسی",
+        "priority": 0
+      }
+    ]
   },
   {
     "destination": "@cristiano_ir",
     "link": "https://ble.ir/cristiano_ir",
-    "keywords": ["کریستیانو", "کریستیانو رونالدو", "رونالدو", "کریس رونالدو", "سی آر سون"]
+    "keywords": [
+      {
+        "keyword": "کریستیانو رونالدو",
+        "priority": 0
+      },
+      {
+        "keyword": "کریس رونالدو",
+        "priority": 0
+      },
+      {
+        "keyword": "کریستیانو",
+        "priority": 0
+      },
+      {
+        "keyword": "سی آر سون",
+        "priority": 0
+      },
+      {
+        "keyword": "رونالدو",
+        "priority": 0
+      }
+    ]
   },
   {
     "destination": "@erling_haaland_ir",
     "link": "https://ble.ir/erling_haaland_ir",
-    "keywords": ["هالند", "ارلینگ هالند", "ارلینگ", "هالان"]
+    "keywords": [
+      {
+        "keyword": "ارلینگ هالند",
+        "priority": 0
+      },
+      {
+        "keyword": "ارلینگ",
+        "priority": 0
+      },
+      {
+        "keyword": "هالند",
+        "priority": 0
+      },
+      {
+        "keyword": "هالان",
+        "priority": 0
+      }
+    ]
+  },
+  {
+    "destination": "@Espnfc_news",
+    "link": "https://ble.ir/Espnfc_news",
+    "keywords": [
+      {
+        "keyword": "ای‌اس‌پی‌ان اف‌سی",
+        "priority": 0
+      },
+      {
+        "keyword": "ای اس پی ان اف سی",
+        "priority": 0
+      },
+      {
+        "keyword": "ای‌اس‌پی‌ان",
+        "priority": 0
+      },
+      {
+        "keyword": "ای اس پی ان",
+        "priority": 0
+      }
+    ]
+  },
+  {
+    "destination": "@hd_ultra_wallpapers",
+    "link": "https://ble.ir/hd_ultra_wallpapers",
+    "keywords": [
+      {
+        "keyword": "سرزمین والپیپر",
+        "priority": 100
+      },
+      {
+        "keyword": "چنل والپیپر",
+        "priority": 100
+      }
+    ]
   },
   {
     "destination": "@herewegoclub",
     "link": "https://ble.ir/herewegoclub",
-    "keywords": ["هیر وی گو", "هیر‌وی‌گو", "اینجا وی گو", "هیرویگو"]
+    "keywords": [
+      {
+        "keyword": "اینجا وی گو",
+        "priority": 0
+      },
+      {
+        "keyword": "هیر وی گو",
+        "priority": 0
+      },
+      {
+        "keyword": "هیر‌وی‌گو",
+        "priority": 0
+      },
+      {
+        "keyword": "هیرویگو",
+        "priority": 0
+      }
+    ]
   },
   {
     "destination": "@hilal_al",
     "link": "https://ble.ir/hilal_al",
-    "keywords": ["الهلال", "باشگاه الهلال", "تیم الهلال", "آبی‌های ریاض"]
+    "keywords": [
+      {
+        "keyword": "باشگاه الهلال",
+        "priority": 0
+      },
+      {
+        "keyword": "آبی‌های ریاض",
+        "priority": 0
+      },
+      {
+        "keyword": "تیم الهلال",
+        "priority": 0
+      },
+      {
+        "keyword": "الهلال",
+        "priority": 0
+      }
+    ]
   },
   {
     "destination": "@inter_miami_ir",
     "link": "https://ble.ir/inter_miami_ir",
-    "keywords": ["اینتر میامی", "باشگاه اینتر میامی", "میامی", "صورتی‌پوشان میامی"]
+    "keywords": [
+      {
+        "keyword": "باشگاه اینتر میامی",
+        "priority": 0
+      },
+      {
+        "keyword": "صورتی‌پوشان میامی",
+        "priority": 0
+      },
+      {
+        "keyword": "اینتر میامی",
+        "priority": 0
+      },
+      {
+        "keyword": "میامی",
+        "priority": 0
+      }
+    ]
   },
   {
     "destination": "@inter_milan_ir",
     "link": "https://ble.ir/inter_milan_ir",
-    "keywords": ["اینتر میلان", "اینتر", "باشگاه اینتر", "نراتزوری"]
+    "keywords": [
+      {
+        "keyword": "باشگاه اینتر",
+        "priority": 0
+      },
+      {
+        "keyword": "اینتر میلان",
+        "priority": 0
+      },
+      {
+        "keyword": "نراتزوری",
+        "priority": 0
+      },
+      {
+        "keyword": "اینتر",
+        "priority": 0
+      }
+    ]
   },
   {
     "destination": "@juventus_fa",
     "link": "https://ble.ir/juventus_fa",
-    "keywords": ["یوونتوس", "یووه", "باشگاه یوونتوس", "بیانکونری"]
+    "keywords": [
+      {
+        "keyword": "باشگاه یوونتوس",
+        "priority": 0
+      },
+      {
+        "keyword": "بیانکونری",
+        "priority": 0
+      },
+      {
+        "keyword": "یوونتوس",
+        "priority": 0
+      },
+      {
+        "keyword": "یووه",
+        "priority": 0
+      }
+    ]
   },
   {
     "destination": "@kiwi_kiwi_test",
     "link": "https://ble.ir/kiwi_kiwi_test",
-    "keywords": ["کیوی", "کیوی تست", "کانال کیوی"]
+    "keywords": [
+      {
+        "keyword": "کانال کیوی",
+        "priority": 0
+      },
+      {
+        "keyword": "کیوی تست",
+        "priority": 0
+      },
+      {
+        "keyword": "کیوی",
+        "priority": 0
+      }
+    ]
   },
   {
     "destination": "@kylian_mbappe_ir",
     "link": "https://ble.ir/kylian_mbappe_ir",
-    "keywords": ["امباپه", "کیلیان امباپه", "کیلین امباپه", "کیلیان"]
-  },
-  {
-    "destination": "@lamine_yamal_official",
-    "link": "https://ble.ir/lamine_yamal_official",
-    "keywords": ["یامال", "لامین", "لامین یامال"]
-  },
-  {
-    "destination": "@liverpool_fa",
-    "link": "https://ble.ir/liverpool_fa",
-    "keywords": ["لیورپول", "باشگاه لیورپول", "قرمزهای مرسی‌ساید", "ردز"]
+    "keywords": [
+      {
+        "keyword": "کیلیان امباپه",
+        "priority": 0
+      },
+      {
+        "keyword": "کیلین امباپه",
+        "priority": 0
+      },
+      {
+        "keyword": "امباپه",
+        "priority": 0
+      },
+      {
+        "keyword": "کیلیان",
+        "priority": 0
+      }
+    ]
   },
   {
     "destination": "@laliga_fa",
     "link": "https://ble.ir/laliga_fa",
-    "keywords": ["لالیگا", "لا لیگا", "لالیگا اسپانیا", "لیگ اسپانیا", "LaLiga", "la liga"]
+    "keywords": [
+      {
+        "keyword": "لالیگا اسپانیا",
+        "priority": 0
+      },
+      {
+        "keyword": "لیگ اسپانیا",
+        "priority": 0
+      },
+      {
+        "keyword": "لا لیگا",
+        "priority": 0
+      },
+      {
+        "keyword": "la liga",
+        "priority": 0
+      },
+      {
+        "keyword": "لالیگا",
+        "priority": 0
+      },
+      {
+        "keyword": "LaLiga",
+        "priority": 0
+      }
+    ]
+  },
+  {
+    "destination": "@lamine_yamal_official",
+    "link": "https://ble.ir/lamine_yamal_official",
+    "keywords": [
+      {
+        "keyword": "لامین یامال",
+        "priority": 0
+      },
+      {
+        "keyword": "یامال",
+        "priority": 0
+      },
+      {
+        "keyword": "لامین",
+        "priority": 0
+      }
+    ]
+  },
+  {
+    "destination": "@liverpool_fa",
+    "link": "https://ble.ir/liverpool_fa",
+    "keywords": [
+      {
+        "keyword": "قرمزهای مرسی‌ساید",
+        "priority": 0
+      },
+      {
+        "keyword": "باشگاه لیورپول",
+        "priority": 0
+      },
+      {
+        "keyword": "لیورپول",
+        "priority": 0
+      },
+      {
+        "keyword": "ردز",
+        "priority": 0
+      }
+    ]
   },
   {
     "destination": "@madrid_atletico",
     "link": "https://ble.ir/madrid_atletico",
-    "keywords": ["اتلتیکو", "اتلتیکو مادرید", "باشگاه اتلتیکو", "روخی‌بلانکوس"]
+    "keywords": [
+      {
+        "keyword": "اتلتیکو مادرید",
+        "priority": 0
+      },
+      {
+        "keyword": "باشگاه اتلتیکو",
+        "priority": 0
+      },
+      {
+        "keyword": "روخی‌بلانکوس",
+        "priority": 0
+      },
+      {
+        "keyword": "اتلتیکو",
+        "priority": 0
+      }
+    ]
   },
   {
     "destination": "@manchester_city_ir",
     "link": "https://ble.ir/manchester_city_ir",
-    "keywords": ["منچستر سیتی", "من سیتی", "منچسترسیتی", "سیتیزن‌ها"]
+    "keywords": [
+      {
+        "keyword": "منچستر سیتی",
+        "priority": 0
+      },
+      {
+        "keyword": "منچسترسیتی",
+        "priority": 0
+      },
+      {
+        "keyword": "سیتیزن‌ها",
+        "priority": 0
+      },
+      {
+        "keyword": "من سیتی",
+        "priority": 0
+      }
+    ]
   },
   {
     "destination": "@manchesterunited_fa",
     "link": "https://ble.ir/manchesterunited_fa",
-    "keywords": ["منچستر یونایتد", "منچستریونایتد", "یونایتد", "شیاطین سرخ", "باشگاه منچستر یونایتد"]
+    "keywords": [
+      {
+        "keyword": "باشگاه منچستر یونایتد",
+        "priority": 0
+      },
+      {
+        "keyword": "منچستر یونایتد",
+        "priority": 0
+      },
+      {
+        "keyword": "منچستریونایتد",
+        "priority": 0
+      },
+      {
+        "keyword": "شیاطین سرخ",
+        "priority": 0
+      },
+      {
+        "keyword": "یونایتد",
+        "priority": 0
+      }
+    ]
   },
   {
     "destination": "@messi_fa",
     "link": "https://ble.ir/messi_fa",
-    "keywords": ["مسی", "لیونل مسی", "لئو مسی", "لیو مسی"]
+    "keywords": [
+      {
+        "keyword": "لیونل مسی",
+        "priority": 0
+      },
+      {
+        "keyword": "لئو مسی",
+        "priority": 0
+      },
+      {
+        "keyword": "لیو مسی",
+        "priority": 0
+      },
+      {
+        "keyword": "مسی",
+        "priority": 0
+      }
+    ]
   },
   {
     "destination": "@milan_ir",
     "link": "https://ble.ir/milan_ir",
-    "keywords": ["میلان", "آث میلان", "آ سی میلان", "روسونری"]
+    "keywords": [
+      {
+        "keyword": "آ سی میلان",
+        "priority": 0
+      },
+      {
+        "keyword": "آث میلان",
+        "priority": 0
+      },
+      {
+        "keyword": "روسونری",
+        "priority": 0
+      },
+      {
+        "keyword": "میلان",
+        "priority": 0
+      }
+    ]
   },
   {
     "destination": "@neymar_fa",
     "link": "https://ble.ir/neymar_fa",
-    "keywords": ["نیمار", "نیمار جونیور", "نیمار ژونیور"]
+    "keywords": [
+      {
+        "keyword": "نیمار جونیور",
+        "priority": 0
+      },
+      {
+        "keyword": "نیمار ژونیور",
+        "priority": 0
+      },
+      {
+        "keyword": "نیمار",
+        "priority": 0
+      }
+    ]
   },
   {
     "destination": "@paris_saint_germain_ir",
     "link": "https://ble.ir/paris_saint_germain_ir",
-    "keywords": ["پاری سن ژرمن", "پاریس سن ژرمن", "پاری‌سن‌ژرمن", "پی اس جی"]
+    "keywords": [
+      {
+        "keyword": "پاریس سن ژرمن",
+        "priority": 0
+      },
+      {
+        "keyword": "پاری سن ژرمن",
+        "priority": 0
+      },
+      {
+        "keyword": "پاری‌سن‌ژرمن",
+        "priority": 0
+      },
+      {
+        "keyword": "پی اس جی",
+        "priority": 0
+      }
+    ]
   },
   {
     "destination": "@premier_league_ir",
     "link": "https://ble.ir/premier_league_ir",
-    "keywords": ["پریمیر لیگ", "پرمیر لیگ", "پریمییر لیگ", "لیگ برتر انگلیس", "لیگ انگلیس", "Premier League", "premier league"]
+    "keywords": [
+      {
+        "keyword": "لیگ برتر انگلیس",
+        "priority": 0
+      },
+      {
+        "keyword": "Premier League",
+        "priority": 0
+      },
+      {
+        "keyword": "پریمییر لیگ",
+        "priority": 0
+      },
+      {
+        "keyword": "پریمیر لیگ",
+        "priority": 0
+      },
+      {
+        "keyword": "لیگ انگلیس",
+        "priority": 0
+      },
+      {
+        "keyword": "پرمیر لیگ",
+        "priority": 0
+      }
+    ]
   },
   {
     "destination": "@real_madrid_fa",
     "link": "https://ble.ir/real_madrid_fa",
-    "keywords": ["رئال مادرید", "رئال", "باشگاه رئال", "کهکشانی‌ها"]
+    "keywords": [
+      {
+        "keyword": "رئال مادرید",
+        "priority": 0
+      },
+      {
+        "keyword": "باشگاه رئال",
+        "priority": 0
+      },
+      {
+        "keyword": "کهکشانی‌ها",
+        "priority": 0
+      },
+      {
+        "keyword": "رئال",
+        "priority": 0
+      }
+    ]
   },
   {
     "destination": "@serie_a_ir",
     "link": "https://ble.ir/serie_a_ir",
-    "keywords": ["سری آ", "سری‌آ", "لیگ ایتالیا"]
+    "keywords": [
+      {
+        "keyword": "لیگ ایتالیا",
+        "priority": 0
+      },
+      {
+        "keyword": "سری آ",
+        "priority": 0
+      },
+      {
+        "keyword": "سری‌آ",
+        "priority": 0
+      }
+    ]
   },
   {
     "destination": "@soccer_memes",
     "link": "https://ble.ir/soccer_memes",
-    "keywords": ["میم فوتبال", "میم فوتبالی", "طنز فوتبالی"]
+    "keywords": [
+      {
+        "keyword": "میم فوتبالی",
+        "priority": 0
+      },
+      {
+        "keyword": "طنز فوتبالی",
+        "priority": 0
+      },
+      {
+        "keyword": "میم فوتبال",
+        "priority": 0
+      }
+    ]
   },
   {
     "destination": "@tottenham_ir",
     "link": "https://ble.ir/tottenham_ir",
-    "keywords": ["تاتنهام", "تاتنهام هاتسپر", "اسپرز", "باشگاه تاتنهام"]
+    "keywords": [
+      {
+        "keyword": "تاتنهام هاتسپر",
+        "priority": 0
+      },
+      {
+        "keyword": "باشگاه تاتنهام",
+        "priority": 0
+      },
+      {
+        "keyword": "تاتنهام",
+        "priority": 0
+      },
+      {
+        "keyword": "اسپرز",
+        "priority": 0
+      }
+    ]
   },
   {
     "destination": "@uefa_champ_league",
     "link": "https://ble.ir/uefa_champ_league",
-    "keywords": ["لیگ قهرمانان", "چمپیونز لیگ", "جام باشگاه‌های اروپا", "لیگ قهرمانان اروپا"]
+    "keywords": [
+      {
+        "keyword": "جام باشگاه‌های اروپا",
+        "priority": 0
+      },
+      {
+        "keyword": "لیگ قهرمانان اروپا",
+        "priority": 0
+      },
+      {
+        "keyword": "لیگ قهرمانان",
+        "priority": 0
+      },
+      {
+        "keyword": "چمپیونز لیگ",
+        "priority": 0
+      }
+    ]
   }
 ]

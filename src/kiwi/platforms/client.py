@@ -13,6 +13,7 @@ from kiwi.errors import MessageTooLargeError, PlatformApiError
 
 class BotApiClient:
     _INLINE_LINK_RE = re.compile(r"\[[^\]\n]+\]\(\s*https?://[^)\s]+\s*\)", re.IGNORECASE)
+    _INLINE_HTML_LINK_RE = re.compile(r"<a\s+href=(['\"])https?://.+?\1>.*?</a>", re.IGNORECASE | re.DOTALL)
 
     def __init__(
         self,
@@ -71,17 +72,17 @@ class BotApiClient:
         payload: dict[str, object] = {"chat_id": chat_id, "text": text}
         if reply_markup is not None:
             payload["reply_markup"] = reply_markup
-        use_markdown = self._has_inline_markdown_link(text)
-        if use_markdown:
-            payload["parse_mode"] = "Markdown"
+        parse_mode = self._pick_parse_mode(text)
+        if parse_mode:
+            payload["parse_mode"] = parse_mode
         for attempt in range(1, retries + 1):
             try:
                 response = await self._post("sendMessage", json=payload)
                 break
             except PlatformApiError as exc:
-                if use_markdown and self._is_parse_entities_error(exc):
+                if parse_mode and self._is_parse_entities_error(exc):
                     payload.pop("parse_mode", None)
-                    use_markdown = False
+                    parse_mode = None
                     continue
                 last_error = exc
                 if attempt >= retries or not self._is_transient_upload_error(exc):
@@ -216,8 +217,9 @@ class BotApiClient:
                 caption = item.get("caption")
                 if isinstance(caption, str) and caption.strip():
                     media_obj["caption"] = caption.strip()
-                    if self._has_inline_markdown_link(caption):
-                        media_obj["parse_mode"] = "Markdown"
+                    parse_mode = self._pick_parse_mode(caption)
+                    if parse_mode:
+                        media_obj["parse_mode"] = parse_mode
                 media_items.append(media_obj)
 
             data["media"] = json.dumps(media_items, ensure_ascii=False)
@@ -240,8 +242,9 @@ class BotApiClient:
         data: dict[str, str] = {"chat_id": chat_id}
         if caption:
             data["caption"] = caption
-            if self._has_inline_markdown_link(caption):
-                data["parse_mode"] = "Markdown"
+            parse_mode = self._pick_parse_mode(caption)
+            if parse_mode:
+                data["parse_mode"] = parse_mode
         # Bale occasionally returns transient 5xx upload errors.
         # Re-open the file for each attempt and retry a few times.
         retries = 3
@@ -295,6 +298,20 @@ class BotApiClient:
         if not isinstance(text, str) or not text.strip():
             return False
         return bool(cls._INLINE_LINK_RE.search(text))
+
+    @classmethod
+    def _has_inline_html_link(cls, text: str | None) -> bool:
+        if not isinstance(text, str) or not text.strip():
+            return False
+        return bool(cls._INLINE_HTML_LINK_RE.search(text))
+
+    @classmethod
+    def _pick_parse_mode(cls, text: str | None) -> str | None:
+        if cls._has_inline_html_link(text):
+            return "HTML"
+        if cls._has_inline_markdown_link(text):
+            return "Markdown"
+        return None
 
     @staticmethod
     def _guess_upload_mime(file_path: Path, *, media_type: str) -> str:

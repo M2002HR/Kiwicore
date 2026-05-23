@@ -207,6 +207,47 @@ def test_send_photo_sets_markdown_parse_mode_for_inline_link_caption(tmp_path: P
     assert data.get("parse_mode") == "Markdown"
 
 
+def test_send_message_sets_html_parse_mode_for_inline_html_links() -> None:
+    client = BotApiClient(
+        token="t",
+        api_base_url="https://api.telegram.org",
+        file_base_url="https://api.telegram.org/file",
+    )
+    recorder = RecordingHttpClient(_ok_response({"message_id": 4}))
+    client.client = recorder
+
+    asyncio.run(client.send_message("@dest", 'به چنل <a href="https://t.me/hd_ultra_wallpapers">@hd_ultra_wallpapers</a> بپیوندید.'))
+    assert recorder.calls
+    payload = recorder.calls[0].get("json")
+    assert isinstance(payload, dict)
+    assert payload.get("parse_mode") == "HTML"
+
+
+def test_send_photo_sets_html_parse_mode_for_inline_html_link_caption(tmp_path: Path) -> None:
+    client = BotApiClient(
+        token="t",
+        api_base_url="https://api.telegram.org",
+        file_base_url="https://api.telegram.org/file",
+    )
+    recorder = RecordingHttpClient(_ok_response({"message_id": 5}))
+    client.client = recorder
+
+    photo_path = tmp_path / "x.jpg"
+    photo_path.write_bytes(b"abc")
+
+    asyncio.run(
+        client.send_photo(
+            "@dest",
+            photo_path,
+            caption='به چنل <a href="https://t.me/hd_ultra_wallpapers">@hd_ultra_wallpapers</a> بپیوندید.',
+        )
+    )
+    assert recorder.calls
+    data = recorder.calls[0].get("data")
+    assert isinstance(data, dict)
+    assert data.get("parse_mode") == "HTML"
+
+
 def test_send_document_uses_safe_ascii_filename_for_upload(tmp_path: Path) -> None:
     client = BotApiClient(
         token="t",

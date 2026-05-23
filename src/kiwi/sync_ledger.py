@@ -431,6 +431,58 @@ class SyncLedger:
             return None
         return int(row[0])
 
+    def delete_route_checkpoint(self, route_name: str) -> int:
+        name = str(route_name or "").strip()
+        if not name:
+            return 0
+        with self._lock:
+            conn = self._connect()
+            try:
+                cur = self._execute(
+                    conn,
+                    "DELETE FROM sync_route_checkpoint WHERE route_name = ?",
+                    (name,),
+                )
+                conn.commit()
+                return int(getattr(cur, "rowcount", 0) or 0)
+            finally:
+                conn.close()
+
+    def clear_route_sync_state(self, route_name: str) -> dict[str, int]:
+        name = str(route_name or "").strip()
+        if not name:
+            return {
+                "deleted_checkpoint_rows": 0,
+                "deleted_ledger_rows": 0,
+                "deleted_review_rows": 0,
+            }
+        with self._lock:
+            conn = self._connect()
+            try:
+                c1 = self._execute(
+                    conn,
+                    "DELETE FROM sync_message_ledger WHERE route_name = ?",
+                    (name,),
+                )
+                c2 = self._execute(
+                    conn,
+                    "DELETE FROM sync_route_checkpoint WHERE route_name = ?",
+                    (name,),
+                )
+                c3 = self._execute(
+                    conn,
+                    "DELETE FROM sync_review_queue WHERE route_name = ?",
+                    (name,),
+                )
+                conn.commit()
+                return {
+                    "deleted_checkpoint_rows": int(getattr(c2, "rowcount", 0) or 0),
+                    "deleted_ledger_rows": int(getattr(c1, "rowcount", 0) or 0),
+                    "deleted_review_rows": int(getattr(c3, "rowcount", 0) or 0),
+                }
+            finally:
+                conn.close()
+
     def list_retryable_keys(self, *, limit: int = 500) -> list[str]:
         with self._lock:
             conn = self._connect()

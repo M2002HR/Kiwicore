@@ -38,6 +38,9 @@ class SyncQueueBackend:
     async def depth(self) -> int:
         raise NotImplementedError
 
+    async def purge_route(self, *, route_name: str) -> int:
+        raise NotImplementedError
+
 
 class InMemorySyncQueue(SyncQueueBackend):
     def __init__(self) -> None:
@@ -104,6 +107,18 @@ class InMemorySyncQueue(SyncQueueBackend):
     async def depth(self) -> int:
         async with self._lock:
             return len(self._entries)
+
+    async def purge_route(self, *, route_name: str) -> int:
+        name = str(route_name or "").strip()
+        if not name:
+            return 0
+        removed = 0
+        async with self._lock:
+            keys = [key for key, item in self._entries.items() if str(item.route_name) == name]
+            for key in keys:
+                self._entries.pop(key, None)
+                removed += 1
+        return removed
 
 
 class RedisSyncQueue(SyncQueueBackend):
@@ -209,6 +224,46 @@ class RedisSyncQueue(SyncQueueBackend):
     async def depth(self) -> int:
         redis = await self._ensure_client()
         return int(await redis.zcard(self._due_key()))
+
+    async def purge_route(self, *, route_name: str) -> int:
+        redis = await self._ensure_client()
+        target = str(route_name or "").strip()
+        if not target:
+            return 0
+
+        route_key = self._route_key()
+        due_key = self._due_key()
+        payload_key = self._payload_hash_key()
+
+        cursor = 0
+        matched: list[str] = []
+        while True:
+            cursor, chunk = await redis.hscan(route_key, cursor=cursor, count=500)
+            for dedupe_key, item_route in (chunk or {}).items():
+                if str(item_route or "") == target:
+                    matched.append(str(dedupe_key))
+            if int(cursor) == 0:
+                break
+
+        if not matched:
+            return 0
+
+        # Remove route items from due-zset and related hash maps in manageable chunks.
+        removed = 0
+        batch_size = 400
+        for idx in range(0, len(matched), batch_size):
+            batch = matched[idx : idx + batch_size]
+            pipe = redis.pipeline()
+            pipe.zrem(due_key, *batch)
+            pipe.hdel(route_key, *batch)
+            pipe.hdel(payload_key, *batch)
+            out = await pipe.execute()
+            try:
+                removed += int(out[0] or 0)
+            except Exception:
+                # Fall back to approximate count by batch size if redis response is unexpected.
+                removed += len(batch)
+        return removed
 
 
 async def build_sync_queue_backend(*, backend: str, redis_url: str) -> SyncQueueBackend:

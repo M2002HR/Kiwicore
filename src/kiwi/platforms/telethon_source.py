@@ -136,6 +136,20 @@ class TelethonSourceClient:
         # is replayed every loop and media-group buffers never settle.
         self._last_message_id[key] = max(int(current), seeded)
 
+    def reset_route_cursor(self, route: ChannelRoute) -> dict[str, object]:
+        source_key = self._route_source_key(route)
+        if source_key is None:
+            return {"source_key": None, "cleared_cursor": False}
+        key = str(source_key or "").strip()
+        if not key:
+            return {"source_key": None, "cleared_cursor": False}
+
+        had_cursor = key in self._last_message_id
+        self._last_message_id.pop(key, None)
+        self._resolve_retry_after.pop(key, None)
+        self._resolve_last_warn_at.pop(key, None)
+        return {"source_key": key, "cleared_cursor": bool(had_cursor)}
+
     async def aclose(self) -> None:
         if self._client is None:
             return

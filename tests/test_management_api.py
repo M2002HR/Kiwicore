@@ -267,3 +267,127 @@ def test_sync_ledger_route_checkpoint_is_monotonic(tmp_path: Path) -> None:
     # Higher value should advance normally.
     ledger.set_route_checkpoint("r1", 140)
     assert ledger.get_route_checkpoint("r1") == 140
+
+
+def test_force_route_sync_resets_route_state_and_sets_syncing(tmp_path: Path) -> None:
+    channels_path = tmp_path / "config" / "channels.json"
+    channels_path.parent.mkdir(parents=True, exist_ok=True)
+    channels_path.write_text(
+        json.dumps(
+            [
+                {
+                    "name": "r1",
+                    "status": "synced",
+                    "source_channel_username": "@src1",
+                    "destination_channel_id": "-2001",
+                    "channel_script": "default_channel_script.py",
+                    "gaurd_script": "default_guard.py",
+                    "backfill_count": 40,
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    scripts_dir = tmp_path / "scripts"
+    guards_dir = tmp_path / "guards"
+    scripts_dir.mkdir()
+    guards_dir.mkdir()
+    (scripts_dir / "default_channel_script.py").write_text("# x", encoding="utf-8")
+    (guards_dir / "default_guard.py").write_text("# x", encoding="utf-8")
+
+    ledger = SyncLedger(str(tmp_path / "app_data" / "sync_ledger.sqlite3"))
+    payload = {"source_channel_id": "-1001", "message_id": 1}
+    ledger.set_route_checkpoint("r1", 321)
+    ledger.register_message(route_name="r1", source_channel_id="-1001", message_id=10, media_group_id=None, payload=payload)
+
+    class _Queue:
+        def __init__(self) -> None:
+            self.purged = 0
+
+        async def acquire_route_lock(self, *, route_name: str, owner: str, ttl_sec: int) -> bool:  # noqa: ARG002
+            return True
+
+        async def release_route_lock(self, *, route_name: str, owner: str) -> None:  # noqa: ARG002
+            return None
+
+        async def purge_route(self, *, route_name: str) -> int:  # noqa: ARG002
+            self.purged += 1
+            return 7
+
+    class _Source:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def reset_route_cursor(self, route) -> dict:
+            self.calls.append(str(route.name))
+            return {"source_key": "@src1", "cleared_cursor": True}
+
+    queue = _Queue()
+    source = _Source()
+    api = ManagementApi(
+        channels_config_path=str(channels_path),
+        scripts_dir=str(scripts_dir),
+        gaurd_scripts_dir=str(guards_dir),
+        sync_ledger=ledger,
+        sync_queue=queue,
+        source_client=source,
+        on_routes_reloaded=lambda _registry: None,
+    )
+
+    out = asyncio.run(api.force_route_sync("r1"))
+    assert out["route"]["status"] == "syncing"
+    assert int(out["reset"]["purged_queue_items"]) == 7
+    assert int(out["reset"]["deleted_ledger_rows"]) == 1
+    assert int(out["reset"]["deleted_checkpoint_rows"]) == 1
+    assert out["reset"]["source_cursor_reset"]["source_key"] == "@src1"
+    assert source.calls == ["r1"]
+    assert queue.purged == 1
+    assert ledger.get_route_checkpoint("r1") is None
+    assert ledger.get_route_status_counts("r1") == {}
+
+
+def test_force_route_sync_fails_when_route_lock_is_busy(tmp_path: Path) -> None:
+    channels_path = tmp_path / "config" / "channels.json"
+    channels_path.parent.mkdir(parents=True, exist_ok=True)
+    channels_path.write_text(
+        json.dumps(
+            [
+                {
+                    "name": "r1",
+                    "status": "synced",
+                    "source_channel_username": "@src1",
+                    "destination_channel_id": "-2001",
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    scripts_dir = tmp_path / "scripts"
+    guards_dir = tmp_path / "guards"
+    scripts_dir.mkdir()
+    guards_dir.mkdir()
+
+    class _BusyQueue:
+        async def acquire_route_lock(self, *, route_name: str, owner: str, ttl_sec: int) -> bool:  # noqa: ARG002
+            return False
+
+        async def release_route_lock(self, *, route_name: str, owner: str) -> None:  # noqa: ARG002
+            return None
+
+        async def purge_route(self, *, route_name: str) -> int:  # noqa: ARG002
+            return 0
+
+    api = ManagementApi(
+        channels_config_path=str(channels_path),
+        scripts_dir=str(scripts_dir),
+        gaurd_scripts_dir=str(guards_dir),
+        sync_ledger=SyncLedger(str(tmp_path / "app_data" / "sync_ledger.sqlite3")),
+        sync_queue=_BusyQueue(),
+        on_routes_reloaded=lambda _registry: None,
+    )
+
+    try:
+        asyncio.run(api.force_route_sync("r1", lock_timeout_sec=0.2))
+        assert False, "expected RuntimeError"
+    except RuntimeError as exc:
+        assert "route_sync_busy" in str(exc)

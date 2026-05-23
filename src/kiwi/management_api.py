@@ -6,9 +6,11 @@ import tempfile
 import threading
 import time
 import asyncio
+import inspect
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable
+from uuid import uuid4
 
 from kiwi.config import RouteRegistry, load_routes
 from kiwi.sync_ledger import SyncLedger
@@ -135,6 +137,70 @@ class ManagementApi:
 
     def stop_route_sync(self, name: str) -> dict:
         return self.set_route_status(name, "deactive")
+
+    async def force_route_sync(self, name: str, *, lock_timeout_sec: float = 10.0) -> dict[str, Any]:
+        route_name = str(name or "").strip()
+        if not route_name:
+            raise ValueError("route name is required")
+
+        route_raw = self.get_route(route_name)
+        route_obj = _route_dict_to_channel_route(route_raw)
+        lock_owner = f"force-sync:{route_name}:{uuid4()}"
+
+        lock_acquired = False
+        queue_purged = 0
+        if self.sync_queue is not None:
+            deadline = time.monotonic() + max(1.0, float(lock_timeout_sec))
+            while time.monotonic() < deadline:
+                lock_acquired = bool(
+                    await self.sync_queue.acquire_route_lock(
+                        route_name=route_name,
+                        owner=lock_owner,
+                        ttl_sec=30,
+                    )
+                )
+                if lock_acquired:
+                    break
+                await asyncio.sleep(0.2)
+            if not lock_acquired:
+                raise RuntimeError("route_sync_busy")
+
+        try:
+            if self.sync_queue is not None:
+                queue_purged = int(await self.sync_queue.purge_route(route_name=route_name) or 0)
+
+            if self.sync_ledger is not None:
+                ledger_reset = self.sync_ledger.clear_route_sync_state(route_name)
+            else:
+                ledger_reset = {
+                    "deleted_checkpoint_rows": 0,
+                    "deleted_ledger_rows": 0,
+                    "deleted_review_rows": 0,
+                }
+
+            source_cursor_reset: dict[str, Any] | None = None
+            reset_func = getattr(self.source_client, "reset_route_cursor", None)
+            if callable(reset_func):
+                out = reset_func(route_obj)
+                if inspect.isawaitable(out):
+                    out = await out
+                if isinstance(out, dict):
+                    source_cursor_reset = dict(out)
+                else:
+                    source_cursor_reset = {"result": bool(out)}
+
+            route = self.update_route(route_name, {"status": "syncing"})
+            return {
+                "route": route,
+                "reset": {
+                    **ledger_reset,
+                    "purged_queue_items": int(queue_purged),
+                    "source_cursor_reset": source_cursor_reset,
+                },
+            }
+        finally:
+            if lock_acquired and self.sync_queue is not None:
+                await self.sync_queue.release_route_lock(route_name=route_name, owner=lock_owner)
 
     def start_all_routes(self) -> dict:
         routes = self._load_routes_raw()

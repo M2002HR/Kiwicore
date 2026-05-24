@@ -298,7 +298,7 @@ class TelethonSourceClient:
                 parsed.append(incoming)
 
         self._last_message_id[source_key] = max_seen
-        return parsed
+        return self._collapse_media_groups_for_seed(parsed)
 
     async def latest_message_id_for_route(self, route: ChannelRoute) -> int:
         await self._ensure_connected()
@@ -798,6 +798,31 @@ class TelethonSourceClient:
             },
             media_group_id=first.media_group_id,
         )
+
+    @classmethod
+    def _collapse_media_groups_for_seed(cls, messages: list[IncomingChannelMessage]) -> list[IncomingChannelMessage]:
+        if not messages:
+            return []
+
+        groups: dict[tuple[str, str], list[IncomingChannelMessage]] = {}
+        singles: list[IncomingChannelMessage] = []
+        for msg in messages:
+            group_id = str(msg.media_group_id or "").strip()
+            if not group_id:
+                singles.append(msg)
+                continue
+            key = (str(msg.source_channel_id or "").strip(), group_id)
+            groups.setdefault(key, []).append(msg)
+
+        collapsed: list[IncomingChannelMessage] = list(singles)
+        for _, members in groups.items():
+            if len(members) <= 1:
+                collapsed.extend(members)
+                continue
+            collapsed.append(cls._merge_media_group_members(members))
+
+        collapsed.sort(key=lambda m: (int(m.message_id), int(m.update_id)))
+        return collapsed
 
     @staticmethod
     def _infer_source_key_from_incoming(incoming: IncomingChannelMessage, *, source_username: str | None = None) -> str | None:

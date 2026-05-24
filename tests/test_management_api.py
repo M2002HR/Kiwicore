@@ -3,9 +3,11 @@ from __future__ import annotations
 import json
 import asyncio
 from pathlib import Path
+from unittest.mock import patch
 
 from kiwi.management_api import ManagementApi
 from kiwi.sync_ledger import SyncLedger
+from kiwi.sync_queue import InMemorySyncQueue
 
 
 def test_management_api_crud_and_reload(tmp_path: Path) -> None:
@@ -253,6 +255,127 @@ def test_start_route_sync_does_not_probe_source_client(tmp_path: Path) -> None:
     ledger.set_route_checkpoint("r1", 123)
     started_again = api.start_route_sync("r1")
     assert started_again["status"] == "synced"
+
+
+def test_start_route_sync_reactivates_route_deactive_records_and_requeues(tmp_path: Path) -> None:
+    channels_path = tmp_path / "config" / "channels.json"
+    channels_path.parent.mkdir(parents=True, exist_ok=True)
+    channels_path.write_text(
+        json.dumps(
+            [
+                {
+                    "name": "r1",
+                    "status": "deactive",
+                    "source_channel_username": "@src1",
+                    "destination_channel_id": "-2001",
+                    "channel_script": "default_channel_script.py",
+                    "gaurd_script": "default_guard.py",
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    scripts_dir = tmp_path / "scripts"
+    guards_dir = tmp_path / "guards"
+    scripts_dir.mkdir()
+    guards_dir.mkdir()
+    (scripts_dir / "default_channel_script.py").write_text("# x", encoding="utf-8")
+    (guards_dir / "default_guard.py").write_text("# x", encoding="utf-8")
+
+    ledger = SyncLedger(str(tmp_path / "app_data" / "sync_ledger.sqlite3"))
+    payload = {"message": {"text": "resume me"}}
+    _, key, _ = ledger.register_message(
+        route_name="r1",
+        source_channel_id="-1001",
+        message_id=123,
+        media_group_id=None,
+        payload=payload,
+    )
+    ledger.mark_status(key, status="blocked", last_error="route_deactive")
+    queue = InMemorySyncQueue()
+    api = ManagementApi(
+        channels_config_path=str(channels_path),
+        scripts_dir=str(scripts_dir),
+        gaurd_scripts_dir=str(guards_dir),
+        sync_ledger=ledger,
+        sync_queue=queue,
+        source_client=None,
+        on_routes_reloaded=lambda _registry: None,
+    )
+
+    started = api.start_route_sync("r1")
+    assert started["status"] == "syncing"
+    record = ledger.get_record(key)
+    assert record is not None
+    assert record.status == "failed"
+
+    popped = asyncio.run(queue.pop_due(limit=10, now_ts=10**12))
+    assert [item.dedupe_key for item in popped] == [key]
+
+
+def test_start_route_sync_requeue_is_immediate(tmp_path: Path) -> None:
+    channels_path = tmp_path / "config" / "channels.json"
+    channels_path.parent.mkdir(parents=True, exist_ok=True)
+    channels_path.write_text(
+        json.dumps(
+            [
+                {
+                    "name": "r1",
+                    "status": "deactive",
+                    "source_channel_username": "@src1",
+                    "destination_channel_id": "-2001",
+                    "channel_script": "default_channel_script.py",
+                    "gaurd_script": "default_guard.py",
+                    "interval_sec": 30,
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    scripts_dir = tmp_path / "scripts"
+    guards_dir = tmp_path / "guards"
+    scripts_dir.mkdir()
+    guards_dir.mkdir()
+    (scripts_dir / "default_channel_script.py").write_text("# x", encoding="utf-8")
+    (guards_dir / "default_guard.py").write_text("# x", encoding="utf-8")
+
+    ledger = SyncLedger(str(tmp_path / "app_data" / "sync_ledger.sqlite3"))
+    payload = {"message": {"text": "resume paced"}}
+    _, key1, _ = ledger.register_message(
+        route_name="r1",
+        source_channel_id="-1001",
+        message_id=123,
+        media_group_id=None,
+        payload=payload,
+    )
+    _, key2, _ = ledger.register_message(
+        route_name="r1",
+        source_channel_id="-1001",
+        message_id=124,
+        media_group_id=None,
+        payload=payload,
+    )
+    ledger.mark_status(key1, status="blocked", last_error="route_deactive")
+    ledger.mark_status(key2, status="blocked", last_error="route_deactive")
+
+    queue = InMemorySyncQueue()
+    api = ManagementApi(
+        channels_config_path=str(channels_path),
+        scripts_dir=str(scripts_dir),
+        gaurd_scripts_dir=str(guards_dir),
+        sync_ledger=ledger,
+        sync_queue=queue,
+        source_client=None,
+        on_routes_reloaded=lambda _registry: None,
+    )
+
+    with patch("kiwi.management_api.time.time", return_value=1_000.0):
+        started = api.start_route_sync("r1")
+    assert started["status"] == "syncing"
+
+    due = asyncio.run(queue.pop_due(limit=10, now_ts=1_001.0))
+    assert len(due) == 2
+    assert {item.dedupe_key for item in due} == {key1, key2}
 
 
 def test_sync_ledger_route_checkpoint_is_monotonic(tmp_path: Path) -> None:

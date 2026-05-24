@@ -933,6 +933,7 @@ function renderDashboardPage() {
       ${card('Total Routes', routes.total ?? 0, 'route definitions')}
       ${card('Synced Routes', routes.synced ?? 0, 'status=synced')}
       ${card('Syncing Routes', routes.syncing ?? 0, 'status=syncing')}
+      ${card('Waiting Routes', routes.sync_waiting ?? 0, 'status=sync_waiting')}
       ${card('Queue Depth', sync.queue_depth ?? 0, 'sync queue')}
     </div>
     <div class="grid cols-4" style="margin-top:10px">
@@ -953,12 +954,17 @@ function renderDashboardPage() {
 function routeStatusPill(routeStatus) {
   const status = String(routeStatus || '').toLowerCase();
   if (status === 'synced') return '<span class="badge ok">synced</span>';
+  if (status === 'sync_waiting') return '<span class="badge warn">sync_waiting</span>';
   if (status === 'syncing') return '<span class="badge warn">syncing</span>';
   if (status === 'deactive') return '<span class="badge err">deactive</span>';
   return '<span class="badge">-</span>';
 }
 
-function effectiveRouteStatus(routeStatus, metrics) {
+function effectiveRouteStatus(routeStatus, metrics, runtimeStatus) {
+  const runtime = String(runtimeStatus || '').toLowerCase();
+  if (runtime === 'deactive' || runtime === 'syncing' || runtime === 'sync_waiting' || runtime === 'synced') {
+    return runtime;
+  }
   const normalized = String(routeStatus || 'deactive').toLowerCase();
   if (normalized === 'deactive' || normalized === 'syncing' || normalized === 'synced') {
     return normalized;
@@ -996,7 +1002,7 @@ function routeSortValue(route, metrics, key) {
   if (key === 'destination') return String(route?.destination_channel_username || route?.destination_channel_id || '');
   if (key === 'channel_script') return String(route?.channel_script || '');
   if (key === 'guard') return String(route?.gaurd_script || '');
-  if (key === 'status') return effectiveRouteStatus(route?.status, metrics);
+  if (key === 'status') return effectiveRouteStatus(route?.status, metrics, route?.runtime_status);
   if (key === 'remaining') return Number(metrics?.remaining_unsynced ?? 0);
   if (key === 'progress') return Number(metrics?.progress_pct ?? 0);
   if (key === 'actions') return String(route?.name || '');
@@ -1028,6 +1034,7 @@ function renderRoutesPage(opts = {}) {
       r?.channel_script,
       r?.gaurd_script,
       r?.status,
+      r?.runtime_status,
     ].map((x) => String(x || '').toLowerCase()).join(' | ');
     return hay.includes(needle);
   });
@@ -1059,13 +1066,17 @@ function renderRoutesPage(opts = {}) {
     const cs = esc(r.channel_script || '-');
     const gs = esc(r.gaurd_script || '-');
     const m = state.routeMetrics && r.name ? state.routeMetrics[String(r.name)] : null;
-    const routeStatus = effectiveRouteStatus(r.status, m);
+    const routeStatus = effectiveRouteStatus(r.status, m, r.runtime_status);
     const isDeactive = routeStatus === 'deactive';
+    const waitRemainingSec = Number(r?.wait_remaining_sec ?? 0);
     const remaining = Number(m?.remaining_unsynced ?? 0);
     const progressPct = Number(m?.progress_pct ?? 0);
     const remainingLabel = isDeactive ? '-' : String(remaining);
     const progressLabel = isDeactive ? '-' : (Number.isFinite(progressPct) ? `${progressPct.toFixed(1)}%` : '-');
     const progressBadge = isDeactive ? '' : (progressPct >= 95 ? 'ok' : (progressPct >= 60 ? 'warn' : 'err'));
+    const statusDetail = routeStatus === 'sync_waiting' && waitRemainingSec > 0
+      ? `<div class="muted">next in ${esc(formatDuration(waitRemainingSec))}</div>`
+      : '';
     return `
       <tr>
         <td class="route-col-name" title="${name}">${name}</td>
@@ -1073,7 +1084,7 @@ function renderRoutesPage(opts = {}) {
         <td class="route-col-destination" title="${dest}">${dest}</td>
         <td>${cs}</td>
         <td>${gs}</td>
-        <td>${routeStatusPill(routeStatus)}</td>
+        <td>${routeStatusPill(routeStatus)}${statusDetail}</td>
         <td>${remainingLabel}</td>
         <td><span class="badge ${progressBadge}">${progressLabel}</span></td>
         <td class="actions-cell">

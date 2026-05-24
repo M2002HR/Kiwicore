@@ -317,3 +317,30 @@ def test_expand_media_group_merges_all_group_members_into_single_incoming() -> N
     assert expanded.media_group_id == str(grouped_id)
     assert len(expanded.medias) == 4
     assert expanded.caption == "album caption"
+
+
+def test_seed_recent_messages_collapses_album_members_before_enqueue() -> None:
+    source = TelethonSourceClient(api_id=1, api_hash="x", session_path="./tmp.session")
+    fake = _FakeTelethonClient()
+    grouped_id = 14078066505163477
+    fake.history_by_entity["@stored_src"] = [
+        _PhotoMsg(7650, grouped_id=grouped_id, text="album caption"),
+        _PhotoMsg(7651, grouped_id=grouped_id),
+        _PhotoMsg(7652, grouped_id=grouped_id),
+        _PhotoMsg(7653, grouped_id=grouped_id),
+        _PhotoMsg(7654, grouped_id=grouped_id),
+        _PhotoMsg(7655, grouped_id=grouped_id),
+        _PhotoMsg(7656, grouped_id=grouped_id),
+        _PhotoMsg(7657, grouped_id=grouped_id),
+    ]
+    source._client = fake  # noqa: SLF001
+    source._ensure_connected = lambda: asyncio.sleep(0)  # type: ignore[method-assign]  # noqa: SLF001
+
+    route = _route()
+    out = asyncio.run(source.seed_recent_messages(route, limit=8))
+    assert len(out) == 1
+    merged = out[0]
+    assert merged.media_group_id == str(grouped_id)
+    assert merged.message_id == 7657
+    assert merged.update_id == 7657
+    assert len(merged.medias) == 8

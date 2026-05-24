@@ -74,8 +74,39 @@ def _destination_target(payload: dict) -> str | None:
 
 
 def _build_destination_caption(payload: dict) -> str:
-    del payload
-    return "به چنل سرزمین والپیپر بپیوندید."
+    base = "به چنل سرزمین والپیپر بپیوندید..."
+    hashtags = _extract_hashtags(payload)
+    if not hashtags:
+        return base
+    return f"{' '.join(hashtags)}\n{base}"
+
+
+def _extract_hashtags(payload: dict) -> list[str]:
+    message = payload.get("message")
+    if not isinstance(message, dict):
+        return []
+
+    texts = [
+        str(message.get("caption") or ""),
+        str(message.get("text") or ""),
+    ]
+    if not any(part.strip() for part in texts):
+        return []
+
+    out: list[str] = []
+    seen: set[str] = set()
+    for part in texts:
+        for match in re.findall(r"(?<!\S)#[^\s#]+", part):
+            token = match.strip()
+            token = token.rstrip(".,!?:;،؛؟)]}»\"'")
+            if len(token) <= 1 or not token.startswith("#"):
+                continue
+            key = token.casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(token)
+    return out
 
 
 def build_messages(payload: dict, *, input_dir: Path) -> list[dict]:

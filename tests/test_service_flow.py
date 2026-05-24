@@ -228,10 +228,77 @@ def _route_registry(route: ChannelRoute | list[ChannelRoute]) -> RouteRegistry:
     return RouteRegistry(routes=routes, by_channel_id=by_id, by_channel_username=by_username)
 
 
-def test_service_sync_initial_due_is_jittered_and_spaced(tmp_path: Path) -> None:
+def test_service_sync_enqueue_is_immediate_even_when_syncing(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
     route = ChannelRoute(
-        name="sync-jitter-route",
+        name="sync-paced-route",
+        enabled=False,
+        source_channel_id="-1001",
+        source_channel_username="@srcchan",
+        destination_channel_id="-2001",
+        destination_channel_username=None,
+        channel_script=None,
+        max_message_mb=10,
+        sync_enabled=True,
+        sync_status="syncing",
+        sync_interval_sec=30,
+    )
+    service = KiwiService(
+        settings=settings,
+        routes=_route_registry(route),
+        telegram_client=FakeTelegramClient([], b""),
+        bale_client=FakeBaleClient(),
+        storage=StorageManager(settings.storage_dir),
+        guard_runner=GuardRunner(settings.gaurd_scripts_dir, timeout_sec=5),
+        script_runner=ScriptRunner(settings.scripts_dir, timeout_sec=5),
+        state_store=StateStore(settings.state_path),
+    )
+    msg1 = IncomingChannelMessage(
+        update_id=1,
+        source_channel_id="-1001",
+        source_channel_username="@srcchan",
+        message_id=101,
+        date=None,
+        text="m1",
+        caption=None,
+        medias=[],
+        raw={},
+        media_group_id=None,
+    )
+    msg2 = IncomingChannelMessage(
+        update_id=2,
+        source_channel_id="-1001",
+        source_channel_username="@srcchan",
+        message_id=102,
+        date=None,
+        text="m2",
+        caption=None,
+        medias=[],
+        raw={},
+        media_group_id=None,
+    )
+    with patch("kiwi.service.time.time", return_value=1_000.0):
+        asyncio.run(service._enqueue_sync_message(route, msg1))  # noqa: SLF001
+        asyncio.run(service._enqueue_sync_message(route, msg2))  # noqa: SLF001
+
+    due = asyncio.run(service.sync_queue.pop_due(limit=10, now_ts=1_000.0))  # noqa: SLF001
+    assert len(due) == 2
+
+
+def test_service_sync_jitter_varies_across_routes() -> None:
+    interval_sec = 60
+    values = {
+        KiwiService._initial_sync_jitter_sec(f"route-{idx}", interval_sec)  # noqa: SLF001
+        for idx in range(1, 16)
+    }
+    assert all(0 <= value < interval_sec for value in values)
+    assert len(values) > 1
+
+
+def test_service_sync_interval_applies_only_after_successful_dispatch(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    route = ChannelRoute(
+        name="sync-success-gated-route",
         enabled=False,
         source_channel_id="-1001",
         source_channel_username="@srcchan",
@@ -254,24 +321,69 @@ def test_service_sync_initial_due_is_jittered_and_spaced(tmp_path: Path) -> None
         state_store=StateStore(settings.state_path),
     )
 
-    base_now = 1_000.0
-    expected_jitter = service._initial_sync_jitter_sec(route.name, route.sync_interval_sec)  # noqa: SLF001
-    with patch("kiwi.service.time.time", return_value=base_now):
-        first_due = service._reserve_sync_due_at(route.name, route.sync_interval_sec)  # noqa: SLF001
-        second_due = service._reserve_sync_due_at(route.name, route.sync_interval_sec)  # noqa: SLF001
+    async def _ok_once(incoming, route_obj, retries, **kwargs):  # noqa: ARG001
+        return ("ok", None)
 
-    assert first_due == base_now
-    assert second_due == first_due + route.sync_interval_sec + expected_jitter
+    service._process_route_message_with_retries = _ok_once  # type: ignore[method-assign]  # noqa: SLF001
 
+    in_1 = IncomingChannelMessage(
+        update_id=1,
+        source_channel_id="-1001",
+        source_channel_username="@srcchan",
+        message_id=101,
+        date=None,
+        text="m1",
+        caption=None,
+        medias=[],
+        raw={},
+        media_group_id=None,
+    )
+    in_2 = IncomingChannelMessage(
+        update_id=2,
+        source_channel_id="-1001",
+        source_channel_username="@srcchan",
+        message_id=102,
+        date=None,
+        text="m2",
+        caption=None,
+        medias=[],
+        raw={},
+        media_group_id=None,
+    )
 
-def test_service_sync_jitter_varies_across_routes() -> None:
-    interval_sec = 60
-    values = {
-        KiwiService._initial_sync_jitter_sec(f"route-{idx}", interval_sec)  # noqa: SLF001
-        for idx in range(1, 16)
-    }
-    assert all(0 <= value < interval_sec for value in values)
-    assert len(values) > 1
+    asyncio.run(service._enqueue_sync_message(route, in_1))  # noqa: SLF001
+    asyncio.run(service._enqueue_sync_message(route, in_2))  # noqa: SLF001
+
+    item_1 = QueueItem(
+        dedupe_key=service.sync_ledger.dedupe_key(route.name, in_1.source_channel_id, in_1.message_id, None),  # noqa: SLF001
+        route_name=route.name,
+        due_at=0.0,
+        payload_hash="",
+    )
+    item_2 = QueueItem(
+        dedupe_key=service.sync_ledger.dedupe_key(route.name, in_2.source_channel_id, in_2.message_id, None),  # noqa: SLF001
+        route_name=route.name,
+        due_at=0.0,
+        payload_hash="",
+    )
+
+    with patch("kiwi.service.time.time", return_value=1_000.0):
+        out_1 = asyncio.run(service._process_queued_item(item_1))  # noqa: SLF001
+    assert out_1 == 1
+    assert float(service._sync_next_due_at.get(route.name) or 0.0) == 1_030.0  # noqa: SLF001
+
+    with patch("kiwi.service.time.time", return_value=1_010.0):
+        out_2_wait = asyncio.run(service._process_queued_item(item_2))  # noqa: SLF001
+    assert out_2_wait == 0
+    no_due = asyncio.run(service.sync_queue.pop_due(limit=10, now_ts=1_029.0))  # noqa: SLF001
+    assert len(no_due) == 0
+    ready = asyncio.run(service.sync_queue.pop_due(limit=10, now_ts=1_030.0))  # noqa: SLF001
+    assert len(ready) == 1
+    assert ready[0].dedupe_key == item_2.dedupe_key
+
+    with patch("kiwi.service.time.time", return_value=1_030.0):
+        out_2 = asyncio.run(service._process_queued_item(ready[0]))  # noqa: SLF001
+    assert out_2 == 1
 
 
 def test_service_traffic_snapshot_accumulates_by_route(tmp_path: Path) -> None:
@@ -564,6 +676,7 @@ def test_service_sync_enforces_order_before_checkpoint_advance(tmp_path: Path) -
         max_message_mb=10,
         sync_enabled=True,
         sync_status="syncing",
+        sync_interval_sec=1,
         sync_seeded=True,
     )
     service = KiwiService(
@@ -627,11 +740,13 @@ def test_service_sync_enforces_order_before_checkpoint_advance(tmp_path: Path) -
     assert out_11_first == 0
     assert int(service.sync_ledger.get_route_checkpoint(route.name) or 0) == 0  # noqa: SLF001
 
-    out_10 = asyncio.run(service._process_queued_item(item_10))  # noqa: SLF001
+    with patch("kiwi.service.time.time", return_value=1_000.0):
+        out_10 = asyncio.run(service._process_queued_item(item_10))  # noqa: SLF001
     assert out_10 == 1
     assert int(service.sync_ledger.get_route_checkpoint(route.name) or 0) == 10  # noqa: SLF001
 
-    out_11 = asyncio.run(service._process_queued_item(item_11))  # noqa: SLF001
+    with patch("kiwi.service.time.time", return_value=1_001.1):
+        out_11 = asyncio.run(service._process_queued_item(item_11))  # noqa: SLF001
     assert out_11 == 1
     assert int(service.sync_ledger.get_route_checkpoint(route.name) or 0) == 11  # noqa: SLF001
 
@@ -2081,6 +2196,138 @@ print(json.dumps({'messages': [{'type': 'text', 'text': f'COUNT:{count}|CAP:{cap
     assert service.sync_ledger.get_route_checkpoint("telethon-group") == 202
 
 
+def test_service_expanded_telethon_album_advances_checkpoint_to_album_end(tmp_path: Path) -> None:
+    scripts_dir = tmp_path / "scripts"
+    scripts_dir.mkdir()
+    script_path = scripts_dir / "count_inputs.py"
+    script_path.write_text(
+        """
+import json
+import argparse
+from pathlib import Path
+
+p = argparse.ArgumentParser()
+p.add_argument('--payload', required=True)
+p.add_argument('--input-dir', required=True)
+p.add_argument('--output-dir', required=True)
+a = p.parse_args()
+payload = json.loads(Path(a.payload).read_text(encoding='utf-8'))
+count = len(payload.get('inputs', []))
+caption = str((payload.get('message') or {}).get('caption') or '')
+print(json.dumps({'messages': [{'type': 'text', 'text': f'COUNT:{count}|CAP:{caption}'}]}))
+""".strip(),
+        encoding="utf-8",
+    )
+
+    settings = _settings(tmp_path)
+    settings.telegram_source_mode = "hybrid"
+    settings.telethon_enabled = True
+
+    route = ChannelRoute(
+        name="telethon-expand-checkpoint",
+        enabled=True,
+        source_channel_id="-1009",
+        source_channel_username="@src",
+        destination_channel_id="-2001",
+        destination_channel_username=None,
+        channel_script="count_inputs.py",
+        max_message_mb=10,
+    )
+
+    m1 = IncomingChannelMessage(
+        update_id=7220,
+        source_channel_id="-1009",
+        source_channel_username="@src",
+        message_id=7220,
+        date=None,
+        text=None,
+        caption="album cap",
+        medias=[
+            IncomingMedia(
+                kind=MediaKind.PHOTO,
+                file_id="mt:@src:7220",
+                source="telethon",
+                source_ref={"source_key": "@src", "message_id": 7220},
+            )
+        ],
+        raw={"telethon": True},
+        media_group_id="g1",
+    )
+    m2 = IncomingChannelMessage(
+        update_id=7221,
+        source_channel_id="-1009",
+        source_channel_username="@src",
+        message_id=7221,
+        date=None,
+        text=None,
+        caption=None,
+        medias=[
+            IncomingMedia(
+                kind=MediaKind.PHOTO,
+                file_id="mt:@src:7221",
+                source="telethon",
+                source_ref={"source_key": "@src", "message_id": 7221},
+            )
+        ],
+        raw={"telethon": True},
+        media_group_id="g1",
+    )
+
+    class _ExpandSource(FakeTelethonSourceClient):
+        async def expand_media_group(self, incoming: IncomingChannelMessage, *, source_username: str | None = None):
+            del source_username
+            if incoming.media_group_id != "g1":
+                return incoming
+            merged = IncomingChannelMessage(
+                update_id=7228,
+                source_channel_id=incoming.source_channel_id,
+                source_channel_username=incoming.source_channel_username,
+                message_id=7228,
+                date=incoming.date,
+                text=incoming.text,
+                caption=incoming.caption or "album cap",
+                medias=[
+                    IncomingMedia(
+                        kind=MediaKind.PHOTO,
+                        file_id=f"mt:@src:{mid}",
+                        source="telethon",
+                        source_ref={"source_key": "@src", "message_id": mid},
+                    )
+                    for mid in range(7219, 7229)
+                ],
+                raw={"group_message_end_id": 7228},
+                media_group_id="g1",
+            )
+            return merged
+
+    tg = FakeTelegramClient([], b"")
+    bale = FakeBaleClient()
+    source = _ExpandSource(messages=[], seeded_messages=[])
+    service = KiwiService(
+        settings=settings,
+        routes=_route_registry(route),
+        telegram_client=tg,
+        bale_client=bale,
+        source_client=source,
+        storage=StorageManager(settings.storage_dir),
+        guard_runner=GuardRunner(settings.gaurd_scripts_dir, timeout_sec=5),
+        script_runner=ScriptRunner(settings.scripts_dir, timeout_sec=5),
+        state_store=StateStore(settings.state_path),
+    )
+
+    async def _drive() -> int:
+        await service._enqueue_sync_message(route, m1)  # noqa: SLF001
+        await service._enqueue_sync_message(route, m2)  # noqa: SLF001
+        p1 = await service._tick_sync_drain()  # noqa: SLF001
+        p2 = await service._tick_sync_drain()  # noqa: SLF001
+        return int(p1 + p2)
+
+    processed = asyncio.run(_drive())
+    assert processed >= 1
+    assert bale.sent == [("-2001", "COUNT:10|CAP:album cap\n-2001")]
+    assert int(service.sync_ledger.get_route_checkpoint(route.name) or 0) == 7228  # noqa: SLF001
+
+
 def test_service_media_group_does_not_flush_early_when_split_2_plus_1(tmp_path: Path) -> None:
     scripts_dir = tmp_path / "scripts"
     scripts_dir.mkdir()
@@ -2459,7 +2706,7 @@ print(json.dumps({'messages': [{'type': 'text', 'text': 'SYNC:' + text}]}))
                         "enabled": True,
                         "status": "syncing",
                         "backfill_count": 100,
-                        "interval_sec": 300,
+                        "interval_sec": 1,
                         "batch_size": 1,
                         "retry_attempts": 2,
                         "seeded": False,
@@ -2523,7 +2770,7 @@ print(json.dumps({'messages': [{'type': 'text', 'text': 'SYNC:' + text}]}))
         tg._batches.append([update3])  # noqa: SLF001
         tg._batches.append([])  # noqa: SLF001
         await service.run_once()
-        await asyncio.sleep(0.03)
+        await asyncio.sleep(1.05)
         await service.run_once()
 
     asyncio.run(_drive())
@@ -3475,3 +3722,70 @@ def test_service_media_cache_prunes_files_older_than_ttl(tmp_path: Path, monkeyp
     service._media_cache_last_prune_at = 0.0  # noqa: SLF001
     service._prune_media_cache()  # noqa: SLF001
     assert not stale_file.exists()
+
+
+def test_service_run_once_uses_short_poll_when_sync_queue_has_backlog(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    settings.telegram_poll_timeout_sec = 30
+
+    class _TimeoutProbeTelegramClient(FakeTelegramClient):
+        def __init__(self) -> None:
+            super().__init__([], b"")
+            self.last_timeout = None
+
+        async def get_updates(self, offset, timeout, allowed_updates):  # noqa: ARG002
+            self.last_timeout = int(timeout)
+            return []
+
+    telegram_client = _TimeoutProbeTelegramClient()
+    service = KiwiService(
+        settings=settings,
+        routes=_route_registry([]),
+        telegram_client=telegram_client,
+        bale_client=FakeBaleClient(),
+        storage=StorageManager(settings.storage_dir),
+        guard_runner=GuardRunner(settings.gaurd_scripts_dir, timeout_sec=5),
+        script_runner=ScriptRunner(settings.scripts_dir, timeout_sec=5),
+        state_store=StateStore(settings.state_path),
+    )
+
+    asyncio.run(
+        service.sync_queue.enqueue(
+            dedupe_key="r1|-1001|1|-",
+            route_name="r1",
+            due_at=time.time() + 120.0,
+            payload_hash="h1",
+        )
+    )
+
+    asyncio.run(service.run_once())
+    assert telegram_client.last_timeout == 1
+
+
+def test_service_run_once_keeps_configured_poll_timeout_when_no_backlog(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    settings.telegram_poll_timeout_sec = 30
+
+    class _TimeoutProbeTelegramClient(FakeTelegramClient):
+        def __init__(self) -> None:
+            super().__init__([], b"")
+            self.last_timeout = None
+
+        async def get_updates(self, offset, timeout, allowed_updates):  # noqa: ARG002
+            self.last_timeout = int(timeout)
+            return []
+
+    telegram_client = _TimeoutProbeTelegramClient()
+    service = KiwiService(
+        settings=settings,
+        routes=_route_registry([]),
+        telegram_client=telegram_client,
+        bale_client=FakeBaleClient(),
+        storage=StorageManager(settings.storage_dir),
+        guard_runner=GuardRunner(settings.gaurd_scripts_dir, timeout_sec=5),
+        script_runner=ScriptRunner(settings.scripts_dir, timeout_sec=5),
+        state_store=StateStore(settings.state_path),
+    )
+
+    asyncio.run(service.run_once())
+    assert telegram_client.last_timeout == 30

@@ -97,45 +97,9 @@ class BaleDispatcher:
             try:
                 await self._send_media_group_with_retry(destination_target, media_group)
             except PlatformApiError as exc:
-                # Transient media-group failures are ambiguous: the upstream may have accepted
-                # the album even if the client saw a timeout. Falling back to single sends here
-                # can create duplicates (for example, one extra captionless photo).
-                if self._is_transient_error(exc):
-                    raise
-                sent_any = False
-                sent_first_item = False
-                last_error: PlatformApiError | None = None
-                for index, (item, _, _, _) in enumerate(resolved_group):
-                    dispatch_item = item
-                    if index == 0 and isinstance(group_caption, str) and group_caption.strip():
-                        dispatch_item = ScriptOutputMessage(
-                            type=item.type,
-                            text=item.text,
-                            path=item.path,
-                            caption=group_caption,
-                        )
-                    try:
-                        sent_any = await self._send_one(
-                            destination_target,
-                            dispatch_item,
-                            output_dir=output_dir,
-                            input_dir=input_dir,
-                            extra_input_dirs=extra_input_dirs,
-                        ) or sent_any
-                        if index == 0:
-                            sent_first_item = True
-                    except PlatformApiError as exc:
-                        last_error = exc
-                        continue
-                # If fallback sent part of album but missed first item (caption carrier),
-                # deliver caption separately to avoid text loss.
-                if sent_any and not sent_first_item and isinstance(group_caption, str) and group_caption.strip():
-                    try:
-                        await self.bale_client.send_message(destination_target, group_caption.strip())
-                    except PlatformApiError as exc:
-                        last_error = exc
-                if not sent_any and last_error is not None:
-                    raise last_error
+                # Keep media-group delivery atomic. Falling back to single sends can split
+                # albums in destination and produce unstable ordering/duplicates.
+                raise exc
             idx = j
 
     async def _send_one(

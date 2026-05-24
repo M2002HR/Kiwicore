@@ -131,9 +131,28 @@ class ManagementApi:
         return self.update_route(name, patch)
 
     def start_route_sync(self, name: str) -> dict:
+        if self.sync_ledger is not None:
+            # Recover records that were paused while route was deactive, so start truly resumes.
+            self.sync_ledger.reactivate_route_deactive_blocks(name)
         route = self.get_route(name)
         status = self._determine_start_status(name, route)
-        return self.set_route_status(name, status)
+        updated = self.set_route_status(name, status)
+        enqueued = self._enqueue_route_retryables(name)
+        if enqueued > 0 and str(updated.get("status") or "").strip().lower() != "syncing":
+            updated = self.set_route_status(name, "syncing")
+        return updated
+
+    async def start_route_sync_async(self, name: str) -> dict:
+        if self.sync_ledger is not None:
+            # Recover records that were paused while route was deactive, so start truly resumes.
+            self.sync_ledger.reactivate_route_deactive_blocks(name)
+        route = self.get_route(name)
+        status = self._determine_start_status(name, route)
+        updated = self.set_route_status(name, status)
+        enqueued = await self._enqueue_route_retryables_async(name)
+        if enqueued > 0 and str(updated.get("status") or "").strip().lower() != "syncing":
+            updated = self.set_route_status(name, "syncing")
+        return updated
 
     def stop_route_sync(self, name: str) -> dict:
         return self.set_route_status(name, "deactive")
@@ -485,6 +504,46 @@ class ManagementApi:
             raise ValueError("review not found")
         return result
 
+    def _enqueue_route_retryables(self, route_name: str, *, limit: int = 5000) -> int:
+        if self.sync_ledger is None or self.sync_queue is None:
+            return 0
+        keys = self.sync_ledger.list_retryable_keys_for_route(route_name, limit=max(1, int(limit)))
+        if not keys:
+            return 0
+
+        async def _enqueue_all() -> None:
+            now = time.time()
+            for idx, key in enumerate(keys):
+                await self.sync_queue.enqueue(
+                    dedupe_key=key,
+                    route_name=route_name,
+                    due_at=now + (0.002 * idx),
+                    payload_hash="",
+                )
+
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(_enqueue_all())
+        except RuntimeError:
+            asyncio.run(_enqueue_all())
+        return len(keys)
+
+    async def _enqueue_route_retryables_async(self, route_name: str, *, limit: int = 5000) -> int:
+        if self.sync_ledger is None or self.sync_queue is None:
+            return 0
+        keys = self.sync_ledger.list_retryable_keys_for_route(route_name, limit=max(1, int(limit)))
+        if not keys:
+            return 0
+        now = time.time()
+        for idx, key in enumerate(keys):
+            await self.sync_queue.enqueue(
+                dedupe_key=key,
+                route_name=route_name,
+                due_at=now + (0.002 * idx),
+                payload_hash="",
+            )
+        return len(keys)
+
     def reload_routes(self) -> None:
         registry = load_routes(str(self.channels_path))
         self.on_routes_reloaded(registry)
@@ -622,12 +681,32 @@ class ManagementApi:
 
 def _atomic_dump_json(path: Path, payload: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    prev_stat = None
+    try:
+        if path.exists():
+            prev_stat = path.stat()
+    except Exception:
+        prev_stat = None
     fd, temp_path = tempfile.mkstemp(prefix=path.name, suffix=".tmp", dir=str(path.parent))
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(json.dumps(payload, ensure_ascii=False, indent=2))
             fh.flush()
             os.fsync(fh.fileno())
+        if prev_stat is not None:
+            try:
+                os.chown(temp_path, int(prev_stat.st_uid), int(prev_stat.st_gid))
+            except Exception:
+                pass
+            try:
+                os.chmod(temp_path, int(prev_stat.st_mode) & 0o777)
+            except Exception:
+                pass
+        else:
+            try:
+                os.chmod(temp_path, 0o664)
+            except Exception:
+                pass
         os.replace(temp_path, path)
     finally:
         try:
@@ -639,12 +718,32 @@ def _atomic_dump_json(path: Path, payload: object) -> None:
 
 def _atomic_write_text(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    prev_stat = None
+    try:
+        if path.exists():
+            prev_stat = path.stat()
+    except Exception:
+        prev_stat = None
     fd, temp_path = tempfile.mkstemp(prefix=path.name, suffix=".tmp", dir=str(path.parent))
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(str(content))
             fh.flush()
             os.fsync(fh.fileno())
+        if prev_stat is not None:
+            try:
+                os.chown(temp_path, int(prev_stat.st_uid), int(prev_stat.st_gid))
+            except Exception:
+                pass
+            try:
+                os.chmod(temp_path, int(prev_stat.st_mode) & 0o777)
+            except Exception:
+                pass
+        else:
+            try:
+                os.chmod(temp_path, 0o664)
+            except Exception:
+                pass
         os.replace(temp_path, path)
     finally:
         try:

@@ -378,6 +378,33 @@ class SyncLedger:
             return None
         return int(row[0])
 
+    def first_active_key_for_route_message_id(self, route_name: str, message_id: int) -> str | None:
+        placeholders = ",".join("?" for _ in ACTIVE_STATUSES)
+        params: list[Any] = [route_name]
+        params.extend(sorted(ACTIVE_STATUSES))
+        params.append(int(message_id))
+        with self._lock:
+            conn = self._connect()
+            try:
+                row = self._fetchone(
+                    conn,
+                    f"""
+                    SELECT dedupe_key
+                    FROM sync_message_ledger
+                    WHERE route_name = ?
+                      AND status IN ({placeholders})
+                      AND message_id = ?
+                    ORDER BY first_seen_at ASC
+                    LIMIT 1
+                    """,
+                    tuple(params),
+                )
+            finally:
+                conn.close()
+        if row is None or row[0] is None:
+            return None
+        return str(row[0])
+
     def set_route_checkpoint(self, route_name: str, last_source_message_id: int) -> None:
         now = _utc_now_iso()
         with self._lock:
@@ -492,7 +519,7 @@ class SyncLedger:
                     """
                     SELECT dedupe_key FROM sync_message_ledger
                     WHERE status IN ('queued', 'failed', 'retry_wait', 'ambiguous')
-                    ORDER BY first_seen_at ASC
+                    ORDER BY route_name ASC, message_id ASC, first_seen_at ASC
                     LIMIT ?
                     """,
                     (max(1, int(limit)),),
@@ -500,6 +527,52 @@ class SyncLedger:
             finally:
                 conn.close()
         return [str(item[0]) for item in rows]
+
+    def list_retryable_keys_for_route(self, route_name: str, *, limit: int = 500) -> list[str]:
+        with self._lock:
+            conn = self._connect()
+            try:
+                rows = self._fetchall(
+                    conn,
+                    """
+                    SELECT dedupe_key FROM sync_message_ledger
+                    WHERE route_name = ?
+                      AND status IN ('queued', 'failed', 'retry_wait', 'ambiguous')
+                    ORDER BY message_id ASC, first_seen_at ASC
+                    LIMIT ?
+                    """,
+                    (str(route_name or "").strip(), max(1, int(limit))),
+                )
+            finally:
+                conn.close()
+        return [str(item[0]) for item in rows]
+
+    def reactivate_route_deactive_blocks(self, route_name: str) -> int:
+        name = str(route_name or "").strip()
+        if not name:
+            return 0
+        with self._lock:
+            conn = self._connect()
+            try:
+                cur = self._execute(
+                    conn,
+                    """
+                    UPDATE sync_message_ledger
+                    SET status = 'failed',
+                        last_error = 'route_resumed_after_deactive'
+                    WHERE route_name = ?
+                      AND status = 'blocked'
+                      AND (
+                        last_error = 'route_deactive'
+                        OR last_error LIKE 'route_deactive:%%'
+                      )
+                    """,
+                    (name,),
+                )
+                conn.commit()
+                return int(getattr(cur, "rowcount", 0) or 0)
+            finally:
+                conn.close()
 
     def requeue_stale_processing(
         self,

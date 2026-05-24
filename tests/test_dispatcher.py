@@ -184,23 +184,12 @@ def test_dispatcher_promotes_non_first_caption_to_first_in_media_group(tmp_path:
     assert payload[1].get("caption") in {None, ""}
 
 
-def test_dispatcher_fallback_preserves_caption_when_first_album_item_fails(tmp_path: Path) -> None:
-    class PartialFallbackClient(FakeBaleClient):
-        def __init__(self) -> None:
-            super().__init__()
-            self.first_send = True
-
+def test_dispatcher_does_not_fallback_to_single_send_on_non_transient_media_group_error(tmp_path: Path) -> None:
+    class NonTransientGroupFailClient(FakeBaleClient):
         async def send_media_group(self, chat_id: str, media_group: list[dict]):
             raise PlatformApiError("sendMediaGroup HTTP 400: bad request")
 
-        async def send_photo(self, chat_id: str, photo_path: Path, caption: str | None = None):
-            if self.first_send:
-                self.first_send = False
-                raise PlatformApiError("sendPhoto HTTP 500: failed to upload file bytes")
-            self.calls.append(("photo", chat_id, caption))
-            return {"ok": True}
-
-    client = PartialFallbackClient()
+    client = NonTransientGroupFailClient()
     dispatcher = BaleDispatcher(client)
 
     input_dir = tmp_path / "input"
@@ -214,9 +203,12 @@ def test_dispatcher_fallback_preserves_caption_when_first_album_item_fails(tmp_p
         ScriptOutputMessage(type=OutputMessageKind.PHOTO, path="a.jpg", caption="album caption"),
         ScriptOutputMessage(type=OutputMessageKind.PHOTO, path="b.jpg"),
     ]
-    asyncio.run(dispatcher.dispatch("@chan", messages, output_dir=output_dir, input_dir=input_dir))
-
-    assert ("text", "@chan", "album caption\n@chan") in client.calls
+    try:
+        asyncio.run(dispatcher.dispatch("@chan", messages, output_dir=output_dir, input_dir=input_dir))
+        assert False, "expected PlatformApiError"
+    except PlatformApiError:
+        pass
+    assert client.calls == []
 
 
 def test_dispatcher_does_not_fallback_to_single_send_on_transient_media_group_error(tmp_path: Path) -> None:

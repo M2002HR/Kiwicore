@@ -52,3 +52,53 @@ def test_sync_ledger_list_retryable_includes_ambiguous_legacy_records(tmp_path: 
     ledger.mark_status(key, status="ambiguous", last_error="legacy_ambiguous")
     keys = ledger.list_retryable_keys(limit=10)
     assert key in keys
+
+
+def test_sync_ledger_list_retryable_for_route_orders_by_message_id(tmp_path: Path) -> None:
+    ledger = SyncLedger(str(tmp_path / "sync_ledger.sqlite3"))
+    payload = {"update_id": 1, "message_id": 1}
+    _, k3, _ = ledger.register_message(
+        route_name="r1",
+        source_channel_id="-1001",
+        message_id=3,
+        media_group_id=None,
+        payload=payload,
+    )
+    _, k1, _ = ledger.register_message(
+        route_name="r1",
+        source_channel_id="-1001",
+        message_id=1,
+        media_group_id=None,
+        payload=payload,
+    )
+    _, k2, _ = ledger.register_message(
+        route_name="r1",
+        source_channel_id="-1001",
+        message_id=2,
+        media_group_id=None,
+        payload=payload,
+    )
+    keys = ledger.list_retryable_keys_for_route("r1", limit=10)
+    assert keys[:3] == [k1, k2, k3]
+
+
+def test_sync_ledger_first_active_key_for_route_message_id(tmp_path: Path) -> None:
+    ledger = SyncLedger(str(tmp_path / "sync_ledger.sqlite3"))
+    payload = {"update_id": 1, "message_id": 10}
+    _, k1, _ = ledger.register_message(
+        route_name="r1",
+        source_channel_id="-1001",
+        message_id=10,
+        media_group_id=None,
+        payload=payload,
+    )
+    _, k2, _ = ledger.register_message(
+        route_name="r1",
+        source_channel_id="-1001",
+        message_id=11,
+        media_group_id=None,
+        payload=payload,
+    )
+    assert ledger.first_active_key_for_route_message_id("r1", 10) == k1
+    assert ledger.first_active_key_for_route_message_id("r1", 11) == k2
+    assert ledger.first_active_key_for_route_message_id("r1", 12) is None

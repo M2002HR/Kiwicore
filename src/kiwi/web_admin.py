@@ -667,7 +667,7 @@ class AdminWebServer:
                     return
 
                 if path == "/api/routes" and method == "GET":
-                    self._send_json({"ok": True, "routes": parent.management_api.list_routes()})
+                    self._send_json({"ok": True, "routes": parent._routes_with_runtime_status()})
                     return
 
                 if path == "/api/routes" and method == "POST":
@@ -693,14 +693,28 @@ class AdminWebServer:
                         return
                     if route_name.endswith("/sync/start") and method == "POST":
                         name = route_name[: -len("/sync/start")]
-                        out = parent.management_api.start_route_sync(unquote(name))
+                        out = parent._run_async(parent.management_api.start_route_sync_async(unquote(name)), timeout=20.0)
                         self._send_json({"ok": True, "route": out})
                         return
                     if route_name.endswith("/sync/force") and method == "POST":
                         name = unquote(route_name[: -len("/sync/force")])
+                        force_limit = _q_int(query, "limit", 0, min_value=0, max_value=200000)
+                        force_backfill_timeout_sec = _q_int(
+                            query,
+                            "timeout_sec",
+                            int(os.getenv("WEB_FORCE_SYNC_BACKFILL_TIMEOUT_SEC", "180") or 180),
+                            min_value=20,
+                            max_value=1800,
+                        )
                         out = parent._run_async(parent.management_api.force_route_sync(name), timeout=20.0)
                         runtime_reset = parent._run_async(parent.service.force_sync_route_runtime_reset(name), timeout=8.0)
-                        backfill = parent._run_async(parent.service.force_sync_route_backfill(name), timeout=35.0)
+                        backfill = parent._run_async(
+                            parent.service.force_sync_route_backfill(
+                                name,
+                                limit=(None if force_limit <= 0 else int(force_limit)),
+                            ),
+                            timeout=float(force_backfill_timeout_sec),
+                        )
                         self._send_json({"ok": True, **out, "runtime_reset": runtime_reset, "backfill": backfill})
                         return
                     if route_name.endswith("/sync/stop") and method == "POST":
@@ -1061,16 +1075,16 @@ class AdminWebServer:
             raise
 
     def _dashboard_snapshot(self) -> dict[str, object]:
-        routes = self.management_api.list_routes()
+        routes = self._routes_with_runtime_status()
         try:
             sync_snapshot = self._run_async(self.management_api.sync_stats(), timeout=12.0)
         except Exception:
             logger.exception("Failed to fetch async sync stats for dashboard; fallback to snapshot")
             sync_snapshot = self.management_api.sync_stats_snapshot()
         status_counts = dict(sync_snapshot.get("status_counts") or {})
-        route_status_counts = {"deactive": 0, "syncing": 0, "synced": 0}
+        route_status_counts = {"deactive": 0, "syncing": 0, "sync_waiting": 0, "synced": 0}
         for route in routes:
-            status = str(route.get("status") or "").strip().lower()
+            status = str(route.get("runtime_status") or route.get("status") or "").strip().lower()
             if status in route_status_counts:
                 route_status_counts[status] += 1
         return {
@@ -1079,6 +1093,7 @@ class AdminWebServer:
                 "total": len(routes),
                 "deactive": int(route_status_counts["deactive"]),
                 "syncing": int(route_status_counts["syncing"]),
+                "sync_waiting": int(route_status_counts["sync_waiting"]),
                 "synced": int(route_status_counts["synced"]),
             },
             "sync": sync_snapshot,
@@ -1251,10 +1266,11 @@ class AdminWebServer:
         }
 
     def _workers_status_snapshot(self) -> dict[str, object]:
-        routes = self.management_api.list_routes()
+        routes = self._routes_with_runtime_status()
         syncing_routes = 0
         for route in routes:
-            if str(route.get("status") or "").strip().lower() == "syncing":
+            status = str(route.get("runtime_status") or route.get("status") or "").strip().lower()
+            if status in {"syncing", "sync_waiting"}:
                 syncing_routes += 1
 
         try:
@@ -1300,6 +1316,43 @@ class AdminWebServer:
             "host": self._host_metrics_snapshot(),
             "service": self.service.runtime_snapshot(),
         }
+
+    def _routes_with_runtime_status(self) -> list[dict]:
+        routes = [dict(item) for item in self.management_api.list_routes()]
+        runtime_map: dict[str, dict[str, object]] = {}
+        try:
+            out = self._run_async(self.service.sync_runtime_status_snapshot(), timeout=4.0)
+            if isinstance(out, dict):
+                runtime_map = out
+        except Exception:
+            logger.exception("Failed to fetch route runtime status snapshot")
+            runtime_map = {}
+
+        for route in routes:
+            name = str(route.get("name") or "").strip()
+            if not name:
+                continue
+            runtime = runtime_map.get(name)
+            if not isinstance(runtime, dict):
+                continue
+            runtime_status = str(runtime.get("runtime_status") or "").strip().lower()
+            if runtime_status:
+                route["runtime_status"] = runtime_status
+            wait_remaining = runtime.get("wait_remaining_sec")
+            try:
+                wait_sec = max(0.0, float(wait_remaining if wait_remaining is not None else 0.0))
+            except Exception:
+                wait_sec = 0.0
+            if wait_sec > 0.0:
+                route["wait_remaining_sec"] = round(wait_sec, 2)
+            next_due = runtime.get("next_due_at_ts")
+            try:
+                next_due_ts = float(next_due) if next_due is not None else 0.0
+            except Exception:
+                next_due_ts = 0.0
+            if next_due_ts > 0.0:
+                route["next_due_at"] = datetime.fromtimestamp(next_due_ts, tz=timezone.utc).isoformat()
+        return routes
 
     def _host_metrics_snapshot(self) -> dict[str, object]:
         cpu_count = int(os.cpu_count() or 0)

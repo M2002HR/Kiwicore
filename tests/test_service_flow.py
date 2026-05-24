@@ -1854,8 +1854,8 @@ def test_service_flow_blocks_message_when_guard_denies(tmp_path: Path) -> None:
     assert processed == 1
     assert bale.sent == []
     assert any(chat == "@logchan" for chat, _ in tg.audit_messages)
-    assert any("توضیح: guard_denied" in text for _, text in tg.audit_messages)
-    assert any("لینک پیام: https://t.me/srcchan/31" in text for _, text in tg.audit_messages)
+    assert any("📝 Details: guard_denied" in text for _, text in tg.audit_messages)
+    assert any("🔗 Message Link: https://t.me/srcchan/31" in text for _, text in tg.audit_messages)
 
 
 def test_service_keeps_original_document_name(tmp_path: Path) -> None:
@@ -2598,7 +2598,7 @@ def test_service_sends_audit_logs_to_telegram_channel(tmp_path: Path) -> None:
     assert len(tg.audit_messages) >= 1
     assert all(chat == "@logchan" for chat, _ in tg.audit_messages)
     assert any("کیوی" in text for _, text in tg.audit_messages)
-    assert any("لینک پیام: https://t.me/srcchan/81" in text for _, text in tg.audit_messages)
+    assert any("🔗 Message Link: https://t.me/srcchan/81" in text for _, text in tg.audit_messages)
 
 
 def test_service_handles_admin_private_commands(tmp_path: Path) -> None:

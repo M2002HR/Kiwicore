@@ -2862,12 +2862,10 @@ class KiwiService:
             source_link = self._source_message_link(incoming)
             if source_link:
                 lines.append(f"🔗 Message Link: {source_link}")
-                lines.append(f"لینک پیام: {source_link}")
             if incoming.media_group_id:
                 lines.append(f"🗂 media_group_id: {incoming.media_group_id}")
         if reason:
             lines.append(f"📝 Details: {reason}")
-            lines.append(f"توضیح: {reason}")
         if stage_timings_ms:
             lines.append(f"⏱ timings_ms: {json.dumps(stage_timings_ms, ensure_ascii=False)}")
         if stage_output_text:

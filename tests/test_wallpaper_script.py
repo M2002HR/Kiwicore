@@ -83,7 +83,25 @@ def test_wallpaper_script_adds_link_caption_to_first_media_only(tmp_path: Path) 
     assert len(out) == 2
     assert "caption" in out[0]
     assert "caption" not in out[1]
-    assert out[0]["caption"] == "به چنل سرزمین والپیپر بپیوندید."
+    assert out[0]["caption"] == "به چنل سرزمین والپیپر بپیوندید..."
+    assert out[0]["append_destination_footer"] is False
+
+
+def test_wallpaper_script_keeps_hashtags_before_join_message(tmp_path: Path) -> None:
+    mod = _load_module()
+    payload = {
+        "message": {
+            "caption": "#Vaporwave #NeonCity \n@WallpapersArena",
+        },
+        "inputs": [
+            {"kind": "photo", "local_name": "x.jpg"},
+            {"kind": "photo", "local_name": "y.jpg"},
+        ],
+    }
+
+    out = mod.build_messages(payload, input_dir=tmp_path)
+    assert len(out) == 2
+    assert out[0]["caption"] == "#Vaporwave #NeonCity\nبه چنل سرزمین والپیپر بپیوندید..."
     assert out[0]["append_destination_footer"] is False
 
 

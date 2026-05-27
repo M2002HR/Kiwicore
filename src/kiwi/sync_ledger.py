@@ -458,6 +458,41 @@ class SyncLedger:
             return None
         return int(row[0])
 
+    def latest_sent_at_for_route(self, route_name: str) -> float | None:
+        name = str(route_name or "").strip()
+        if not name:
+            return None
+        with self._lock:
+            conn = self._connect()
+            try:
+                row = self._fetchone(
+                    conn,
+                    """
+                    SELECT sent_at
+                    FROM sync_message_ledger
+                    WHERE route_name = ?
+                      AND status = 'sent'
+                      AND sent_at IS NOT NULL
+                    ORDER BY sent_at DESC
+                    LIMIT 1
+                    """,
+                    (name,),
+                )
+            finally:
+                conn.close()
+        if row is None or row[0] is None:
+            return None
+        raw = str(row[0] or "").strip()
+        if not raw:
+            return None
+        try:
+            dt = datetime.fromisoformat(raw)
+        except Exception:
+            return None
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return float(dt.timestamp())
+
     def delete_route_checkpoint(self, route_name: str) -> int:
         name = str(route_name or "").strip()
         if not name:
@@ -518,7 +553,7 @@ class SyncLedger:
                     conn,
                     """
                     SELECT dedupe_key FROM sync_message_ledger
-                    WHERE status IN ('queued', 'failed', 'retry_wait', 'ambiguous')
+                    WHERE status IN ('queued', 'failed', 'retry_wait')
                     ORDER BY route_name ASC, message_id ASC, first_seen_at ASC
                     LIMIT ?
                     """,
@@ -537,7 +572,7 @@ class SyncLedger:
                     """
                     SELECT dedupe_key FROM sync_message_ledger
                     WHERE route_name = ?
-                      AND status IN ('queued', 'failed', 'retry_wait', 'ambiguous')
+                      AND status IN ('queued', 'failed', 'retry_wait')
                     ORDER BY message_id ASC, first_seen_at ASC
                     LIMIT ?
                     """,
@@ -564,7 +599,9 @@ class SyncLedger:
                       AND status = 'blocked'
                       AND (
                         last_error = 'route_deactive'
+                        OR last_error = 'route_deactive_archived'
                         OR last_error LIKE 'route_deactive:%%'
+                        OR last_error LIKE 'route_deactive_archived:%%'
                       )
                     """,
                     (name,),

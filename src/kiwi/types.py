@@ -37,6 +37,8 @@ class IncomingMedia:
     file_name: str | None = None
     mime_type: str | None = None
     duration: int | None = None
+    title: str | None = None
+    performer: str | None = None
     source: str | None = None
     source_ref: dict | None = None
 
@@ -53,6 +55,7 @@ class IncomingChannelMessage:
     medias: list[IncomingMedia]
     raw: dict
     media_group_id: str | None = None
+    source_topic_id: int | None = None
 
 
 @dataclass(slots=True)
@@ -74,6 +77,7 @@ class ChannelRoute:
     sync_retry_attempts: int = 2
     sync_seeded: bool = False
     status: str | None = None
+    source_topic_id: int | None = None
 
     def __post_init__(self) -> None:
         source_username = str(self.source_channel_username or "").strip()
@@ -87,6 +91,11 @@ class ChannelRoute:
                 source_username = ""
         self.source_channel_id = source_id
         self.source_channel_username = normalize_channel_username(source_username) if source_username else None
+        try:
+            topic_id = int(self.source_topic_id) if self.source_topic_id is not None else 0
+        except Exception:
+            topic_id = 0
+        self.source_topic_id = topic_id if topic_id > 0 else None
 
         if self.status is None or str(self.status).strip() == "":
             legacy_sync_status = str(self.sync_status or "").strip().lower()
@@ -148,6 +157,7 @@ class ScriptOutputMessage:
     text: str | None = None
     path: str | None = None
     caption: str | None = None
+    reply_markup: dict | None = None
     append_destination_footer: bool = True
 
 

@@ -96,6 +96,76 @@ def test_load_routes_default_script_name_prefers_username(tmp_path: Path) -> Non
     assert route.script == "usd_iran.py"
 
 
+def test_load_routes_parses_public_topic_link_source(tmp_path: Path) -> None:
+    config_path = tmp_path / "channels.json"
+    config_path.write_text(
+        json.dumps(
+            [
+                {
+                    "name": "topic-route",
+                    "source_channel_username": "https://t.me/FreeRapHipHop_PlayList/1556041",
+                    "destination_channel_username": "@iran_music_fa",
+                    "channel_script": "music.py",
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    registry = load_routes(str(config_path))
+    route = registry.match("-1", "@freeraphiphop_playlist")
+    assert route is not None
+    assert route.source_channel_username == "@freeraphiphop_playlist"
+    assert route.source_topic_id == 1556041
+
+
+def test_load_routes_prefers_explicit_source_topic_id_over_link(tmp_path: Path) -> None:
+    config_path = tmp_path / "channels.json"
+    config_path.write_text(
+        json.dumps(
+            [
+                {
+                    "name": "topic-route",
+                    "source_channel_username": "https://t.me/FreeRapHipHop_PlayList/1556041",
+                    "source_topic_id": 777,
+                    "destination_channel_username": "@iran_music_fa",
+                    "channel_script": "music.py",
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    registry = load_routes(str(config_path))
+    route = registry.match("-1", "@freeraphiphop_playlist")
+    assert route is not None
+    assert route.source_topic_id == 777
+
+
+def test_load_routes_parses_public_topic_link_from_source_channel_id(tmp_path: Path) -> None:
+    config_path = tmp_path / "channels.json"
+    config_path.write_text(
+        json.dumps(
+            [
+                {
+                    "name": "topic-route-id-field",
+                    "source_channel_id": "https://t.me/FreeRapHipHop_PlayList/1556041",
+                    "destination_channel_username": "@iran_music_fa",
+                    "channel_script": "music.py",
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    registry = load_routes(str(config_path))
+    route = registry.match("-1", "@freeraphiphop_playlist")
+    assert route is not None
+    assert route.source_channel_username == "@freeraphiphop_playlist"
+    assert route.source_topic_id == 1556041
+    assert route.source_channel_id is None
+
+
 def test_match_prefers_username_over_id(tmp_path: Path) -> None:
     config_path = tmp_path / "channels.json"
     config_path.write_text(

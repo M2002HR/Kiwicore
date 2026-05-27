@@ -7,6 +7,7 @@ import threading
 import time
 import asyncio
 import inspect
+import re
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable
@@ -15,13 +16,14 @@ from uuid import uuid4
 from kiwi.config import RouteRegistry, load_routes
 from kiwi.sync_ledger import SyncLedger
 from kiwi.sync_queue import SyncQueueBackend
-from kiwi.utils import dump_json, safe_script_name
+from kiwi.utils import dump_json, normalize_channel_id, normalize_channel_username, safe_script_name
 
 _ROUTE_KEYS = {
     "name",
     "status",
     "source_channel_id",
     "source_channel_username",
+    "source_topic_id",
     "destination_channel_id",
     "destination_channel_username",
     "channel_script",
@@ -32,6 +34,53 @@ _ROUTE_KEYS = {
     "batch_size",
     "retry_attempts",
 }
+
+_PUBLIC_TME_TOPIC_LINK_RE = re.compile(
+    r"^(?:https?://)?(?:t\.me|telegram\.me|telegram\.dog)/([A-Za-z0-9_]{5,})/(\d+)(?:/(\d+))?(?:[?#].*)?$",
+    re.IGNORECASE,
+)
+_PRIVATE_TME_TOPIC_LINK_RE = re.compile(
+    r"^(?:https?://)?(?:t\.me|telegram\.me|telegram\.dog)/c/(\d+)/(\d+)(?:/(\d+))?(?:[?#].*)?$",
+    re.IGNORECASE,
+)
+
+
+def _positive_int_or_none(value: object) -> int | None:
+    try:
+        out = int(value)  # type: ignore[arg-type]
+    except Exception:
+        return None
+    return out if out > 0 else None
+
+
+def _is_numeric_channel_id(value: str | None) -> bool:
+    text = str(value or "").strip()
+    if not text:
+        return False
+    return text.lstrip("-").isdigit()
+
+
+def _parse_topic_link_source(raw: str) -> tuple[str | None, str | None, int | None]:
+    text = str(raw or "").strip()
+    if not text:
+        return (None, None, None)
+
+    m_private = _PRIVATE_TME_TOPIC_LINK_RE.match(text)
+    if m_private:
+        internal_chat_id = _positive_int_or_none(m_private.group(1))
+        topic_id = _positive_int_or_none(m_private.group(2))
+        if internal_chat_id and topic_id:
+            source_channel_id = normalize_channel_id(f"-100{internal_chat_id}")
+            return (None, source_channel_id, topic_id)
+
+    m_public = _PUBLIC_TME_TOPIC_LINK_RE.match(text)
+    if m_public:
+        username = normalize_channel_username(m_public.group(1))
+        topic_id = _positive_int_or_none(m_public.group(2))
+        if username and topic_id:
+            return (username, None, topic_id)
+
+    return (None, None, None)
 
 
 class ManagementApi:
@@ -575,9 +624,38 @@ class ManagementApi:
         if "source_channel_username" in out:
             source_username = str(out.get("source_channel_username") or "").strip()
             out["source_channel_username"] = source_username or None
+        if "source_topic_id" in out:
+            out["source_topic_id"] = _positive_int_or_none(out.get("source_topic_id"))
+        source_username_raw = str(out.get("source_channel_username") or "").strip()
+        source_channel_id_raw = str(out.get("source_channel_id") or "").strip()
+        if source_username_raw:
+            parsed_username, parsed_source_id, parsed_topic_id = _parse_topic_link_source(source_username_raw)
+            if parsed_username:
+                out["source_channel_username"] = parsed_username
+            if parsed_source_id and not str(out.get("source_channel_id") or "").strip():
+                out["source_channel_id"] = parsed_source_id
+            if out.get("source_topic_id") is None and parsed_topic_id is not None:
+                out["source_topic_id"] = parsed_topic_id
+        if source_channel_id_raw:
+            parsed_username, parsed_source_id, parsed_topic_id = _parse_topic_link_source(source_channel_id_raw)
+            if parsed_source_id:
+                out["source_channel_id"] = parsed_source_id
+            elif parsed_username:
+                out["source_channel_id"] = None
+            if not source_username_raw and parsed_username:
+                out["source_channel_username"] = parsed_username
+            if out.get("source_topic_id") is None and parsed_topic_id is not None:
+                out["source_topic_id"] = parsed_topic_id
         if "source_channel_id" in out:
-            source_id = str(out.get("source_channel_id") or "").strip()
-            out["source_channel_id"] = source_id or None
+            out["source_channel_id"] = normalize_channel_id(out.get("source_channel_id"))
+            if not _is_numeric_channel_id(out.get("source_channel_id")):
+                out["source_channel_id"] = None
+        if "source_topic_id" in out:
+            try:
+                topic_id = int(out.get("source_topic_id") or 0)
+            except Exception:
+                topic_id = 0
+            out["source_topic_id"] = topic_id if topic_id > 0 else None
         legacy_sync_obj = obj.get("sync")
         if isinstance(legacy_sync_obj, dict):
             if "backfill_count" not in out and "backfill_count" in legacy_sync_obj:
@@ -815,19 +893,23 @@ def _build_route_sync_metrics_from_checkpoint(
 def _route_dict_to_channel_route(route: dict) -> "ChannelRoute":
     from kiwi.types import ChannelRoute
 
-    sync_obj = route.get("sync") if isinstance(route.get("sync"), dict) else {}
+    normalized = ManagementApi._normalize_route_payload(route)
+    obj = dict(route)
+    obj.update(normalized)
+    sync_obj = obj.get("sync") if isinstance(obj.get("sync"), dict) else {}
     return ChannelRoute(
-        name=str(route.get("name") or ""),
-        status=str(route.get("status") or "deactive"),
-        source_channel_id=str(route.get("source_channel_id") or "") or None,
-        source_channel_username=str(route.get("source_channel_username") or "") or None,
-        destination_channel_id=str(route.get("destination_channel_id") or "") or None,
-        destination_channel_username=str(route.get("destination_channel_username") or "") or None,
-        channel_script=str(route.get("channel_script") or "") or None,
-        max_message_mb=int(route.get("max_message_mb")) if route.get("max_message_mb") is not None else None,
-        gaurd_script=str(route.get("gaurd_script") or "") or None,
-        sync_backfill_count=max(0, int(route.get("backfill_count", sync_obj.get("backfill_count", 100)))),
-        sync_interval_sec=max(1, int(route.get("interval_sec", sync_obj.get("interval_sec", 1)))),
-        sync_batch_size=max(1, int(route.get("batch_size", sync_obj.get("batch_size", 1)))),
-        sync_retry_attempts=max(0, int(route.get("retry_attempts", sync_obj.get("retry_attempts", 2)))),
+        name=str(obj.get("name") or ""),
+        status=str(obj.get("status") or "deactive"),
+        source_channel_id=str(obj.get("source_channel_id") or "") or None,
+        source_channel_username=str(obj.get("source_channel_username") or "") or None,
+        source_topic_id=int(obj.get("source_topic_id") or 0) or None,
+        destination_channel_id=str(obj.get("destination_channel_id") or "") or None,
+        destination_channel_username=str(obj.get("destination_channel_username") or "") or None,
+        channel_script=str(obj.get("channel_script") or "") or None,
+        max_message_mb=int(obj.get("max_message_mb")) if obj.get("max_message_mb") is not None else None,
+        gaurd_script=str(obj.get("gaurd_script") or "") or None,
+        sync_backfill_count=max(0, int(obj.get("backfill_count", sync_obj.get("backfill_count", 100)))),
+        sync_interval_sec=max(1, int(obj.get("interval_sec", sync_obj.get("interval_sec", 1)))),
+        sync_batch_size=max(1, int(obj.get("batch_size", sync_obj.get("batch_size", 1)))),
+        sync_retry_attempts=max(0, int(obj.get("retry_attempts", sync_obj.get("retry_attempts", 2)))),
     )

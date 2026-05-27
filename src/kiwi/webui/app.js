@@ -44,6 +44,9 @@ const state = {
   settings: null,
   admins: [],
   keywordLinks: [],
+  ui: {
+    lastInteractionAt: 0,
+  },
 };
 
 const menuItems = [
@@ -100,6 +103,8 @@ const PAGE_SCOPES = {
   system: ['system_checks_table'],
   admins: ['admins_table'],
 };
+const WS_FAILURE_SUSPEND_AFTER = 6;
+const WS_SUSPEND_MS = 120000;
 
 function parseNumberLike(value) {
   const text = String(value || '').trim().toLowerCase();
@@ -448,14 +453,18 @@ function refreshAutoRefreshUi() {
   const anyConnected = channels.some((ch) => !!ch?.wsConnected);
   const anyConnecting = channels.some((ch) => !!ch?.wsConnecting);
   const anyConfigured = channels.some((ch) => !!ch?.wsConfigured);
+  const now = Date.now();
+  const anySuspended = channels.some((ch) => Number(ch?.wsSuspendedUntil || 0) > now);
   if (!state.autoRefreshEnabled) {
     setAutoRefreshText('Realtime: paused');
   } else if (anyConnected) {
     setAutoRefreshText('Realtime: live');
   } else if (anyConnecting) {
     setAutoRefreshText('Realtime: connecting...');
+  } else if (anySuspended) {
+    setAutoRefreshText('Realtime: polling active');
   } else if (anyConfigured) {
-    setAutoRefreshText('Realtime: reconnecting...');
+    setAutoRefreshText('Realtime: reconnecting (polling active)...');
   } else {
     setAutoRefreshText('Realtime: disconnected');
   }
@@ -495,7 +504,15 @@ function captureFocusedFieldSnapshot() {
     inModal: !!el.closest('#modalOverlay'),
     selectionStart: null,
     selectionEnd: null,
+    value: null,
+    checked: null,
   };
+  if (tag === 'input' || tag === 'textarea' || tag === 'select') {
+    snap.value = typeof el.value === 'string' ? el.value : null;
+  }
+  if (tag === 'input' && ('checked' in el)) {
+    snap.checked = !!el.checked;
+  }
   if (tag !== 'select' && 'selectionStart' in el && 'selectionEnd' in el) {
     const start = Number(el.selectionStart);
     const end = Number(el.selectionEnd);
@@ -535,6 +552,15 @@ function findFieldFromSnapshot(snap) {
 function restoreFocusedFieldSnapshot(snap) {
   const el = findFieldFromSnapshot(snap);
   if (!el || !(el instanceof HTMLElement)) return;
+  if (snap && snap.tag === 'select' && typeof snap.value === 'string' && 'value' in el) {
+    try { el.value = snap.value; } catch (_) {}
+  }
+  if (snap && (snap.tag === 'input' || snap.tag === 'textarea') && typeof snap.value === 'string' && 'value' in el) {
+    try { el.value = snap.value; } catch (_) {}
+  }
+  if (snap && snap.tag === 'input' && typeof snap.checked === 'boolean' && 'checked' in el) {
+    try { el.checked = snap.checked; } catch (_) {}
+  }
   try {
     el.focus({ preventScroll: true });
   } catch (_) {
@@ -553,6 +579,60 @@ function restoreFocusedFieldSnapshot(snap) {
       // no-op
     }
   }
+}
+
+function captureScrollSnapshot(page = state.currentPage) {
+  const pageEl = document.getElementById(`page-${String(page || '')}`);
+  const wraps = pageEl ? Array.from(pageEl.querySelectorAll('.table-wrap')) : [];
+  return {
+    winX: Number(window.scrollX || 0),
+    winY: Number(window.scrollY || 0),
+    pageTop: Number(pageEl?.scrollTop || 0),
+    pageLeft: Number(pageEl?.scrollLeft || 0),
+    wraps: wraps.map((el, idx) => ({
+      idx,
+      top: Number(el.scrollTop || 0),
+      left: Number(el.scrollLeft || 0),
+    })),
+  };
+}
+
+function restoreScrollSnapshot(snapshot, page = state.currentPage) {
+  if (!snapshot || typeof snapshot !== 'object') return;
+  const pageEl = document.getElementById(`page-${String(page || '')}`);
+  const wraps = pageEl ? Array.from(pageEl.querySelectorAll('.table-wrap')) : [];
+  requestAnimationFrame(() => {
+    try {
+      window.scrollTo(Number(snapshot.winX || 0), Number(snapshot.winY || 0));
+    } catch (_) {
+      // no-op
+    }
+    if (pageEl) {
+      pageEl.scrollTop = Number(snapshot.pageTop || 0);
+      pageEl.scrollLeft = Number(snapshot.pageLeft || 0);
+    }
+    const savedWraps = Array.isArray(snapshot.wraps) ? snapshot.wraps : [];
+    for (const saved of savedWraps) {
+      const idx = Number(saved?.idx ?? -1);
+      if (!Number.isInteger(idx) || idx < 0 || idx >= wraps.length) continue;
+      const el = wraps[idx];
+      el.scrollTop = Number(saved?.top || 0);
+      el.scrollLeft = Number(saved?.left || 0);
+    }
+  });
+}
+
+function isFieldEditingActive() {
+  const el = document.activeElement;
+  if (!el || !(el instanceof HTMLElement)) return false;
+  const tag = String(el.tagName || '').toLowerCase();
+  if (tag === 'input' || tag === 'textarea' || tag === 'select') return true;
+  if (el.isContentEditable) return true;
+  return false;
+}
+
+function markUserInteraction() {
+  state.ui.lastInteractionAt = Date.now();
 }
 
 async function runAction(fn, fallbackError = 'Unknown error') {
@@ -999,6 +1079,7 @@ function toggleRouteSort(key) {
 function routeSortValue(route, metrics, key) {
   if (key === 'name') return String(route?.name || '');
   if (key === 'source') return String(route?.source_channel_username || route?.source_channel_id || '');
+  if (key === 'source_topic_id') return Number(route?.source_topic_id ?? 0);
   if (key === 'destination') return String(route?.destination_channel_username || route?.destination_channel_id || '');
   if (key === 'channel_script') return String(route?.channel_script || '');
   if (key === 'guard') return String(route?.gaurd_script || '');
@@ -1029,6 +1110,7 @@ function renderRoutesPage(opts = {}) {
       r?.name,
       r?.source_channel_username,
       r?.source_channel_id,
+      r?.source_topic_id,
       r?.destination_channel_username,
       r?.destination_channel_id,
       r?.channel_script,
@@ -1062,6 +1144,8 @@ function renderRoutesPage(opts = {}) {
     const routeKey = encodeURIComponent(String(r.name || ''));
     const name = esc(r.name || '-');
     const source = esc(r.source_channel_username || r.source_channel_id || '-');
+    const sourceTopicId = Number(r?.source_topic_id ?? 0);
+    const sourceTopicText = sourceTopicId > 0 ? String(sourceTopicId) : '-';
     const dest = esc(r.destination_channel_username || r.destination_channel_id || '-');
     const cs = esc(r.channel_script || '-');
     const gs = esc(r.gaurd_script || '-');
@@ -1069,6 +1153,7 @@ function renderRoutesPage(opts = {}) {
     const routeStatus = effectiveRouteStatus(r.status, m, r.runtime_status);
     const isDeactive = routeStatus === 'deactive';
     const waitRemainingSec = Number(r?.wait_remaining_sec ?? 0);
+    const canSendOneUnsynced = routeStatus === 'deactive' || routeStatus === 'sync_waiting';
     const remaining = Number(m?.remaining_unsynced ?? 0);
     const progressPct = Number(m?.progress_pct ?? 0);
     const remainingLabel = isDeactive ? '-' : String(remaining);
@@ -1081,6 +1166,7 @@ function renderRoutesPage(opts = {}) {
       <tr>
         <td class="route-col-name" title="${name}">${name}</td>
         <td class="route-col-source" title="${source}">${source}</td>
+        <td title="${esc(sourceTopicText)}">${esc(sourceTopicText)}</td>
         <td class="route-col-destination" title="${dest}">${dest}</td>
         <td>${cs}</td>
         <td>${gs}</td>
@@ -1091,6 +1177,7 @@ function renderRoutesPage(opts = {}) {
           <div class="icon-actions">
             ${iconBtn({ act: 'edit', title: `Edit ${r.name || ''}`, icon: '✎', attrs: `data-route-name="${routeKey}"` })}
             ${iconBtn({ act: 'toggle', title: routeStatus === 'deactive' ? 'Start route' : 'Stop route', icon: routeStatus === 'deactive' ? '▶' : '⏸', attrs: `data-route-name="${routeKey}" data-status="${routeStatus}"` })}
+            ${iconBtn({ act: 'sync-one', title: canSendOneUnsynced ? 'Send one unsynced now' : 'Available on deactive/sync_waiting routes', icon: '⇢', attrs: `data-route-name="${routeKey}"${canSendOneUnsynced ? '' : ' disabled aria-disabled="true"'}` })}
             ${iconBtn({ act: 'force-sync', title: 'Force sync', icon: '↻', attrs: `data-route-name="${routeKey}"` })}
             ${iconBtn({ act: 'delete', title: `Delete ${r.name || ''}`, icon: '✕', extraClass: 'btn-danger', attrs: `data-route-name="${routeKey}"` })}
           </div>
@@ -1117,6 +1204,7 @@ function renderRoutesPage(opts = {}) {
             <tr>
               <th class="route-col-name"><button class="th-sort" data-sort-key="name">Name <span class="sort-arrow">${routeSortIndicator('name')}</span></button></th>
               <th class="route-col-source"><button class="th-sort" data-sort-key="source">Source <span class="sort-arrow">${routeSortIndicator('source')}</span></button></th>
+              <th><button class="th-sort" data-sort-key="source_topic_id">Source Topic ID <span class="sort-arrow">${routeSortIndicator('source_topic_id')}</span></button></th>
               <th class="route-col-destination"><button class="th-sort" data-sort-key="destination">Destination <span class="sort-arrow">${routeSortIndicator('destination')}</span></button></th>
               <th><button class="th-sort" data-sort-key="channel_script">Channel Script <span class="sort-arrow">${routeSortIndicator('channel_script')}</span></button></th>
               <th><button class="th-sort" data-sort-key="guard">Guard <span class="sort-arrow">${routeSortIndicator('guard')}</span></button></th>
@@ -1206,6 +1294,23 @@ function renderRoutesPage(opts = {}) {
         }, 'Failed to force sync route');
         return;
       }
+      if (act === 'sync-one') {
+        await runAction(async () => {
+          const out = await api(`/api/routes/${encodeURIComponent(name)}/sync/send-one`, { method: 'POST' });
+          const result = out?.result || {};
+          const processed = Number(result.processed || 0);
+          const note = String(result.note || '');
+          if (processed > 0) {
+            showFlash('One unsynced message sent');
+          } else if (note) {
+            showFlash(`No message sent (${note})`);
+          } else {
+            showFlash('No message sent');
+          }
+          await reloadPageData('routes');
+        }, 'Failed to send one unsynced message');
+        return;
+      }
       if (act === 'edit') {
         openRouteEditor(route);
       }
@@ -1233,6 +1338,7 @@ function openRouteEditor(route) {
   const isEdit = !!route;
   const r = route || {
     name: '', status: 'synced', source_channel_username: '', source_channel_id: '',
+    source_topic_id: null,
     destination_channel_username: '', destination_channel_id: '',
     channel_script: '', gaurd_script: 'default_guard.py', max_message_mb: 60,
     backfill_count: 50, interval_sec: 1, batch_size: 1, retry_attempts: 2,
@@ -1250,6 +1356,7 @@ function openRouteEditor(route) {
         <label>Status <select name="status"><option value="deactive" ${String(r.status || '') === 'deactive' ? 'selected' : ''}>deactive</option><option value="syncing" ${String(r.status || '') === 'syncing' ? 'selected' : ''}>syncing</option><option value="synced" ${String(r.status || '') === 'synced' ? 'selected' : ''}>synced</option></select></label>
         <label>source username <input name="source_channel_username" value="${esc(r.source_channel_username || '')}"></label>
         <label>source id <input name="source_channel_id" value="${esc(r.source_channel_id || '')}" placeholder="-1001234567890"></label>
+        <label>source topic id <input type="number" min="1" name="source_topic_id" value="${esc(r.source_topic_id ?? '')}" placeholder="e.g. 1556041"></label>
         <label>destination username <input name="destination_channel_username" value="${esc(r.destination_channel_username || '')}"></label>
         <label>destination id <input name="destination_channel_id" value="${esc(r.destination_channel_id || '')}"></label>
         <label>channel script <input name="channel_script" value="${esc(r.channel_script || '')}"></label>
@@ -1277,6 +1384,13 @@ function openRouteEditor(route) {
         status: String(fd.get('status') || 'deactive'),
         source_channel_username: (String(fd.get('source_channel_username') || '').trim() || null),
         source_channel_id: (String(fd.get('source_channel_id') || '').trim() || null),
+        source_topic_id: (() => {
+          const raw = String(fd.get('source_topic_id') || '').trim();
+          if (!raw) return null;
+          const n = Number(raw);
+          if (!Number.isFinite(n) || n <= 0) return null;
+          return Math.trunc(n);
+        })(),
         destination_channel_username: (String(fd.get('destination_channel_username') || '').trim() || null),
         destination_channel_id: (String(fd.get('destination_channel_id') || '').trim() || null),
         channel_script: (String(fd.get('channel_script') || '').trim() || null),
@@ -2416,6 +2530,7 @@ function renderCurrentPage() {
 
 async function reloadPageData(page = state.currentPage) {
   const focusedFieldSnapshot = captureFocusedFieldSnapshot();
+  const scrollSnapshot = captureScrollSnapshot(page);
   try {
     if (page === 'dashboard') await loadDashboard();
     if (page === 'routes') await loadRoutes();
@@ -2431,6 +2546,7 @@ async function reloadPageData(page = state.currentPage) {
     if (page === 'admins') await loadAdmins();
     renderCurrentPage();
     restoreFocusedFieldSnapshot(focusedFieldSnapshot);
+    restoreScrollSnapshot(scrollSnapshot, page);
   } catch (e) {
     showFlash(`Error: ${e.message}`, true);
   }
@@ -2442,6 +2558,8 @@ function canAutoRefresh(page = state.currentPage) {
   if (document.hidden) return false;
   if (isModalOpen()) return false;
   if (state.autoRefreshRunning) return false;
+  if (isFieldEditingActive()) return false;
+  if (Date.now() - Number(state.ui.lastInteractionAt || 0) < 2000) return false;
   if (page === 'scripts' || page === 'keywords' || page === 'admins') return false;
   return true;
 }
@@ -2456,10 +2574,13 @@ function ensureRealtimeChannel(scope) {
     wsConnected: false,
     wsConnecting: false,
     wsConfigured: false,
+    wsConnectStartedAt: 0,
     reconnectAttempt: 0,
     wsReconnectTimer: null,
     wsLastCloseAt: 0,
     wsLastCloseText: '',
+    wsFailureStreak: 0,
+    wsSuspendedUntil: 0,
     reloadDebounceTimer: null,
   };
   state.realtime.channels[key] = created;
@@ -2547,9 +2668,13 @@ function scheduleRealtimeReconnect(scope) {
   if (!ch || ch.wsReconnectTimer) return;
   const attempt = Number(ch.reconnectAttempt || 0) + 1;
   ch.reconnectAttempt = attempt;
+  const now = Date.now();
+  const suspendedUntil = Number(ch.wsSuspendedUntil || 0);
+  const suspendedDelay = suspendedUntil > now ? (suspendedUntil - now) : 0;
   const baseDelay = 1500;
   const maxDelay = 30000;
-  const delay = Math.min(maxDelay, Math.round(baseDelay * (2 ** Math.min(6, attempt - 1))));
+  const retryDelay = Math.min(maxDelay, Math.round(baseDelay * (2 ** Math.min(6, attempt - 1))));
+  const delay = Math.max(suspendedDelay, retryDelay);
   ch.wsReconnectTimer = setTimeout(() => {
     ch.wsReconnectTimer = null;
     connectScopeSocket(key);
@@ -2616,6 +2741,12 @@ async function connectScopeSocket(scope, forceConfigRefresh = false) {
   if (!key || !state.user || !state.autoRefreshEnabled) return;
   const ch = ensureRealtimeChannel(key);
   if (!ch || ch.wsConnected || ch.wsConnecting) return;
+  const now = Date.now();
+  if (!forceConfigRefresh && Number(ch.wsSuspendedUntil || 0) > now) {
+    scheduleRealtimeReconnect(key);
+    refreshAutoRefreshUi();
+    return;
+  }
   ch.wsConnecting = true;
   refreshAutoRefreshUi();
   let config;
@@ -2662,11 +2793,15 @@ async function connectScopeSocket(scope, forceConfigRefresh = false) {
     return;
   }
   ch.ws = ws;
+  ch.wsConnectStartedAt = Date.now();
 
   ws.onopen = () => {
     ch.wsConnected = true;
     ch.wsConnecting = false;
+    ch.wsConnectStartedAt = 0;
     ch.reconnectAttempt = 0;
+    ch.wsFailureStreak = 0;
+    ch.wsSuspendedUntil = 0;
     refreshAutoRefreshUi();
   };
   ws.onmessage = (evt) => {
@@ -2684,9 +2819,12 @@ async function connectScopeSocket(scope, forceConfigRefresh = false) {
     const wasConnected = !!ch.wsConnected;
     const code = Number(evt?.code || 0);
     const reason = String(evt?.reason || '').trim();
+    const openedAt = Number(ch.wsConnectStartedAt || 0);
+    const lifetimeMs = openedAt > 0 ? Math.max(0, Date.now() - openedAt) : 0;
     ch.ws = null;
     ch.wsConnected = false;
     ch.wsConnecting = false;
+    ch.wsConnectStartedAt = 0;
     refreshAutoRefreshUi();
     if (!state.user || !state.autoRefreshEnabled) return;
     const now = Date.now();
@@ -2700,6 +2838,17 @@ async function connectScopeSocket(scope, forceConfigRefresh = false) {
     if (code === 1008) {
       state.realtime.config = null;
       state.realtime.configFetchedAt = 0;
+    }
+    if (!wasConnected && (code === 1006 || code === 0) && lifetimeMs < 4500) {
+      ch.wsFailureStreak = Number(ch.wsFailureStreak || 0) + 1;
+    } else if (wasConnected) {
+      ch.wsFailureStreak = 0;
+    }
+    if (Number(ch.wsFailureStreak || 0) >= WS_FAILURE_SUSPEND_AFTER) {
+      ch.wsFailureStreak = 0;
+      ch.wsSuspendedUntil = now + WS_SUSPEND_MS;
+      ch.wsConfigured = false;
+      refreshAutoRefreshUi();
     }
     scheduleRealtimeReconnect(key);
   };
@@ -2747,12 +2896,6 @@ function buildRealtimeWsCandidates(config) {
   const querySep = path.includes('?') ? '&' : '?';
   const suffix = ticket ? `${querySep}ticket=${encodeURIComponent(ticket)}` : '';
 
-  try {
-    const sameOrigin = new URL(path + suffix, `${protocol}//${location.host}`);
-    add(String(sameOrigin.toString()));
-  } catch (_) {
-    // no-op
-  }
   if (Number.isFinite(port) && port > 0) {
     try {
       const withPort = new URL(path + suffix, `${protocol}//${location.host}`);
@@ -2775,6 +2918,20 @@ function startAutoRefresh() {
   refreshAutoRefreshUi();
   if (!state.autoRefreshEnabled) return;
   refreshRealtimeSubscriptions();
+  state.autoRefreshTimer = setInterval(async () => {
+    if (!canAutoRefresh(state.currentPage)) return;
+    const channels = Object.values(state.realtime.channels || {});
+    const anyConnected = channels.some((ch) => !!ch?.wsConnected);
+    if (anyConnected) return;
+    state.autoRefreshRunning = true;
+    refreshAutoRefreshUi();
+    try {
+      await reloadPageData(state.currentPage);
+    } finally {
+      state.autoRefreshRunning = false;
+      refreshAutoRefreshUi();
+    }
+  }, Math.max(1500, Number(state.autoRefreshMs || 5000)));
 }
 
 async function verifyAuth() {
@@ -2790,6 +2947,7 @@ async function verifyAuth() {
 
 async function bootstrap() {
   buildMenu();
+  markUserInteraction();
 
   els.modalCloseBtn?.addEventListener('click', closeModal);
   els.modalOverlay?.addEventListener('click', (e) => {
@@ -2803,6 +2961,12 @@ async function bootstrap() {
     if (!state.user || !state.autoRefreshEnabled) return;
     refreshRealtimeSubscriptions();
   });
+  window.addEventListener('wheel', markUserInteraction, { passive: true });
+  window.addEventListener('touchstart', markUserInteraction, { passive: true });
+  document.addEventListener('pointerdown', markUserInteraction, true);
+  document.addEventListener('input', markUserInteraction, true);
+  document.addEventListener('change', markUserInteraction, true);
+  document.addEventListener('keydown', markUserInteraction, true);
   window.addEventListener('beforeunload', () => {
     closeRealtimeSocket();
     forEachRealtimeChannel((scope) => {

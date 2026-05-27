@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -9,6 +10,16 @@ from dotenv import load_dotenv
 
 from kiwi.types import ChannelRoute
 from kiwi.utils import normalize_channel_id, normalize_channel_username, safe_script_name
+
+
+_PUBLIC_TME_TOPIC_LINK_RE = re.compile(
+    r"^(?:https?://)?(?:t\.me|telegram\.me|telegram\.dog)/([A-Za-z0-9_]{5,})/(\d+)(?:/(\d+))?(?:[?#].*)?$",
+    re.IGNORECASE,
+)
+_PRIVATE_TME_TOPIC_LINK_RE = re.compile(
+    r"^(?:https?://)?(?:t\.me|telegram\.me|telegram\.dog)/c/(\d+)/(\d+)(?:/(\d+))?(?:[?#].*)?$",
+    re.IGNORECASE,
+)
 
 
 @dataclass(slots=True)
@@ -262,6 +273,10 @@ def _default_channel_script_name(route_obj: dict) -> str | None:
         return safe_script_name(script)
 
     source_username = normalize_channel_username(route_obj.get("source_channel_username"))
+    if source_username and source_username.startswith(("https://t.me/", "http://t.me/", "t.me/")):
+        parsed_username, _parsed_source_id, _parsed_topic_id = _parse_topic_link_source(str(source_username))
+        if parsed_username:
+            source_username = parsed_username
     if source_username:
         return f"{source_username.lstrip('@')}.py"
     source_id = normalize_channel_id(route_obj.get("source_channel_id"))
@@ -277,6 +292,46 @@ def _default_gaurd_script_name(route_obj: dict) -> str | None:
             return None
         return safe_script_name(script)
     return "default_guard.py"
+
+
+def _positive_int_or_none(value: object) -> int | None:
+    try:
+        out = int(value)  # type: ignore[arg-type]
+    except Exception:
+        return None
+    return out if out > 0 else None
+
+
+def _is_numeric_channel_id(value: str | None) -> bool:
+    text = str(value or "").strip()
+    if not text:
+        return False
+    return text.lstrip("-").isdigit()
+
+
+def _parse_topic_link_source(raw: str) -> tuple[str | None, str | None, int | None]:
+    text = str(raw or "").strip()
+    if not text:
+        return (None, None, None)
+
+    m_private = _PRIVATE_TME_TOPIC_LINK_RE.match(text)
+    if m_private:
+        internal_chat_id = _positive_int_or_none(m_private.group(1))
+        topic_id = _positive_int_or_none(m_private.group(2))
+        if internal_chat_id and topic_id:
+            source_channel_id = normalize_channel_id(f"-100{internal_chat_id}")
+            return (None, source_channel_id, topic_id)
+
+    m_public = _PUBLIC_TME_TOPIC_LINK_RE.match(text)
+    if m_public:
+        username = normalize_channel_username(m_public.group(1))
+        # Thread links are /<username>/<thread_id>/<msg_id>; normal message/topic links
+        # are /<username>/<id>. For topic routes we always treat the middle id as topic id.
+        topic_id = _positive_int_or_none(m_public.group(2))
+        if username and topic_id:
+            return (username, None, topic_id)
+
+    return (None, None, None)
 
 
 def load_routes(config_path: str) -> RouteRegistry:
@@ -297,8 +352,32 @@ def load_routes(config_path: str) -> RouteRegistry:
             raise ValueError(f"Route at index {idx} must be an object")
 
         raw_source_username = str(obj.get("source_channel_username") or "").strip()
-        source_channel_id = normalize_channel_id(obj.get("source_channel_id"))
+        raw_source_channel_id = str(obj.get("source_channel_id") or "").strip()
+        source_channel_id = normalize_channel_id(raw_source_channel_id)
+        source_topic_id = _positive_int_or_none(obj.get("source_topic_id"))
         source_channel_username: str | None = None
+        if raw_source_username:
+            parsed_username, parsed_source_id, parsed_topic_id = _parse_topic_link_source(raw_source_username)
+            if parsed_source_id and source_channel_id is None:
+                source_channel_id = parsed_source_id
+                if not parsed_username:
+                    raw_source_username = ""
+            if parsed_username:
+                raw_source_username = parsed_username
+            if source_topic_id is None and parsed_topic_id is not None:
+                source_topic_id = parsed_topic_id
+        if raw_source_channel_id:
+            parsed_username, parsed_source_id, parsed_topic_id = _parse_topic_link_source(raw_source_channel_id)
+            if parsed_source_id:
+                source_channel_id = parsed_source_id
+            elif parsed_username:
+                source_channel_id = None
+            if not raw_source_username and parsed_username:
+                raw_source_username = parsed_username
+            if source_topic_id is None and parsed_topic_id is not None:
+                source_topic_id = parsed_topic_id
+        if not _is_numeric_channel_id(source_channel_id):
+            source_channel_id = None
         if raw_source_username:
             if not raw_source_username.startswith("@"):
                 lowered = raw_source_username.lower()
@@ -354,6 +433,7 @@ def load_routes(config_path: str) -> RouteRegistry:
             status=raw_status,
             source_channel_id=source_channel_id,
             source_channel_username=source_channel_username,
+            source_topic_id=source_topic_id,
             destination_channel_id=destination_channel_id,
             destination_channel_username=destination_channel_username,
             channel_script=channel_script,

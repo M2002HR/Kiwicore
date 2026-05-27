@@ -22,15 +22,26 @@ class BotApiClient:
         api_base_url: str,
         file_base_url: str,
         timeout_sec: float = 40.0,
+        upload_max_concurrency: int | None = None,
         trust_env: bool = False,
     ) -> None:
         self.token = token
         self.api_base_url = api_base_url.rstrip("/")
         self.file_base_url = file_base_url.rstrip("/")
-        timeout = httpx.Timeout(connect=15.0, read=timeout_sec, write=30.0, pool=30.0)
+        timeout = httpx.Timeout(
+            connect=15.0,
+            read=timeout_sec,
+            write=max(30.0, float(timeout_sec)),
+            pool=max(30.0, float(timeout_sec)),
+        )
         # Ignore process-level proxy env vars by default to avoid crashes when
         # local SOCKS proxy variables are set with unsupported schemes.
         self.client = httpx.AsyncClient(timeout=timeout, trust_env=trust_env)
+        try:
+            max_uploads = int(upload_max_concurrency or 0)
+        except Exception:
+            max_uploads = 0
+        self._upload_semaphore = asyncio.Semaphore(max(1, max_uploads)) if max_uploads > 0 else None
 
     async def aclose(self) -> None:
         await self.client.aclose()
@@ -115,34 +126,100 @@ class BotApiClient:
         response = await self._post("answerCallbackQuery", json=payload)
         return bool(response)
 
-    async def send_photo(self, chat_id: str, photo_path: Path, caption: str | None = None) -> dict:
-        return await self._send_file("sendPhoto", chat_id=chat_id, field_name="photo", file_path=photo_path, caption=caption)
+    async def send_photo(
+        self,
+        chat_id: str,
+        photo_path: Path,
+        caption: str | None = None,
+        reply_markup: dict | None = None,
+    ) -> dict:
+        return await self._send_file(
+            "sendPhoto",
+            chat_id=chat_id,
+            field_name="photo",
+            file_path=photo_path,
+            caption=caption,
+            reply_markup=reply_markup,
+        )
 
-    async def send_video(self, chat_id: str, video_path: Path, caption: str | None = None) -> dict:
-        return await self._send_file("sendVideo", chat_id=chat_id, field_name="video", file_path=video_path, caption=caption)
+    async def send_video(
+        self,
+        chat_id: str,
+        video_path: Path,
+        caption: str | None = None,
+        reply_markup: dict | None = None,
+    ) -> dict:
+        return await self._send_file(
+            "sendVideo",
+            chat_id=chat_id,
+            field_name="video",
+            file_path=video_path,
+            caption=caption,
+            reply_markup=reply_markup,
+        )
 
-    async def send_voice(self, chat_id: str, voice_path: Path, caption: str | None = None) -> dict:
-        return await self._send_file("sendVoice", chat_id=chat_id, field_name="voice", file_path=voice_path, caption=caption)
+    async def send_voice(
+        self,
+        chat_id: str,
+        voice_path: Path,
+        caption: str | None = None,
+        reply_markup: dict | None = None,
+    ) -> dict:
+        return await self._send_file(
+            "sendVoice",
+            chat_id=chat_id,
+            field_name="voice",
+            file_path=voice_path,
+            caption=caption,
+            reply_markup=reply_markup,
+        )
 
-    async def send_audio(self, chat_id: str, audio_path: Path, caption: str | None = None) -> dict:
-        return await self._send_file("sendAudio", chat_id=chat_id, field_name="audio", file_path=audio_path, caption=caption)
+    async def send_audio(
+        self,
+        chat_id: str,
+        audio_path: Path,
+        caption: str | None = None,
+        reply_markup: dict | None = None,
+    ) -> dict:
+        return await self._send_file(
+            "sendAudio",
+            chat_id=chat_id,
+            field_name="audio",
+            file_path=audio_path,
+            caption=caption,
+            reply_markup=reply_markup,
+        )
 
-    async def send_document(self, chat_id: str, document_path: Path, caption: str | None = None) -> dict:
+    async def send_document(
+        self,
+        chat_id: str,
+        document_path: Path,
+        caption: str | None = None,
+        reply_markup: dict | None = None,
+    ) -> dict:
         return await self._send_file(
             "sendDocument",
             chat_id=chat_id,
             field_name="document",
             file_path=document_path,
             caption=caption,
+            reply_markup=reply_markup,
         )
 
-    async def send_animation(self, chat_id: str, animation_path: Path, caption: str | None = None) -> dict:
+    async def send_animation(
+        self,
+        chat_id: str,
+        animation_path: Path,
+        caption: str | None = None,
+        reply_markup: dict | None = None,
+    ) -> dict:
         return await self._send_file(
             "sendAnimation",
             chat_id=chat_id,
             field_name="animation",
             file_path=animation_path,
             caption=caption,
+            reply_markup=reply_markup,
         )
 
     async def send_sticker(self, chat_id: str, sticker_path: Path) -> dict:
@@ -166,23 +243,9 @@ class BotApiClient:
     async def send_media_group(self, chat_id: str, media_group: list[dict]) -> list[dict]:
         if len(media_group) < 2:
             raise ValueError("media_group requires at least two items")
-        retries = 3  # initial attempt + 2 retries
-        backoff_sec = 0.8
-        response: object | None = None
-        last_error: PlatformApiError | None = None
-        for attempt in range(1, retries + 1):
-            try:
-                response = await self._send_media_group_once(chat_id, media_group)
-                break
-            except PlatformApiError as exc:
-                last_error = exc
-                if attempt >= retries or not self._is_transient_upload_error(exc):
-                    raise
-                await asyncio.sleep(backoff_sec * attempt)
-
-        if response is None:
-            assert last_error is not None
-            raise last_error
+        # Media-group delivery is not safely retryable. Upstream can accept the
+        # album even when the transport/errors look failed. Never auto-resend here.
+        response = await self._send_media_group_once(chat_id, media_group)
         if not isinstance(response, list):
             raise PlatformApiError("sendMediaGroup response is not a list")
         return response
@@ -223,7 +286,10 @@ class BotApiClient:
                 media_items.append(media_obj)
 
             data["media"] = json.dumps(media_items, ensure_ascii=False)
-            return await self._post("sendMediaGroup", data=data, files=files_payload)
+            if self._upload_semaphore is None:
+                return await self._post("sendMediaGroup", data=data, files=files_payload)
+            async with self._upload_semaphore:
+                return await self._post("sendMediaGroup", data=data, files=files_payload)
         finally:
             for fh in file_handles:
                 fh.close()
@@ -236,6 +302,7 @@ class BotApiClient:
         field_name: str,
         file_path: Path,
         caption: str | None = None,
+        reply_markup: dict | None = None,
     ) -> dict:
         if not file_path.exists():
             raise FileNotFoundError(str(file_path))
@@ -245,10 +312,12 @@ class BotApiClient:
             parse_mode = self._pick_parse_mode(caption)
             if parse_mode:
                 data["parse_mode"] = parse_mode
+        if reply_markup is not None:
+            data["reply_markup"] = json.dumps(reply_markup, ensure_ascii=False)
         # Bale occasionally returns transient 5xx upload errors.
         # Re-open the file for each attempt and retry a few times.
-        retries = 3
-        backoff_sec = 0.6
+        retries = 5
+        backoff_sec = 0.8
         response: object | None = None
         last_error: PlatformApiError | None = None
         for attempt in range(1, retries + 1):
@@ -257,7 +326,11 @@ class BotApiClient:
                     mime = self._guess_upload_mime(file_path, media_type=field_name)
                     upload_name = self._safe_upload_filename(file_path, media_type=field_name)
                     files = {field_name: (upload_name, fh, mime)}
-                    response = await self._post(method, data=data, files=files)
+                    if self._upload_semaphore is None:
+                        response = await self._post(method, data=data, files=files)
+                    else:
+                        async with self._upload_semaphore:
+                            response = await self._post(method, data=data, files=files)
                 break
             except PlatformApiError as exc:
                 if "parse_mode" in data and self._is_parse_entities_error(exc):
@@ -282,6 +355,17 @@ class BotApiClient:
             or "connecttimeout" in text
             or "readtimeout" in text
             or "http 500" in text
+            or "http 502" in text
+            or "http 503" in text
+            or "http 504" in text
+            or "failed to upload file bytes" in text
+        )
+
+    @staticmethod
+    def _is_retry_safe_upload_error(exc: PlatformApiError) -> bool:
+        text = str(exc).lower()
+        return (
+            "http 500" in text
             or "http 502" in text
             or "http 503" in text
             or "http 504" in text

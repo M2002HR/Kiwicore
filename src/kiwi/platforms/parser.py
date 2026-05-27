@@ -63,6 +63,8 @@ def parse_telegram_channel_update(update: dict) -> IncomingChannelMessage | None
                 file_name=str(part.get("file_name")) if part.get("file_name") else None,
                 mime_type=str(part.get("mime_type")) if part.get("mime_type") else None,
                 duration=_to_int_or_none(part.get("duration")),
+                title=str(part.get("title")) if (key == "audio" and part.get("title")) else None,
+                performer=str(part.get("performer")) if (key == "audio" and part.get("performer")) else None,
             )
         )
 
@@ -97,6 +99,8 @@ def parse_telegram_channel_update(update: dict) -> IncomingChannelMessage | None
                 file_name=str(file_part.get("file_name")) if file_part.get("file_name") else None,
                 mime_type=str(file_part.get("mime_type")) if file_part.get("mime_type") else None,
                 duration=_to_int_or_none(file_part.get("duration")),
+                title=str(file_part.get("title")) if file_part.get("title") else None,
+                performer=str(file_part.get("performer")) if file_part.get("performer") else None,
             )
         )
 

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 from kiwi.admin_bot import AdminBotHandler
 from kiwi.admin_store import AdminStore
 from kiwi.config import load_routes, load_settings
@@ -18,6 +20,22 @@ from kiwi.sync_queue import build_sync_queue_backend
 async def build_service(env_file: str = ".env") -> KiwiService:
     settings = load_settings(env_file)
     routes = load_routes(settings.channels_config_path)
+    try:
+        bale_timeout_sec = float(str(os.getenv("BALE_API_TIMEOUT_SEC", "90")).strip() or "90")
+    except Exception:
+        bale_timeout_sec = 90.0
+    bale_timeout_sec = max(20.0, min(300.0, bale_timeout_sec))
+    try:
+        bale_upload_max_concurrency = int(str(os.getenv("BALE_UPLOAD_MAX_CONCURRENCY", "1")).strip() or "1")
+    except Exception:
+        bale_upload_max_concurrency = 1
+    raw_bale_trust_env = str(os.getenv("BALE_HTTP_TRUST_ENV", "")).strip().lower()
+    if raw_bale_trust_env in {"1", "true", "yes", "on"}:
+        bale_trust_env = True
+    elif raw_bale_trust_env in {"0", "false", "no", "off"}:
+        bale_trust_env = False
+    else:
+        bale_trust_env = bool(settings.http_trust_env)
 
     telegram_client = BotApiClient(
         token=settings.telegram_bot_token,
@@ -30,8 +48,9 @@ async def build_service(env_file: str = ".env") -> KiwiService:
         token=settings.bale_bot_token,
         api_base_url=settings.bale_api_base_url,
         file_base_url=settings.bale_file_base_url,
-        timeout_sec=30.0,
-        trust_env=settings.http_trust_env,
+        timeout_sec=bale_timeout_sec,
+        upload_max_concurrency=max(0, bale_upload_max_concurrency),
+        trust_env=bale_trust_env,
     )
     telethon_source_client = None
     if settings.telethon_enabled:

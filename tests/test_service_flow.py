@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -118,6 +119,58 @@ class FakeBaleClient:
         return None
 
 
+class MessageIdBaleClient(FakeBaleClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self._next_id = 900
+
+    def _new_id(self) -> int:
+        self._next_id += 1
+        return self._next_id
+
+    async def send_message(self, chat_id: str, text: str, reply_markup: dict | None = None):
+        self.sent.append((chat_id, text))
+        return {"ok": True, "message_id": self._new_id()}
+
+    async def send_photo(self, chat_id: str, photo_path: Path, caption: str | None = None):
+        self.sent.append((chat_id, f"photo:{photo_path.name}"))
+        return {"ok": True, "message_id": self._new_id()}
+
+    async def send_video(self, chat_id: str, video_path: Path, caption: str | None = None):
+        self.sent.append((chat_id, f"video:{video_path.name}"))
+        return {"ok": True, "message_id": self._new_id()}
+
+    async def send_document(self, chat_id: str, document_path: Path, caption: str | None = None):
+        self.sent.append((chat_id, f"doc:{document_path.name}"))
+        return {"ok": True, "message_id": self._new_id()}
+
+    async def send_media_group(self, chat_id: str, media_group: list[dict]):
+        self.media_group_sent.append((chat_id, len(media_group)))
+        out = []
+        for _ in media_group:
+            out.append({"ok": True, "message_id": self._new_id()})
+        return out
+
+
+class RidBaleClient(FakeBaleClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self._next_id = 800
+        self._rid = 4_985_031_728_703_449_716
+        self._date = 1_779_658_729
+
+    def _new_message_id(self) -> int:
+        self._next_id += 1
+        return self._next_id
+
+    async def send_message(self, chat_id: str, text: str, reply_markup: dict | None = None):
+        self.sent.append((chat_id, text))
+        out = {"ok": True, "message_id": self._new_message_id(), "id": self._rid, "date": self._date}
+        self._rid += 1
+        self._date += 1
+        return out
+
+
 class FakeTelethonSourceClient:
     def __init__(
         self,
@@ -170,6 +223,12 @@ class FakeTelethonSourceClient:
 
     async def aclose(self) -> None:
         self.closed = True
+
+
+class HangingTelethonSourceClient(FakeTelethonSourceClient):
+    async def poll_messages(self, routes: list[ChannelRoute]) -> list[IncomingChannelMessage]:  # noqa: ARG002
+        await asyncio.sleep(3600)
+        return []
 
 
 def _settings(tmp_path: Path, default_max_mb: int = 50) -> Settings:
@@ -285,6 +344,192 @@ def test_service_sync_enqueue_is_immediate_even_when_syncing(tmp_path: Path) -> 
     assert len(due) == 2
 
 
+def test_service_sync_waiting_enqueue_is_deferred_until_next_due(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    route = ChannelRoute(
+        name="sync-waiting-enqueue-route",
+        enabled=False,
+        source_channel_id="-1001",
+        source_channel_username="@srcchan",
+        destination_channel_id="-2001",
+        destination_channel_username=None,
+        channel_script=None,
+        max_message_mb=10,
+        sync_enabled=True,
+        sync_status="syncing",
+        sync_interval_sec=30,
+    )
+    service = KiwiService(
+        settings=settings,
+        routes=_route_registry(route),
+        telegram_client=FakeTelegramClient([], b""),
+        bale_client=FakeBaleClient(),
+        storage=StorageManager(settings.storage_dir),
+        guard_runner=GuardRunner(settings.gaurd_scripts_dir, timeout_sec=5),
+        script_runner=ScriptRunner(settings.scripts_dir, timeout_sec=5),
+        state_store=StateStore(settings.state_path),
+    )
+    service._sync_next_due_at[route.name] = 1_000.0  # noqa: SLF001
+    msg = IncomingChannelMessage(
+        update_id=10,
+        source_channel_id="-1001",
+        source_channel_username="@srcchan",
+        message_id=777,
+        date=None,
+        text="m777",
+        caption=None,
+        medias=[],
+        raw={},
+        media_group_id=None,
+    )
+
+    with patch("kiwi.service.time.time", return_value=970.0):
+        asyncio.run(service._enqueue_sync_message(route, msg))  # noqa: SLF001
+
+    before_due = asyncio.run(service.sync_queue.pop_due(limit=10, now_ts=999.0))  # noqa: SLF001
+    assert before_due == []
+
+    events = service.message_monitor.list_events(after_seq=0, limit=200)["events"]  # noqa: SLF001
+    assert all(str(evt.get("stage") or "") != "dequeue" for evt in events)
+
+    at_due = asyncio.run(service.sync_queue.pop_due(limit=10, now_ts=1_000.0))  # noqa: SLF001
+    assert len(at_due) == 1
+
+
+def test_state_store_persists_offset_without_dropping_sync_next_due(tmp_path: Path) -> None:
+    state_path = tmp_path / "storage" / "state.json"
+    store = StateStore(str(state_path))
+    store.save_sync_next_due_map({"r1": 1111.0, "r2": 2222.0})
+    store.save_offset(321)
+
+    data = json.loads(state_path.read_text(encoding="utf-8"))
+    assert data["offset"] == 321
+    assert data["sync_next_due_at"]["r1"] == 1111.0
+    assert data["sync_next_due_at"]["r2"] == 2222.0
+
+
+def test_service_sync_wait_timer_persists_across_restart(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    route = ChannelRoute(
+        name="sync-waiting-persist-route",
+        enabled=False,
+        source_channel_id="-1001",
+        source_channel_username="@srcchan",
+        destination_channel_id="-2001",
+        destination_channel_username=None,
+        channel_script=None,
+        max_message_mb=10,
+        sync_enabled=True,
+        sync_status="syncing",
+        sync_interval_sec=30,
+    )
+    common_args = dict(
+        settings=settings,
+        routes=_route_registry(route),
+        telegram_client=FakeTelegramClient([], b""),
+        bale_client=FakeBaleClient(),
+        storage=StorageManager(settings.storage_dir),
+        guard_runner=GuardRunner(settings.gaurd_scripts_dir, timeout_sec=5),
+        script_runner=ScriptRunner(settings.scripts_dir, timeout_sec=5),
+        state_store=StateStore(settings.state_path),
+    )
+
+    service1 = KiwiService(**common_args)
+    service1._sync_next_due_at[route.name] = 2_000.0  # noqa: SLF001
+    service1._save_sync_next_due_safe()  # noqa: SLF001
+
+    service2 = KiwiService(**common_args)
+    assert float(service2._sync_next_due_at.get(route.name) or 0.0) == 2_000.0  # noqa: SLF001
+
+    msg = IncomingChannelMessage(
+        update_id=11,
+        source_channel_id="-1001",
+        source_channel_username="@srcchan",
+        message_id=778,
+        date=None,
+        text="m778",
+        caption=None,
+        medias=[],
+        raw={},
+        media_group_id=None,
+    )
+
+    with patch("kiwi.service.time.time", return_value=1_970.0):
+        asyncio.run(service2._enqueue_sync_message(route, msg))  # noqa: SLF001
+
+    before_due = asyncio.run(service2.sync_queue.pop_due(limit=10, now_ts=1_999.0))  # noqa: SLF001
+    assert before_due == []
+    at_due = asyncio.run(service2.sync_queue.pop_due(limit=10, now_ts=2_000.0))  # noqa: SLF001
+    assert len(at_due) == 1
+
+
+def test_service_recovers_sync_wait_from_ledger_when_state_missing(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    route = ChannelRoute(
+        name="sync-ledger-recover-route",
+        enabled=False,
+        source_channel_id="-1001",
+        source_channel_username="@srcchan",
+        destination_channel_id="-2001",
+        destination_channel_username=None,
+        channel_script=None,
+        max_message_mb=10,
+        sync_enabled=True,
+        sync_status="syncing",
+        sync_interval_sec=300,
+    )
+    state_store = StateStore(settings.state_path)
+    service_seed = KiwiService(
+        settings=settings,
+        routes=_route_registry(route),
+        telegram_client=FakeTelegramClient([], b""),
+        bale_client=FakeBaleClient(),
+        storage=StorageManager(settings.storage_dir),
+        guard_runner=GuardRunner(settings.gaurd_scripts_dir, timeout_sec=5),
+        script_runner=ScriptRunner(settings.scripts_dir, timeout_sec=5),
+        state_store=state_store,
+    )
+
+    payload = {"update_id": 1, "message_id": 10}
+    _, key, _ = service_seed.sync_ledger.register_message(  # noqa: SLF001
+        route_name=route.name,
+        source_channel_id="-1001",
+        message_id=10,
+        media_group_id=None,
+        payload=payload,
+    )
+    service_seed.sync_ledger.mark_status(key, status="sent")  # noqa: SLF001
+    sent_ts = 1_700_000_000.0
+    sent_iso = datetime.fromtimestamp(sent_ts, tz=timezone.utc).isoformat()
+    conn = service_seed.sync_ledger._connect()  # noqa: SLF001
+    try:
+        service_seed.sync_ledger._execute(  # noqa: SLF001
+            conn,
+            "UPDATE sync_message_ledger SET sent_at = ? WHERE dedupe_key = ?",
+            (sent_iso, key),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    # Simulate missing state map on restart.
+    Path(settings.state_path).write_text(json.dumps({"offset": None}, ensure_ascii=False), encoding="utf-8")
+    with patch("kiwi.service.time.time", return_value=sent_ts + 30.0):
+        service_after = KiwiService(
+            settings=settings,
+            routes=_route_registry(route),
+            telegram_client=FakeTelegramClient([], b""),
+            bale_client=FakeBaleClient(),
+            storage=StorageManager(settings.storage_dir),
+            guard_runner=GuardRunner(settings.gaurd_scripts_dir, timeout_sec=5),
+            script_runner=ScriptRunner(settings.scripts_dir, timeout_sec=5),
+            state_store=StateStore(settings.state_path),
+            sync_ledger=service_seed.sync_ledger,  # noqa: SLF001
+        )
+    recovered_due = float(service_after._sync_next_due_at.get(route.name) or 0.0)  # noqa: SLF001
+    assert recovered_due == sent_ts + 300.0
+
+
 def test_service_sync_jitter_varies_across_routes() -> None:
     interval_sec = 60
     values = {
@@ -384,6 +629,109 @@ def test_service_sync_interval_applies_only_after_successful_dispatch(tmp_path: 
     with patch("kiwi.service.time.time", return_value=1_030.0):
         out_2 = asyncio.run(service._process_queued_item(ready[0]))  # noqa: SLF001
     assert out_2 == 1
+
+
+def test_service_force_sync_send_one_unsynced_allows_deactive_route(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    route = ChannelRoute(
+        name="sync-send-one-deactive",
+        enabled=False,
+        source_channel_id="-1001",
+        source_channel_username="@srcchan",
+        destination_channel_id="-2001",
+        destination_channel_username=None,
+        channel_script=None,
+        max_message_mb=10,
+        sync_enabled=True,
+        sync_status="deactive",
+        status="deactive",
+        sync_interval_sec=120,
+    )
+    service = KiwiService(
+        settings=settings,
+        routes=_route_registry(route),
+        telegram_client=FakeTelegramClient([], b""),
+        bale_client=FakeBaleClient(),
+        storage=StorageManager(settings.storage_dir),
+        guard_runner=GuardRunner(settings.gaurd_scripts_dir, timeout_sec=5),
+        script_runner=ScriptRunner(settings.scripts_dir, timeout_sec=5),
+        state_store=StateStore(settings.state_path),
+    )
+    incoming = IncomingChannelMessage(
+        update_id=701,
+        source_channel_id="-1001",
+        source_channel_username="@srcchan",
+        message_id=701,
+        date=None,
+        text="msg",
+        caption=None,
+        medias=[],
+        raw={},
+        media_group_id=None,
+    )
+    asyncio.run(service._enqueue_sync_message(route, incoming))  # noqa: SLF001
+
+    out = asyncio.run(service.force_sync_route_send_one_unsynced(route.name))  # noqa: SLF001
+    assert int(out.get("processed") or 0) == 1
+    assert str(out.get("runtime_status_before") or "") == "deactive"
+    assert str(out.get("route_status_after") or "") == "deactive"
+    assert str(out.get("status_after") or "") == "missing"
+    key = str(out.get("dedupe_key") or "")
+    record = service.sync_ledger.get_record(key)  # noqa: SLF001
+    assert record is None
+    assert int(service.sync_ledger.get_route_checkpoint(route.name) or 0) >= incoming.message_id  # noqa: SLF001
+
+
+def test_service_force_sync_send_one_unsynced_bypasses_waiting_and_resets_timer(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    route = ChannelRoute(
+        name="sync-send-one-waiting",
+        enabled=False,
+        source_channel_id="-1001",
+        source_channel_username="@srcchan",
+        destination_channel_id="-2001",
+        destination_channel_username=None,
+        channel_script=None,
+        max_message_mb=10,
+        sync_enabled=True,
+        sync_status="syncing",
+        sync_interval_sec=60,
+    )
+    service = KiwiService(
+        settings=settings,
+        routes=_route_registry(route),
+        telegram_client=FakeTelegramClient([], b""),
+        bale_client=FakeBaleClient(),
+        storage=StorageManager(settings.storage_dir),
+        guard_runner=GuardRunner(settings.gaurd_scripts_dir, timeout_sec=5),
+        script_runner=ScriptRunner(settings.scripts_dir, timeout_sec=5),
+        state_store=StateStore(settings.state_path),
+    )
+    incoming = IncomingChannelMessage(
+        update_id=702,
+        source_channel_id="-1001",
+        source_channel_username="@srcchan",
+        message_id=702,
+        date=None,
+        text="msg",
+        caption=None,
+        medias=[],
+        raw={},
+        media_group_id=None,
+    )
+    asyncio.run(service._enqueue_sync_message(route, incoming))  # noqa: SLF001
+    service._sync_next_due_at[route.name] = 2_000.0  # noqa: SLF001
+
+    with patch("kiwi.service.time.time", return_value=1_000.0):
+        out = asyncio.run(service.force_sync_route_send_one_unsynced(route.name))  # noqa: SLF001
+    assert int(out.get("processed") or 0) == 1
+    assert str(out.get("runtime_status_before") or "") == "sync_waiting"
+    assert str(out.get("status_after") or "") == "missing"
+    assert float(service._sync_next_due_at.get(route.name) or 0.0) == 1_060.0  # noqa: SLF001
+    key = str(out.get("dedupe_key") or "")
+    record = service.sync_ledger.get_record(key)  # noqa: SLF001
+    assert record is None
+    assert int(service.sync_ledger.get_route_checkpoint(route.name) or 0) >= incoming.message_id  # noqa: SLF001
 
 
 def test_service_traffic_snapshot_accumulates_by_route(tmp_path: Path) -> None:
@@ -1852,7 +2200,9 @@ def test_service_flow_blocks_message_when_guard_denies(tmp_path: Path) -> None:
 
     processed = asyncio.run(service.run_once())
     assert processed == 1
-    assert bale.sent == []
+    assert not any(chat == "-2001" for chat, _ in bale.sent)
+    assert any(chat == "@kiwi_logs_logs" for chat, _ in bale.sent)
+    assert any("📝 Details: guard_denied" in text for chat, text in bale.sent if chat == "@kiwi_logs_logs")
     assert any(chat == "@logchan" for chat, _ in tg.audit_messages)
     assert any("📝 Details: guard_denied" in text for _, text in tg.audit_messages)
     assert any("🔗 Message Link: https://t.me/srcchan/31" in text for _, text in tg.audit_messages)
@@ -2594,11 +2944,101 @@ def test_service_sends_audit_logs_to_telegram_channel(tmp_path: Path) -> None:
     )
     processed = asyncio.run(service.run_once())
     assert processed == 1
-    assert bale.sent == [("-2001", "ok\n-2001")]
+    assert any(chat == "-2001" and text == "ok\n-2001" for chat, text in bale.sent)
+    mirror_logs = [text for chat, text in bale.sent if chat == "@kiwi_logs_logs"]
+    assert len(mirror_logs) >= 1
     assert len(tg.audit_messages) >= 1
     assert all(chat == "@logchan" for chat, _ in tg.audit_messages)
     assert any("کیوی" in text for _, text in tg.audit_messages)
     assert any("🔗 Message Link: https://t.me/srcchan/81" in text for _, text in tg.audit_messages)
+
+
+def test_service_dispatch_audit_includes_destination_message_ids_when_link_metadata_missing(tmp_path: Path) -> None:
+    scripts_dir = tmp_path / "scripts"
+    scripts_dir.mkdir()
+    (scripts_dir / "-1001.py").write_text("print('{\"messages\": [{\"type\":\"text\",\"text\":\"ok\"}]}')", encoding="utf-8")
+
+    update = {
+        "update_id": 702,
+        "channel_post": {
+            "message_id": 82,
+            "chat": {"id": -1001, "type": "channel", "username": "srcchan"},
+            "text": "hello",
+        },
+    }
+    settings = _settings(tmp_path)
+    settings.log_channel_target = "@logchan"
+    route = ChannelRoute(
+        name="r-dest-link",
+        enabled=True,
+        source_channel_id="-1001",
+        source_channel_username="@srcchan",
+        destination_channel_id=None,
+        destination_channel_username="@destchan",
+        channel_script="-1001.py",
+        max_message_mb=10,
+    )
+    tg = FakeTelegramClient([update], b"")
+    bale = MessageIdBaleClient()
+    service = KiwiService(
+        settings=settings,
+        routes=_route_registry(route),
+        telegram_client=tg,
+        bale_client=bale,
+        storage=StorageManager(settings.storage_dir),
+        guard_runner=GuardRunner(settings.gaurd_scripts_dir, timeout_sec=5),
+        script_runner=ScriptRunner(settings.scripts_dir, timeout_sec=5),
+        state_store=StateStore(settings.state_path),
+    )
+    processed = asyncio.run(service.run_once())
+    assert processed == 1
+    assert any(chat == "@destchan" and text == "ok\n@destchan" for chat, text in bale.sent)
+    assert any("📨 Destination Message IDs: 901" in text for _, text in tg.audit_messages)
+
+
+def test_service_dispatch_audit_includes_destination_link_from_rid_date_metadata(tmp_path: Path) -> None:
+    scripts_dir = tmp_path / "scripts"
+    scripts_dir.mkdir()
+    (scripts_dir / "-1001.py").write_text("print('{\"messages\": [{\"type\":\"text\",\"text\":\"ok\"}]}')", encoding="utf-8")
+
+    update = {
+        "update_id": 703,
+        "channel_post": {
+            "message_id": 83,
+            "chat": {"id": -1001, "type": "channel", "username": "srcchan"},
+            "text": "hello",
+        },
+    }
+    settings = _settings(tmp_path)
+    settings.log_channel_target = "@logchan"
+    route = ChannelRoute(
+        name="r-dest-link-rid",
+        enabled=True,
+        source_channel_id="-1001",
+        source_channel_username="@srcchan",
+        destination_channel_id=None,
+        destination_channel_username="@bayern_munich_ir",
+        channel_script="-1001.py",
+        max_message_mb=10,
+    )
+    tg = FakeTelegramClient([update], b"")
+    bale = RidBaleClient()
+    service = KiwiService(
+        settings=settings,
+        routes=_route_registry(route),
+        telegram_client=tg,
+        bale_client=bale,
+        storage=StorageManager(settings.storage_dir),
+        guard_runner=GuardRunner(settings.gaurd_scripts_dir, timeout_sec=5),
+        script_runner=ScriptRunner(settings.scripts_dir, timeout_sec=5),
+        state_store=StateStore(settings.state_path),
+    )
+    processed = asyncio.run(service.run_once())
+    assert processed == 1
+    assert any(
+        "📨 Destination Link: https://ble.ir/bayern_munich_ir/4985031728703449716/1779658729000" in text
+        for _, text in tg.audit_messages
+    )
 
 
 def test_service_handles_admin_private_commands(tmp_path: Path) -> None:
@@ -2925,7 +3365,7 @@ def test_service_sync_ledger_dedupes_same_message_after_sent(tmp_path: Path) -> 
     assert bale.sent == [("-2001", "hello\n-2001")]
 
 
-def test_service_sync_treats_ambiguous_as_retryable_failed(tmp_path: Path) -> None:
+def test_service_sync_marks_ambiguous_for_review_without_auto_retry(tmp_path: Path) -> None:
     channels_path = tmp_path / "channels.json"
     channels_path.write_text(
         json.dumps(
@@ -2980,9 +3420,10 @@ def test_service_sync_treats_ambiguous_as_retryable_failed(tmp_path: Path) -> No
     key = service.sync_ledger.dedupe_key(route.name, incoming.source_channel_id, incoming.message_id, None)  # noqa: SLF001
     record = service.sync_ledger.get_record(key)  # noqa: SLF001
     assert record is not None
-    assert record.status == "retry_wait"
+    assert record.status == "ambiguous"
     reviews = service.sync_ledger.list_review(limit=10, only_open=True)  # noqa: SLF001
-    assert len(reviews) == 0
+    assert len(reviews) == 1
+    assert str(reviews[0].get("dedupe_key") or "") == key
 
 
 def test_service_sync_does_not_seed_checkpoint_from_stored_messages(tmp_path: Path) -> None:
@@ -3301,6 +3742,72 @@ def test_service_run_once_continues_with_telethon_when_get_updates_fails(tmp_pat
     assert "hello-from-telethon" in bale.sent[0][1]
 
 
+def test_service_run_once_telethon_poll_timeout_does_not_hang(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    settings.telegram_source_mode = "telethon"
+    settings.telethon_enabled = True
+    route = ChannelRoute(
+        name="telethon-timeout-route",
+        enabled=True,
+        source_channel_id="-100777",
+        source_channel_username="@timeout_src",
+        destination_channel_id="-2001",
+        destination_channel_username=None,
+        channel_script=None,
+        max_message_mb=10,
+    )
+    tg = FakeTelegramClient([], b"")
+    bale = FakeBaleClient()
+    source = HangingTelethonSourceClient()
+    service = KiwiService(
+        settings=settings,
+        routes=_route_registry(route),
+        telegram_client=tg,
+        bale_client=bale,
+        source_client=source,
+        storage=StorageManager(settings.storage_dir),
+        guard_runner=GuardRunner(settings.gaurd_scripts_dir, timeout_sec=5),
+        script_runner=ScriptRunner(settings.scripts_dir, timeout_sec=5),
+        state_store=StateStore(settings.state_path),
+    )
+    service._telethon_poll_timeout_sec = 0.01  # noqa: SLF001
+
+    processed = asyncio.run(asyncio.wait_for(service.run_once(), timeout=1.5))
+    assert processed == 0
+    assert bale.sent == []
+
+
+def test_service_run_once_ignores_state_offset_write_permission_error(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    route = ChannelRoute(
+        name="state-perm-route",
+        enabled=True,
+        source_channel_id="-100888",
+        source_channel_username="@state_src",
+        destination_channel_id="-2001",
+        destination_channel_username=None,
+        channel_script=None,
+        max_message_mb=10,
+    )
+    tg = FakeTelegramClient([{"update_id": 101}], b"")
+    bale = FakeBaleClient()
+    service = KiwiService(
+        settings=settings,
+        routes=_route_registry(route),
+        telegram_client=tg,
+        bale_client=bale,
+        storage=StorageManager(settings.storage_dir),
+        guard_runner=GuardRunner(settings.gaurd_scripts_dir, timeout_sec=5),
+        script_runner=ScriptRunner(settings.scripts_dir, timeout_sec=5),
+        state_store=StateStore(settings.state_path),
+    )
+
+    with patch.object(service.state_store, "save_offset", side_effect=PermissionError("no write permission")):
+        processed = asyncio.run(service.run_once())
+
+    assert processed == 0
+
+
 def test_service_classifies_download_timeout_as_retryable(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
     route = ChannelRoute(
@@ -3354,6 +3861,36 @@ def test_service_dispatch_http_500_is_not_ambiguous(tmp_path: Path) -> None:
             'sendDocument HTTP 500: {"ok":false,"error_code":500,"description":"Internal Error: failed to upload file bytes"}'
         )
         is False
+    )
+
+
+def test_service_dispatch_send_media_group_http_500_is_ambiguous(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    route = ChannelRoute(
+        name="dispatch-http500-media-group",
+        enabled=True,
+        source_channel_id="-1001",
+        source_channel_username=None,
+        destination_channel_id="-2001",
+        destination_channel_username=None,
+        channel_script=None,
+        max_message_mb=10,
+    )
+    service = KiwiService(
+        settings=settings,
+        routes=_route_registry(route),
+        telegram_client=FakeTelegramClient([], b""),
+        bale_client=FakeBaleClient(),
+        storage=StorageManager(settings.storage_dir),
+        guard_runner=GuardRunner(settings.gaurd_scripts_dir, timeout_sec=5),
+        script_runner=ScriptRunner(settings.scripts_dir, timeout_sec=5),
+        state_store=StateStore(settings.state_path),
+    )
+    assert (
+        service._is_ambiguous_dispatch_error_text(  # noqa: SLF001
+            'sendMediaGroup HTTP 500: {"ok":false,"error_code":500,"description":"Internal Error: failed to upload file bytes"}'
+        )
+        is True
     )
 
 
@@ -3534,10 +4071,53 @@ def test_service_dispatch_timeout_is_ambiguous(tmp_path: Path) -> None:
     assert service._is_ambiguous_dispatch_error_text("sendDocument network error: ReadTimeout") is True  # noqa: SLF001
 
 
+def test_service_dispatch_timeout_returns_ambiguous_status(tmp_path: Path) -> None:
+    class TimeoutSendMessageBaleClient(FakeBaleClient):
+        async def send_message(self, chat_id: str, text: str, reply_markup: dict | None = None):  # noqa: ARG002
+            raise PlatformApiError("sendMessage network error: ReadTimeout")
+
+    settings = _settings(tmp_path)
+    route = ChannelRoute(
+        name="dispatch-timeout-detailed",
+        enabled=True,
+        source_channel_id="-1001",
+        source_channel_username=None,
+        destination_channel_id="-2001",
+        destination_channel_username=None,
+        channel_script=None,
+        max_message_mb=10,
+    )
+    service = KiwiService(
+        settings=settings,
+        routes=_route_registry(route),
+        telegram_client=FakeTelegramClient([], b""),
+        bale_client=TimeoutSendMessageBaleClient(),
+        storage=StorageManager(settings.storage_dir),
+        guard_runner=GuardRunner(settings.gaurd_scripts_dir, timeout_sec=5),
+        script_runner=ScriptRunner(settings.scripts_dir, timeout_sec=5),
+        state_store=StateStore(settings.state_path),
+    )
+    incoming = IncomingChannelMessage(
+        update_id=3541,
+        source_channel_id="-1001",
+        source_channel_username=None,
+        message_id=3541,
+        date=None,
+        text="hello",
+        caption=None,
+        medias=[],
+        raw={},
+        media_group_id=None,
+    )
+    status, error = asyncio.run(service._process_route_message_detailed(incoming, route))  # noqa: SLF001
+    assert status == "ambiguous"
+    assert "readtimeout" in str(error).lower()
+
+
 def test_service_media_cache_reuses_file_across_route_retries(tmp_path: Path, monkeypatch) -> None:
-    class TimeoutPhotoBaleClient(FakeBaleClient):
+    class RetryablePhotoBaleClient(FakeBaleClient):
         async def send_photo(self, chat_id: str, photo_path: Path, caption: str | None = None):
-            raise PlatformApiError("sendPhoto network error: ReadTimeout: ")
+            raise PlatformApiError("sendPhoto HTTP 500: failed to upload file bytes")
 
     monkeypatch.setenv("SYNC_MEDIA_CACHE_ENABLED", "true")
     monkeypatch.setenv("SYNC_MEDIA_CACHE_TTL_SEC", "86400")
@@ -3558,7 +4138,7 @@ def test_service_media_cache_reuses_file_across_route_retries(tmp_path: Path, mo
         settings=settings,
         routes=_route_registry(route),
         telegram_client=tg,
-        bale_client=TimeoutPhotoBaleClient(),
+        bale_client=RetryablePhotoBaleClient(),
         storage=StorageManager(settings.storage_dir),
         guard_runner=GuardRunner(settings.gaurd_scripts_dir, timeout_sec=5),
         script_runner=ScriptRunner(settings.scripts_dir, timeout_sec=5),

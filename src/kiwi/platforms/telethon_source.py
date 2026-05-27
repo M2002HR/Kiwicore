@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import re
 import shutil
 from pathlib import Path
 from typing import Any
@@ -13,6 +14,23 @@ from kiwi.types import ChannelRoute, IncomingChannelMessage, IncomingMedia, Medi
 from kiwi.utils import normalize_channel_id, normalize_channel_username
 
 logger = logging.getLogger(__name__)
+
+_PUBLIC_TME_LINK_RE = re.compile(
+    r"^(?:https?://)?(?:t\.me|telegram\.me|telegram\.dog)/([A-Za-z0-9_]{5,})(?:/.*)?$",
+    re.IGNORECASE,
+)
+_PRIVATE_TME_LINK_RE = re.compile(
+    r"^(?:https?://)?(?:t\.me|telegram\.me|telegram\.dog)/c/(\d+)(?:/.*)?$",
+    re.IGNORECASE,
+)
+_PUBLIC_TME_TOPIC_LINK_RE = re.compile(
+    r"^(?:https?://)?(?:t\.me|telegram\.me|telegram\.dog)/([A-Za-z0-9_]{5,})/(\d+)(?:/(\d+))?(?:[?#].*)?$",
+    re.IGNORECASE,
+)
+_PRIVATE_TME_TOPIC_LINK_RE = re.compile(
+    r"^(?:https?://)?(?:t\.me|telegram\.me|telegram\.dog)/c/(\d+)/(\d+)(?:/(\d+))?(?:[?#].*)?$",
+    re.IGNORECASE,
+)
 
 
 class TelethonSourceClient:
@@ -123,6 +141,12 @@ class TelethonSourceClient:
     def route_source_key(self, route: ChannelRoute) -> str | None:
         return self._route_source_key(route)
 
+    def route_cursor_key(self, route: ChannelRoute) -> str | None:
+        source_key = self._route_source_key(route)
+        if not source_key:
+            return None
+        return self._cursor_key(source_key, topic_id=self._route_topic_id(route))
+
     def prime_cursor(self, source_key: str, message_id: int) -> None:
         key = str(source_key or "").strip()
         if not key:
@@ -137,10 +161,7 @@ class TelethonSourceClient:
         self._last_message_id[key] = max(int(current), seeded)
 
     def reset_route_cursor(self, route: ChannelRoute) -> dict[str, object]:
-        source_key = self._route_source_key(route)
-        if source_key is None:
-            return {"source_key": None, "cleared_cursor": False}
-        key = str(source_key or "").strip()
+        key = self.route_cursor_key(route)
         if not key:
             return {"source_key": None, "cleared_cursor": False}
 
@@ -160,72 +181,116 @@ class TelethonSourceClient:
         await self._ensure_connected()
         assert self._client is not None
 
-        sources: dict[str, tuple[str | None, str | None, list[str]]] = {}
+        sources: dict[str, dict[str, object]] = {}
         for route in routes:
             if route.is_deactive():
                 continue
             source_key = self._route_source_key(route)
             if source_key is None:
                 continue
-            existing = sources.get(source_key)
+            topic_id = self._route_topic_id(route)
+            cursor_key = self._cursor_key(source_key, topic_id=topic_id)
+            existing = sources.get(cursor_key)
             if existing is None:
-                sources[source_key] = (route.source_channel_username, route.source_channel_id, [route.name])
+                sources[cursor_key] = {
+                    "source_key": source_key,
+                    "topic_id": topic_id,
+                    "username": route.source_channel_username,
+                    "channel_id": route.source_channel_id,
+                    "route_names": [route.name],
+                }
             else:
-                names = list(existing[2])
+                names = list(existing.get("route_names") or [])
                 if route.name not in names:
                     names.append(route.name)
-                channel_id = existing[1] or route.source_channel_id
-                sources[source_key] = (existing[0], channel_id, names)
+                channel_id = existing.get("channel_id") or route.source_channel_id
+                existing["channel_id"] = channel_id
+                existing["route_names"] = names
 
         out: list[IncomingChannelMessage] = []
-        for source_key, (username, channel_id, route_names) in sources.items():
+        for cursor_key, scope in sources.items():
+            source_key = str(scope.get("source_key") or "").strip()
+            if not source_key:
+                continue
+            topic_id_raw = scope.get("topic_id")
+            try:
+                topic_id = int(topic_id_raw) if topic_id_raw is not None else 0
+            except Exception:
+                topic_id = 0
+            if topic_id <= 0:
+                topic_id = None
+            username = scope.get("username")
+            channel_id = scope.get("channel_id")
+            route_names = [str(item) for item in (scope.get("route_names") or []) if str(item).strip()]
+
             now = asyncio.get_running_loop().time()
-            retry_after = float(self._resolve_retry_after.get(source_key) or 0.0)
+            retry_after = float(self._resolve_retry_after.get(cursor_key) or 0.0)
             if retry_after > now:
                 continue
             try:
                 entity = await self._resolve_entity(source_key, username=username, channel_id=channel_id)
-                if source_key not in self._last_message_id:
+                if cursor_key not in self._last_message_id:
                     # First poll must not replay historical channel content.
                     # Initialize cursor at the latest message id and start from there.
-                    self._last_message_id[source_key] = await self._latest_message_id(entity)
+                    if topic_id is not None:
+                        self._last_message_id[cursor_key] = await self._latest_message_id_for_topic(entity, topic_id)
+                    else:
+                        self._last_message_id[cursor_key] = await self._latest_message_id(entity)
                     continue
 
-                min_id = int(self._last_message_id.get(source_key) or 0)
+                min_id = int(self._last_message_id.get(cursor_key) or 0)
                 max_seen = min_id
 
-                async for msg in self._client.iter_messages(
-                    entity,
-                    min_id=min_id,
-                    limit=self.poll_batch_size,
-                    reverse=True,
-                ):
+                if topic_id is None:
+                    messages_iter = self._client.iter_messages(
+                        entity,
+                        min_id=min_id,
+                        limit=self.poll_batch_size,
+                        reverse=True,
+                    )
+                    raw_messages = []
+                    async for msg in messages_iter:
+                        raw_messages.append(msg)
+                else:
+                    raw_messages = await self._get_topic_messages_since(
+                        entity,
+                        topic_id=topic_id,
+                        min_id=min_id,
+                        limit=self.poll_batch_size,
+                    )
+
+                for msg in raw_messages:
                     message_id = int(getattr(msg, "id", 0) or 0)
                     if message_id <= 0:
                         continue
                     if message_id > max_seen:
                         max_seen = message_id
-                    parsed = await self._to_incoming(msg, source_key=source_key, source_username=username)
+                    parsed = await self._to_incoming(
+                        msg,
+                        source_key=source_key,
+                        source_username=username,
+                        route_scope_names=route_names,
+                    )
                     if parsed is not None:
                         out.append(parsed)
 
                 if max_seen > min_id:
-                    self._last_message_id[source_key] = max_seen
-                self._resolve_retry_after.pop(source_key, None)
-                self._resolve_last_warn_at.pop(source_key, None)
+                    self._last_message_id[cursor_key] = max_seen
+                self._resolve_retry_after.pop(cursor_key, None)
+                self._resolve_last_warn_at.pop(cursor_key, None)
             except Exception as exc:
                 if self._is_unresolvable_entity_error(exc):
                     # Back off repeated resolution attempts for invalid/missing channels.
-                    self._resolve_retry_after[source_key] = now + 300.0
-                    last_warn_at = float(self._resolve_last_warn_at.get(source_key) or 0.0)
+                    self._resolve_retry_after[cursor_key] = now + 300.0
+                    last_warn_at = float(self._resolve_last_warn_at.get(cursor_key) or 0.0)
                     if (now - last_warn_at) >= 300.0:
-                        self._resolve_last_warn_at[source_key] = now
+                        self._resolve_last_warn_at[cursor_key] = now
                         logger.warning(
                             "Telethon source resolve failed; route temporarily paused",
                             extra={
                                 "details": {
                                     "routes": route_names,
-                                    "source_key": source_key,
+                                    "source_key": cursor_key,
                                     "source_username": username,
                                     "source_channel_id": channel_id,
                                     "retry_in_sec": 300,
@@ -239,7 +304,7 @@ class TelethonSourceClient:
                         extra={
                             "details": {
                                 "routes": route_names,
-                                "source_key": source_key,
+                                "source_key": cursor_key,
                                 "source_username": username,
                                 "source_channel_id": channel_id,
                                 "resolve_strategy": "username_then_channel_id_then_numeric_source_key",
@@ -258,6 +323,7 @@ class TelethonSourceClient:
         source_key = self._route_source_key(route)
         if source_key is None:
             return []
+        cursor_key = self.route_cursor_key(route) or source_key
 
         entity = await self._resolve_entity(
             source_key,
@@ -267,23 +333,32 @@ class TelethonSourceClient:
 
         take = max(0, int(limit))
         if take <= 0:
-            self._last_message_id[source_key] = max(
-                int(self._last_message_id.get(source_key) or 0),
+            self._last_message_id[cursor_key] = max(
+                int(self._last_message_id.get(cursor_key) or 0),
                 await self._latest_message_id(entity),
             )
             return []
 
-        batch = await self._client.get_messages(entity, limit=take)
+        source_topic_id = int(route.source_topic_id or 0)
+        topic_only = source_topic_id > 0
+        try:
+            if topic_only:
+                batch = await self._client.get_messages(entity, limit=take, reply_to=source_topic_id)
+            else:
+                batch = await self._client.get_messages(entity, limit=take)
+        except TypeError:
+            # Some fake/older clients may not support reply_to parameter.
+            batch = await self._client.get_messages(entity, limit=take)
         messages = list(batch or [])
         if not messages:
-            self._last_message_id[source_key] = max(
-                int(self._last_message_id.get(source_key) or 0),
+            self._last_message_id[cursor_key] = max(
+                int(self._last_message_id.get(cursor_key) or 0),
                 await self._latest_message_id(entity),
             )
             return []
 
         parsed: list[IncomingChannelMessage] = []
-        max_seen = int(self._last_message_id.get(source_key) or 0)
+        max_seen = int(self._last_message_id.get(cursor_key) or 0)
         messages.sort(key=lambda msg: int(getattr(msg, "id", 0) or 0))
         for msg in messages:
             message_id = int(getattr(msg, "id", 0) or 0)
@@ -295,9 +370,11 @@ class TelethonSourceClient:
                 source_username=route.source_channel_username,
             )
             if incoming is not None:
+                if topic_only and int(incoming.source_topic_id or 0) != source_topic_id:
+                    continue
                 parsed.append(incoming)
 
-        self._last_message_id[source_key] = max_seen
+        self._last_message_id[cursor_key] = max_seen
         return self._collapse_media_groups_for_seed(parsed)
 
     async def latest_message_id_for_route(self, route: ChannelRoute) -> int:
@@ -310,6 +387,19 @@ class TelethonSourceClient:
             username=route.source_channel_username,
             channel_id=route.source_channel_id,
         )
+        source_topic_id = int(route.source_topic_id or 0)
+        if source_topic_id > 0:
+            try:
+                latest_topic = await self._client.get_messages(entity, limit=1, reply_to=source_topic_id)
+            except TypeError:
+                latest_topic = None
+            if isinstance(latest_topic, list):
+                if latest_topic:
+                    return int(getattr(latest_topic[0], "id", 0) or 0)
+            elif latest_topic is not None:
+                topic_id = int(getattr(latest_topic, "id", 0) or 0)
+                if topic_id > 0:
+                    return topic_id
         return await self._latest_message_id(entity)
 
     async def expand_media_group(
@@ -471,6 +561,40 @@ class TelethonSourceClient:
             item = latest[0]
             return int(getattr(item, "id", 0) or 0)
         return int(getattr(latest, "id", 0) or 0)
+
+    async def _latest_message_id_for_topic(self, entity: Any, topic_id: int) -> int:
+        try:
+            latest_topic = await self._client.get_messages(entity, limit=1, reply_to=int(topic_id))
+        except TypeError:
+            latest_topic = None
+        if isinstance(latest_topic, list):
+            if latest_topic:
+                return int(getattr(latest_topic[0], "id", 0) or 0)
+            return 0
+        if latest_topic is None:
+            return 0
+        return int(getattr(latest_topic, "id", 0) or 0)
+
+    async def _get_topic_messages_since(self, entity: Any, *, topic_id: int, min_id: int, limit: int) -> list[Any]:
+        take = max(1, int(limit))
+        try:
+            fetched = await self._client.get_messages(entity, limit=take, min_id=max(0, int(min_id)), reply_to=int(topic_id))
+            if isinstance(fetched, list):
+                messages = list(fetched)
+            elif fetched is None:
+                messages = []
+            else:
+                messages = [fetched]
+        except TypeError:
+            fetched = await self._client.get_messages(entity, limit=max(take * 3, 24), reply_to=int(topic_id))
+            if isinstance(fetched, list):
+                messages = [msg for msg in fetched if int(getattr(msg, "id", 0) or 0) > int(min_id)]
+            elif fetched is None:
+                messages = []
+            else:
+                messages = [fetched] if int(getattr(fetched, "id", 0) or 0) > int(min_id) else []
+        messages.sort(key=lambda msg: int(getattr(msg, "id", 0) or 0))
+        return messages[:take]
 
     async def _ensure_connected(self) -> None:
         if self._client is not None:
@@ -684,6 +808,7 @@ class TelethonSourceClient:
         *,
         source_key: str,
         source_username: str | None,
+        route_scope_names: list[str] | None = None,
     ) -> IncomingChannelMessage | None:
         message_id = int(getattr(msg, "id", 0) or 0)
         if message_id <= 0:
@@ -705,6 +830,7 @@ class TelethonSourceClient:
         mime_type = str(getattr(file_obj, "mime_type", "") or "").strip() or None
         duration = getattr(file_obj, "duration", None)
         duration_int = int(duration) if duration is not None else None
+        audio_title, audio_performer = self._extract_audio_metadata(msg)
 
         media_kind: MediaKind | None = None
         if getattr(msg, "photo", None) is not None:
@@ -733,6 +859,8 @@ class TelethonSourceClient:
                     file_name=file_name,
                     mime_type=mime_type,
                     duration=duration_int,
+                    title=audio_title if media_kind == MediaKind.AUDIO else None,
+                    performer=audio_performer if media_kind == MediaKind.AUDIO else None,
                     source="telethon",
                     source_ref={"source_key": source_key, "message_id": message_id},
                 )
@@ -742,6 +870,7 @@ class TelethonSourceClient:
         media_group_id = str(grouped_id).strip() if grouped_id is not None else None
         if media_group_id == "":
             media_group_id = None
+        source_topic_id = self._extract_source_topic_id(msg)
 
         has_media = len(medias) > 0
         text = None if has_media else (text_raw or None)
@@ -749,6 +878,10 @@ class TelethonSourceClient:
 
         ts = getattr(msg, "date", None)
         date_unix = int(ts.timestamp()) if ts is not None else None
+
+        raw: dict[str, object] = {"telethon": True, "source_key": source_key, "message_id": message_id}
+        if route_scope_names:
+            raw["route_scope_names"] = [str(item) for item in route_scope_names if str(item).strip()]
 
         return IncomingChannelMessage(
             update_id=message_id,
@@ -759,9 +892,35 @@ class TelethonSourceClient:
             text=text,
             caption=caption,
             medias=medias,
-            raw={"telethon": True, "source_key": source_key, "message_id": message_id},
+            raw=raw,
             media_group_id=media_group_id,
+            source_topic_id=source_topic_id,
         )
+
+    @staticmethod
+    def _extract_audio_metadata(msg: Any) -> tuple[str | None, str | None]:
+        audio_obj = getattr(msg, "audio", None)
+        if audio_obj is None:
+            return (None, None)
+
+        title = str(getattr(audio_obj, "title", "") or "").strip() or None
+        performer = str(getattr(audio_obj, "performer", "") or "").strip() or None
+        if title or performer:
+            return (title, performer)
+
+        attrs = getattr(audio_obj, "attributes", None)
+        if not isinstance(attrs, list):
+            return (None, None)
+
+        for attr in attrs:
+            cls_name = str(getattr(attr.__class__, "__name__", "") or "").lower()
+            if "documentattributeaudio" not in cls_name:
+                continue
+            attr_title = str(getattr(attr, "title", "") or "").strip() or None
+            attr_performer = str(getattr(attr, "performer", "") or "").strip() or None
+            if attr_title or attr_performer:
+                return (attr_title, attr_performer)
+        return (None, None)
 
     @staticmethod
     def _merge_media_group_members(messages: list[IncomingChannelMessage]) -> IncomingChannelMessage:
@@ -797,7 +956,35 @@ class TelethonSourceClient:
                 "group_message_end_id": int(max(group_ids)),
             },
             media_group_id=first.media_group_id,
+            source_topic_id=first.source_topic_id or next((m.source_topic_id for m in ordered if m.source_topic_id), None),
         )
+
+    @staticmethod
+    def _extract_source_topic_id(msg: Any) -> int | None:
+        reply_to = getattr(msg, "reply_to", None)
+        if reply_to is None:
+            return None
+
+        top_id_raw = getattr(reply_to, "reply_to_top_id", None)
+        try:
+            top_id = int(top_id_raw or 0)
+        except Exception:
+            top_id = 0
+        if top_id > 0:
+            return top_id
+
+        # In forum topics, non-reply messages can have forum_topic=true and only
+        # reply_to_msg_id set to the topic root id.
+        forum_topic = bool(getattr(reply_to, "forum_topic", False))
+        msg_id_raw = getattr(reply_to, "reply_to_msg_id", None)
+        try:
+            reply_to_msg_id = int(msg_id_raw or 0)
+        except Exception:
+            reply_to_msg_id = 0
+        if forum_topic and reply_to_msg_id > 0:
+            return reply_to_msg_id
+
+        return None
 
     @classmethod
     def _collapse_media_groups_for_seed(cls, messages: list[IncomingChannelMessage]) -> list[IncomingChannelMessage]:
@@ -861,11 +1048,87 @@ class TelethonSourceClient:
         raw_username = str(route.source_channel_username or "").strip()
         lowered = raw_username.lower()
         if lowered.startswith("https://t.me/") or lowered.startswith("http://t.me/") or lowered.startswith("t.me/"):
-            return raw_username
+            parsed = TelethonSourceClient._source_key_from_tme_link(raw_username)
+            if parsed:
+                return parsed
         if route.source_channel_username:
             return normalize_channel_username(route.source_channel_username)
+
+        raw_channel_id = str(route.source_channel_id or "").strip()
+        lowered_channel_id = raw_channel_id.lower()
+        if lowered_channel_id.startswith("https://t.me/") or lowered_channel_id.startswith("http://t.me/") or lowered_channel_id.startswith("t.me/"):
+            parsed = TelethonSourceClient._source_key_from_tme_link(raw_channel_id)
+            if parsed:
+                return parsed
         if route.source_channel_id:
             return normalize_channel_id(route.source_channel_id)
+        return None
+
+    @staticmethod
+    def _route_topic_id(route: ChannelRoute) -> int | None:
+        try:
+            topic_id = int(route.source_topic_id) if route.source_topic_id is not None else 0
+        except Exception:
+            topic_id = 0
+        if topic_id <= 0:
+            source_topic = TelethonSourceClient._topic_id_from_tme_link(str(route.source_channel_username or "").strip())
+            if source_topic is None:
+                source_topic = TelethonSourceClient._topic_id_from_tme_link(str(route.source_channel_id or "").strip())
+            topic_id = int(source_topic or 0)
+        return topic_id if topic_id > 0 else None
+
+    @staticmethod
+    def _cursor_key(source_key: str, topic_id: int | None) -> str:
+        base = str(source_key or "").strip()
+        if not base:
+            return ""
+        if topic_id is None:
+            return base
+        return f"{base}|topic:{int(topic_id)}"
+
+    @staticmethod
+    def _source_key_from_tme_link(value: str) -> str | None:
+        text = str(value or "").strip()
+        if not text:
+            return None
+
+        m_private = _PRIVATE_TME_LINK_RE.match(text)
+        if m_private:
+            try:
+                cid = int(m_private.group(1))
+            except Exception:
+                cid = 0
+            if cid > 0:
+                return normalize_channel_id(f"-100{cid}")
+
+        m_public = _PUBLIC_TME_LINK_RE.match(text)
+        if m_public:
+            return normalize_channel_username(m_public.group(1))
+
+        return None
+
+    @staticmethod
+    def _topic_id_from_tme_link(value: str) -> int | None:
+        text = str(value or "").strip()
+        if not text:
+            return None
+
+        m_private = _PRIVATE_TME_TOPIC_LINK_RE.match(text)
+        if m_private:
+            try:
+                topic_id = int(m_private.group(2))
+            except Exception:
+                topic_id = 0
+            return topic_id if topic_id > 0 else None
+
+        m_public = _PUBLIC_TME_TOPIC_LINK_RE.match(text)
+        if m_public:
+            try:
+                topic_id = int(m_public.group(2))
+            except Exception:
+                topic_id = 0
+            return topic_id if topic_id > 0 else None
+
         return None
 
 

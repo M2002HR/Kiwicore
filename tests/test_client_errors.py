@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 
 import httpx
@@ -137,7 +138,7 @@ def test_send_file_no_retry_on_non_transient_error(tmp_path: Path, monkeypatch: 
     assert client.client.calls == 1
 
 
-def test_send_media_group_retries_on_transient_upload_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_send_media_group_does_not_retry_on_transient_upload_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     async def no_sleep(*args, **kwargs):
         return None
 
@@ -159,17 +160,55 @@ def test_send_media_group_retries_on_transient_upload_error(tmp_path: Path, monk
     p1.write_bytes(b"a")
     p2.write_bytes(b"b")
 
-    result = asyncio.run(
-        client.send_media_group(
-            "@dest",
-            [
-                {"type": "audio", "path": p1, "caption": "cap"},
-                {"type": "audio", "path": p2},
-            ],
+    with pytest.raises(PlatformApiError):
+        asyncio.run(
+            client.send_media_group(
+                "@dest",
+                [
+                    {"type": "audio", "path": p1, "caption": "cap"},
+                    {"type": "audio", "path": p2},
+                ],
+            )
         )
+    assert client.client.calls == 1
+
+
+def test_send_media_group_does_not_retry_on_ambiguous_network_timeout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def no_sleep(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr("kiwi.platforms.client.asyncio.sleep", no_sleep)
+
+    client = BotApiClient(
+        token="t",
+        api_base_url="https://api.telegram.org",
+        file_base_url="https://api.telegram.org/file",
     )
-    assert isinstance(result, list)
-    assert client.client.calls == 2
+    client.client = SequencedHttpClient(
+        [
+            httpx.ReadTimeout("timeout"),
+            _ok_response([{"message_id": 11}, {"message_id": 12}]),
+        ]
+    )
+    p1 = tmp_path / "a.mp3"
+    p2 = tmp_path / "b.mp3"
+    p1.write_bytes(b"a")
+    p2.write_bytes(b"b")
+
+    with pytest.raises(PlatformApiError):
+        asyncio.run(
+            client.send_media_group(
+                "@dest",
+                [
+                    {"type": "audio", "path": p1, "caption": "cap"},
+                    {"type": "audio", "path": p2},
+                ],
+            )
+        )
+    assert client.client.calls == 1
 
 
 def test_send_message_sets_markdown_parse_mode_for_inline_links() -> None:
@@ -221,6 +260,28 @@ def test_send_message_sets_html_parse_mode_for_inline_html_links() -> None:
     payload = recorder.calls[0].get("json")
     assert isinstance(payload, dict)
     assert payload.get("parse_mode") == "HTML"
+
+
+def test_send_photo_serializes_reply_markup(tmp_path: Path) -> None:
+    client = BotApiClient(
+        token="t",
+        api_base_url="https://api.telegram.org",
+        file_base_url="https://api.telegram.org/file",
+    )
+    recorder = RecordingHttpClient(_ok_response({"message_id": 8}))
+    client.client = recorder
+
+    photo_path = tmp_path / "x.jpg"
+    photo_path.write_bytes(b"abc")
+    markup = {"inline_keyboard": [[{"text": "go", "url": "https://ble.ir/pirashki_bot?start=pp_x"}]]}
+
+    asyncio.run(client.send_photo("@dest", photo_path, caption="cap", reply_markup=markup))
+    assert recorder.calls
+    data = recorder.calls[0].get("data")
+    assert isinstance(data, dict)
+    assert "reply_markup" in data
+    parsed = json.loads(str(data["reply_markup"]))
+    assert parsed == markup
 
 
 def test_send_photo_sets_html_parse_mode_for_inline_html_link_caption(tmp_path: Path) -> None:

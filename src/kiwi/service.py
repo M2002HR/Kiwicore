@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import inspect
 import json
@@ -27,7 +28,7 @@ from kiwi.script_runner import ScriptRunner
 from kiwi.state import StateStore
 from kiwi.storage import StorageManager
 from kiwi.sync_ledger import SyncLedger, TERMINAL_STATUSES
-from kiwi.sync_queue import InMemorySyncQueue, SyncQueueBackend, payload_hash_from_json
+from kiwi.sync_queue import InMemorySyncQueue, QueueItem, SyncQueueBackend, payload_hash_from_json
 from kiwi.traffic_history import TrafficHistory
 from kiwi.types import (
     AdminInboundMessage,
@@ -105,15 +106,25 @@ class KiwiService:
         self._pending_media_groups: dict[tuple[str, str, str], dict[str, object]] = {}
         self._retry_queue_hydrated = False
         self._sync_drain_task: asyncio.Task[int] | None = None
-        self._sync_next_due_at: dict[str, float] = {}
+        self._sync_next_due_at: dict[str, float] = self.state_store.load_sync_next_due_map()
         self._next_stale_recover_at = 0.0
         self._started_at_ts = time.time()
         self._run_id = str(uuid4())
         self._run_once_calls = 0
         self._processed_messages_total = 0
         self._last_run_once_ts: float | None = None
+        self._last_state_save_error_at: float = 0.0
         self._consecutive_poll_errors = 0
         self._last_poll_error: str | None = None
+        self._sync_drain_timeout_sec = float(
+            self._read_bounded_int_env("SYNC_DRAIN_TIMEOUT_SEC", default=240, low=20, high=3600)
+        )
+        self._run_once_timeout_sec = float(
+            self._read_bounded_int_env("SYNC_RUN_ONCE_TIMEOUT_SEC", default=420, low=60, high=7200)
+        )
+        self._telethon_poll_timeout_sec = float(
+            self._read_bounded_int_env("TELETHON_POLL_TIMEOUT_SEC", default=90, low=10, high=1200)
+        )
         self._traffic_lock = threading.RLock()
         self._traffic_total_download_bytes = 0
         self._traffic_total_upload_bytes = 0
@@ -128,6 +139,7 @@ class KiwiService:
             started_at_ts=self._started_at_ts,
         )
         self.message_monitor = MessageMonitor()
+        self._recover_missing_sync_due_from_ledger()
 
     @staticmethod
     def _read_bounded_int_env(name: str, *, default: int, low: int, high: int) -> int:
@@ -137,6 +149,30 @@ class KiwiService:
         except Exception:
             value = default
         return max(low, min(high, value))
+
+    def _recover_missing_sync_due_from_ledger(self) -> None:
+        now = time.time()
+        changed = False
+        for route in self.routes.routes:
+            if not route.is_syncing():
+                continue
+            if route.name in self._sync_next_due_at:
+                continue
+            latest_sent_at = self.sync_ledger.latest_sent_at_for_route(route.name)
+            if latest_sent_at is None:
+                continue
+            interval_sec = max(1, int(route.sync_interval_sec))
+            next_due = float(latest_sent_at) + float(interval_sec)
+            if next_due <= now:
+                continue
+            self._sync_next_due_at[route.name] = next_due
+            changed = True
+        if not changed:
+            return
+        try:
+            self.state_store.save_sync_next_due_map(self._sync_next_due_at)
+        except Exception:
+            logger.exception("Failed to persist recovered sync next-due map")
 
     async def stop(self) -> None:
         self._stop_event.set()
@@ -154,7 +190,11 @@ class KiwiService:
         try:
             while not self._stop_event.is_set():
                 try:
-                    updates_count = await self.run_once()
+                    run_once_timeout = max(
+                        self._run_once_timeout_sec,
+                        float(self.settings.telegram_poll_timeout_sec) + 90.0,
+                    )
+                    updates_count = await asyncio.wait_for(self.run_once(), timeout=run_once_timeout)
                     self._run_once_calls += 1
                     self._processed_messages_total += max(0, int(updates_count))
                     self._last_run_once_ts = time.time()
@@ -168,6 +208,22 @@ class KiwiService:
                             await asyncio.sleep(self.settings.poll_idle_sleep_sec)
                 except asyncio.CancelledError:
                     raise
+                except asyncio.TimeoutError:
+                    self._consecutive_poll_errors += 1
+                    self._last_poll_error = "run_once_timeout"
+                    delay = min(self.settings.poll_error_sleep_sec * self._consecutive_poll_errors, 60.0)
+                    logger.error(
+                        "Polling loop timed out; retrying",
+                        extra={
+                            "details": {
+                                "retry_in_sec": delay,
+                                "consecutive_errors": self._consecutive_poll_errors,
+                                "run_once_timeout_sec": run_once_timeout,
+                            }
+                        },
+                    )
+                    await self._cancel_stuck_sync_drain_task()
+                    await asyncio.sleep(delay)
                 except PlatformApiError as exc:
                     self._consecutive_poll_errors += 1
                     self._last_poll_error = str(exc)
@@ -209,7 +265,7 @@ class KiwiService:
         backlog_before_poll = await self._sync_queue_depth_safe()
         if backlog_before_poll > 0:
             # Keep sync backlog moving even when Bot API long-poll waits for updates.
-            processed_pre += await self._tick_sync_drain()
+            processed_pre += await self._safe_tick_sync_drain()
             backlog_before_poll = await self._sync_queue_depth_safe()
 
         updates: list[dict]
@@ -241,7 +297,16 @@ class KiwiService:
         telethon_messages: list[IncomingChannelMessage] = []
         if self.source_client is not None:
             try:
-                telethon_messages = await self.source_client.poll_messages(self.routes.routes)
+                telethon_messages = await asyncio.wait_for(
+                    self.source_client.poll_messages(self.routes.routes),
+                    timeout=max(0.2, self._telethon_poll_timeout_sec),
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Telethon polling timed out; continuing without telethon updates",
+                    extra={"details": {"timeout_sec": self._telethon_poll_timeout_sec}},
+                )
+                telethon_messages = []
             except Exception:
                 logger.exception("Telethon polling failed")
                 if self.settings.telegram_source_mode == "telethon":
@@ -250,6 +315,7 @@ class KiwiService:
             telethon_pairs: list[tuple[IncomingChannelMessage, ChannelRoute]] = []
             for incoming in telethon_messages:
                 routes = self.routes.match_all(incoming.source_channel_id, incoming.source_channel_username)
+                routes = self._routes_from_scope_hint(routes, incoming)
                 for route in routes:
                     telethon_pairs.append((incoming, route))
             ready = self._collect_ready_messages(telethon_pairs)
@@ -260,7 +326,7 @@ class KiwiService:
                 if route.is_deactive():
                     continue
                 await self._enqueue_sync_message(route, incoming)
-            processed += await self._tick_sync_drain()
+            processed += await self._safe_tick_sync_drain()
             await self._auto_activate_ready_routes()
             return processed
 
@@ -269,7 +335,7 @@ class KiwiService:
             update_id = int(update.get("update_id") or 0)
             if update_id:
                 self._offset = update_id + 1
-                self.state_store.save_offset(self._offset)
+                self._save_offset_safe(self._offset)
 
             incoming = parse_telegram_channel_update(update)
             private_incoming = parse_telegram_private_message_update(update)
@@ -280,6 +346,7 @@ class KiwiService:
                 continue
 
             routes = self.routes.match_all(incoming.source_channel_id, incoming.source_channel_username)
+            routes = self._routes_from_scope_hint(routes, incoming)
             if not routes:
                 continue
 
@@ -288,6 +355,7 @@ class KiwiService:
 
         for incoming in telethon_messages:
             routes = self.routes.match_all(incoming.source_channel_id, incoming.source_channel_username)
+            routes = self._routes_from_scope_hint(routes, incoming)
             for route in routes:
                 matched_messages.append((incoming, route))
         ready_messages = self._collect_ready_messages(matched_messages)
@@ -310,9 +378,66 @@ class KiwiService:
                 continue
             await self._enqueue_sync_message(route, incoming)
 
-        processed += await self._tick_sync_drain()
+        processed += await self._safe_tick_sync_drain()
         await self._auto_activate_ready_routes()
         return processed
+
+    def _save_offset_safe(self, offset: int | None) -> None:
+        value = int(offset or 0)
+        try:
+            self.state_store.save_offset(value)
+        except Exception as exc:
+            now = time.time()
+            # Throttle repeated write failures so logs remain readable.
+            if now - float(self._last_state_save_error_at) >= 60.0:
+                self._last_state_save_error_at = now
+                logger.warning(
+                    "Failed to persist state offset; continuing without stopping sync",
+                    extra={"details": {"offset": value, "error": str(exc)}},
+                )
+
+    def _save_sync_next_due_safe(self) -> None:
+        try:
+            self.state_store.save_sync_next_due_map(self._sync_next_due_at)
+        except Exception as exc:
+            now = time.time()
+            if now - float(self._last_state_save_error_at) >= 60.0:
+                self._last_state_save_error_at = now
+                logger.warning(
+                    "Failed to persist sync next-due map; continuing without stopping sync",
+                    extra={
+                        "details": {
+                            "routes_count": len(self._sync_next_due_at),
+                            "error": str(exc),
+                        }
+                    },
+                )
+
+    async def _cancel_stuck_sync_drain_task(self) -> None:
+        task = self._sync_drain_task
+        if task is None:
+            return
+        if not task.done():
+            task.cancel()
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(task, timeout=1.5)
+        self._sync_drain_task = None
+
+    async def _safe_tick_sync_drain(self) -> int:
+        try:
+            return int(
+                await asyncio.wait_for(
+                    self._tick_sync_drain(),
+                    timeout=max(1.0, float(self._sync_drain_timeout_sec)),
+                )
+            )
+        except asyncio.TimeoutError:
+            logger.error(
+                "Sync drain tick timed out; cancelling stuck drain task",
+                extra={"details": {"timeout_sec": self._sync_drain_timeout_sec}},
+            )
+            await self._cancel_stuck_sync_drain_task()
+            return 0
 
     async def _sync_queue_depth_safe(self) -> int:
         try:
@@ -320,6 +445,17 @@ class KiwiService:
         except Exception:
             logger.exception("Failed to read sync queue depth")
             return 0
+
+    def _sync_route_due_at(self, route_name: str, *, now: float | None = None) -> float:
+        base = float(time.time() if now is None else now)
+        next_due_raw = self._sync_next_due_at.get(str(route_name or ""))
+        if next_due_raw is None:
+            return base
+        try:
+            next_due = float(next_due_raw)
+        except Exception:
+            return base
+        return max(base, next_due)
 
     def set_route_patch_callback(self, callback: Any | None) -> None:
         self._route_patch_callback = callback
@@ -417,16 +553,25 @@ class KiwiService:
             self._sync_drain_task = None
         return processed
 
-    async def _enqueue_sync_message(self, route: ChannelRoute, incoming: IncomingChannelMessage) -> None:
+    async def _enqueue_sync_message(
+        self,
+        route: ChannelRoute,
+        incoming: IncomingChannelMessage,
+        *,
+        bypass_checkpoint_gate: bool = False,
+        bypass_interval_gate: bool = False,
+    ) -> str | None:
         checkpoint = self.sync_ledger.get_route_checkpoint(route.name)
-        if checkpoint is not None and int(incoming.message_id) <= checkpoint:
-            return
+        if not bypass_checkpoint_gate and checkpoint is not None and int(incoming.message_id) <= checkpoint:
+            return None
 
         if route.is_synced():
             route.status = "syncing"
             await self._persist_route_patch(route.name, {"status": "syncing"})
 
         payload = self._serialize_incoming(incoming)
+        if bypass_checkpoint_gate or bypass_interval_gate:
+            payload["_force_backfill"] = True
         created, dedupe_key, status = self.sync_ledger.register_message(
             route_name=route.name,
             source_channel_id=incoming.source_channel_id,
@@ -445,10 +590,10 @@ class KiwiService:
             payload=payload,
         )
         if not created and status in TERMINAL_STATUSES:
-            return
-        # Sync pacing is enforced after successful dispatch (worker-side),
-        # so queue entries are admitted immediately.
+            return None
         due_at = time.time()
+        if route.is_syncing() and not bypass_interval_gate:
+            due_at = self._sync_route_due_at(route.name, now=due_at)
         self.message_monitor.note_stage(
             dedupe_key=dedupe_key,
             stage="queued",
@@ -463,6 +608,7 @@ class KiwiService:
             due_at=due_at,
             payload_hash=payload_hash_from_json(payload),
         )
+        return dedupe_key
 
     @staticmethod
     def _initial_sync_jitter_sec(route_name: str, interval_sec: int) -> float:
@@ -475,6 +621,7 @@ class KiwiService:
     async def _ensure_sync_baseline(self) -> None:
         prime_cursor = getattr(self.source_client, "prime_cursor", None)
         route_source_key = getattr(self.source_client, "route_source_key", None)
+        route_cursor_key = getattr(self.source_client, "route_cursor_key", None)
         latest_func = getattr(self.source_client, "latest_message_id_for_route", None)
         for route in self.routes.routes:
             if route.is_deactive():
@@ -522,8 +669,12 @@ class KiwiService:
                     await self._persist_route_patch(route.name, {"status": "synced"})
 
             checkpoint = int(current_checkpoint or 0)
-            if callable(prime_cursor) and callable(route_source_key):
-                source_key = route_source_key(route)
+            if callable(prime_cursor):
+                source_key = None
+                if callable(route_cursor_key):
+                    source_key = route_cursor_key(route)
+                elif callable(route_source_key):
+                    source_key = route_source_key(route)
                 if isinstance(source_key, str) and source_key.strip():
                     prime_cursor(source_key, checkpoint)
 
@@ -581,6 +732,9 @@ class KiwiService:
             )
             # Keep tiny staggering to avoid bursty lock contention on restart.
             due_at = time.time() + (0.005 * idx)
+            route = self._find_route(record.route_name)
+            if route is not None and route.is_syncing():
+                due_at = self._sync_route_due_at(route.name, now=due_at)
             await self.sync_queue.enqueue(
                 dedupe_key=key,
                 route_name=record.route_name,
@@ -635,10 +789,14 @@ class KiwiService:
             record = self.sync_ledger.get_record(key)
             if record is None:
                 continue
+            due_at = now + (0.002 * idx)
+            route = self._find_route(record.route_name)
+            if route is not None and route.is_syncing():
+                due_at = self._sync_route_due_at(route.name, now=due_at)
             await self.sync_queue.enqueue(
                 dedupe_key=key,
                 route_name=record.route_name,
-                due_at=now + (0.002 * idx),
+                due_at=due_at,
                 payload_hash=payload_hash_from_json(record.payload),
             )
             hydrated += 1
@@ -654,20 +812,24 @@ class KiwiService:
             },
         )
 
-    async def _process_queued_item(self, item) -> int:
+    async def _process_queued_item(
+        self,
+        item,
+        *,
+        allow_deactive: bool = False,
+        bypass_interval_gate: bool = False,
+        bypass_checkpoint_gate: bool = False,
+        skip_route_lock: bool = False,
+    ) -> int:
         record = self.sync_ledger.get_record(item.dedupe_key)
         if record is None:
             return 0
         if record.status in TERMINAL_STATUSES:
             return 0
-        self.message_monitor.note_stage(
-            dedupe_key=item.dedupe_key,
-            stage="dequeue",
-            status="processing",
-            progress_pct=12.0,
-            details="Picked by sync worker",
-            trace_id=f"sync:{item.dedupe_key}",
-        )
+        payload_obj = record.payload if isinstance(record.payload, dict) else {}
+        force_backfill = bool(payload_obj.get("_force_backfill"))
+        bypass_interval = bool(bypass_interval_gate)
+        bypass_checkpoint = bool(bypass_checkpoint_gate or force_backfill)
 
         route = self._find_route(record.route_name)
         if route is None:
@@ -681,7 +843,7 @@ class KiwiService:
                 trace_id=f"sync:{item.dedupe_key}",
             )
             return 1
-        if route.is_deactive():
+        if route.is_deactive() and not allow_deactive:
             self.sync_ledger.mark_status(item.dedupe_key, status="failed", last_error="route_deactive")
             self.message_monitor.note_status(
                 dedupe_key=item.dedupe_key,
@@ -698,7 +860,7 @@ class KiwiService:
         # checkpoint moved ahead, so transient AI/script outages can self-heal.
         retrying_statuses = {"failed", "retry_wait"}
         is_retrying_failed = str(record.status or "").strip().lower() in retrying_statuses
-        if int(record.message_id) <= checkpoint and not is_retrying_failed:
+        if int(record.message_id) <= checkpoint and not is_retrying_failed and not bypass_checkpoint:
             self.sync_ledger.mark_status(item.dedupe_key, status="blocked", last_error="older_than_checkpoint")
             self.message_monitor.note_status(
                 dedupe_key=item.dedupe_key,
@@ -742,21 +904,12 @@ class KiwiService:
             )
             return 0
 
-        if route.is_syncing():
+        if route.is_syncing() and not bypass_interval:
             next_due_raw = self._sync_next_due_at.get(route.name)
             if next_due_raw is not None:
                 now = time.time()
                 next_due = float(next_due_raw)
                 if now < next_due:
-                    wait_sec = max(0.0, next_due - now)
-                    self.message_monitor.note_stage(
-                        dedupe_key=item.dedupe_key,
-                        stage="interval_wait",
-                        status="queued",
-                        progress_pct=10.0,
-                        details=f"Sync interval gate; retry in {round(wait_sec, 2)}s",
-                        trace_id=f"sync:{item.dedupe_key}",
-                    )
                     await self.sync_queue.schedule_retry(
                         dedupe_key=item.dedupe_key,
                         route_name=route.name,
@@ -765,28 +918,39 @@ class KiwiService:
                     )
                     return 0
 
-        lock_owner = str(uuid4())
-        acquired = await self.sync_queue.acquire_route_lock(
-            route_name=route.name,
-            owner=lock_owner,
-            ttl_sec=int(self.settings.sync_lock_ttl_sec),
+        self.message_monitor.note_stage(
+            dedupe_key=item.dedupe_key,
+            stage="dequeue",
+            status="processing",
+            progress_pct=12.0,
+            details="Picked by sync worker",
+            trace_id=f"sync:{item.dedupe_key}",
         )
-        if not acquired:
-            self.message_monitor.note_stage(
-                dedupe_key=item.dedupe_key,
-                stage="route_lock_wait",
-                status="queued",
-                progress_pct=10.0,
-                details="Route lock is busy; retry scheduled",
-                trace_id=f"sync:{item.dedupe_key}",
-            )
-            await self.sync_queue.schedule_retry(
-                dedupe_key=item.dedupe_key,
+
+        lock_owner = str(uuid4())
+        acquired = True
+        if not skip_route_lock:
+            acquired = await self.sync_queue.acquire_route_lock(
                 route_name=route.name,
-                due_at=time.time() + 0.7,
-                payload_hash=item.payload_hash,
+                owner=lock_owner,
+                ttl_sec=int(self.settings.sync_lock_ttl_sec),
             )
-            return 0
+            if not acquired:
+                self.message_monitor.note_stage(
+                    dedupe_key=item.dedupe_key,
+                    stage="route_lock_wait",
+                    status="queued",
+                    progress_pct=10.0,
+                    details="Route lock is busy; retry scheduled",
+                    trace_id=f"sync:{item.dedupe_key}",
+                )
+                await self.sync_queue.schedule_retry(
+                    dedupe_key=item.dedupe_key,
+                    route_name=route.name,
+                    due_at=time.time() + 0.7,
+                    payload_hash=item.payload_hash,
+                )
+                return 0
 
         try:
             self.sync_ledger.mark_processing(item.dedupe_key, trace_id=f"sync:{item.dedupe_key}")
@@ -807,6 +971,11 @@ class KiwiService:
                 retries=route.sync_retry_attempts,
                 dedupe_key=item.dedupe_key,
             )
+            if route.is_syncing() and not bypass_interval:
+                # Keep route cadence stable regardless of outcome so blocked/failed
+                # items cannot cause rapid-fire backfill bursts.
+                self._sync_next_due_at[route.name] = time.time() + max(1, int(route.sync_interval_sec))
+                self._save_sync_next_due_safe()
 
             if status == "ok":
                 self.sync_ledger.mark_status(item.dedupe_key, status="sent", trace_id=f"sync:{item.dedupe_key}")
@@ -821,8 +990,6 @@ class KiwiService:
                     route.name,
                     self._checkpoint_target_with_pending_groups(route.name, int(incoming.message_id)),
                 )
-                if route.is_syncing():
-                    self._sync_next_due_at[route.name] = time.time() + max(1, int(route.sync_interval_sec))
                 return 1
 
             if status in {"blocked", "skipped"}:
@@ -844,6 +1011,35 @@ class KiwiService:
                 self.sync_ledger.set_route_checkpoint(
                     route.name,
                     self._checkpoint_target_with_pending_groups(route.name, int(incoming.message_id)),
+                )
+                return 1
+
+            if status == "ambiguous":
+                self.sync_ledger.mark_status(
+                    item.dedupe_key,
+                    status="ambiguous",
+                    last_error=last_error,
+                    trace_id=f"sync:{item.dedupe_key}",
+                )
+                review_id = self.sync_ledger.add_review(
+                    dedupe_key=item.dedupe_key,
+                    route_name=route.name,
+                    reason="dispatch_ambiguous_result",
+                    last_error=last_error,
+                )
+                self.message_monitor.note_status(
+                    dedupe_key=item.dedupe_key,
+                    status="ambiguous",
+                    error=last_error,
+                    details=f"Ambiguous dispatch; review_id={review_id}",
+                    progress_pct=100.0,
+                    trace_id=f"sync:{item.dedupe_key}",
+                )
+                await self._notify_review_alert(
+                    route=route,
+                    review_id=int(review_id),
+                    dedupe_key=item.dedupe_key,
+                    error=last_error,
                 )
                 return 1
 
@@ -878,7 +1074,7 @@ class KiwiService:
                 last_error=last_error,
                 trace_id=f"sync:{item.dedupe_key}",
             )
-            delay = self._retry_delay(attempts)
+            delay = self._retry_delay(attempts, last_error=last_error)
             self.message_monitor.note_status(
                 dedupe_key=item.dedupe_key,
                 status="queued",
@@ -895,12 +1091,23 @@ class KiwiService:
             )
             return 1
         finally:
-            await self.sync_queue.release_route_lock(route_name=route.name, owner=lock_owner)
+            if not skip_route_lock:
+                await self.sync_queue.release_route_lock(route_name=route.name, owner=lock_owner)
 
-    def _retry_delay(self, attempt_count: int) -> float:
+    def _retry_delay(self, attempt_count: int, *, last_error: str | None = None) -> float:
         base = float(self.settings.sync_retry_base_sec)
         exp = max(0, int(attempt_count) - 1)
-        return min(base * (2 ** exp), 300.0)
+        delay = min(base * (2 ** exp), 300.0)
+        text = str(last_error or "").strip().lower()
+        if not text:
+            return delay
+        # Bale upload-bytes failures are often transient backend-side errors.
+        # Avoid hammering the API with immediate retries.
+        if "failed to upload file bytes" in text:
+            return max(delay, 90.0)
+        if "http 500" in text and ("sendaudio" in text or "senddocument" in text):
+            return max(delay, 60.0)
+        return delay
 
     def _media_cache_key(self, *, media: IncomingMedia, file_path: str) -> str:
         source = str(media.source or "bot_api").strip().lower()
@@ -1245,10 +1452,9 @@ class KiwiService:
                 # Exhausted route-level retries; keep this item retryable by queue policy.
                 return "failed", "channel_script_retry_exhausted"
             if status == "ambiguous":
-                if idx < attempts - 1:
-                    await asyncio.sleep(0.8 * (idx + 1))
-                    continue
-                return "failed", (err or "ambiguous_result_exhausted")
+                # Ambiguous dispatch (e.g. transport timeout after upstream accepted request)
+                # must not be auto-retried to avoid duplicate posts.
+                return "ambiguous", (err or "ambiguous_dispatch_result")
             if idx < attempts - 1 and self._is_transient_error_text(err):
                 await asyncio.sleep(0.8 * (idx + 1))
                 continue
@@ -1266,6 +1472,7 @@ class KiwiService:
             "text": incoming.text,
             "caption": incoming.caption,
             "media_group_id": incoming.media_group_id,
+            "source_topic_id": int(incoming.source_topic_id) if incoming.source_topic_id is not None else None,
             "raw": incoming.raw if isinstance(incoming.raw, dict) else {},
             "medias": [
                 {
@@ -1275,6 +1482,8 @@ class KiwiService:
                     "file_name": media.file_name,
                     "mime_type": media.mime_type,
                     "duration": media.duration,
+                    "title": media.title,
+                    "performer": media.performer,
                     "source": media.source,
                     "source_ref": media.source_ref if isinstance(media.source_ref, dict) else None,
                 }
@@ -1300,6 +1509,8 @@ class KiwiService:
                     file_name=str(item.get("file_name") or "") or None,
                     mime_type=str(item.get("mime_type") or "") or None,
                     duration=int(item["duration"]) if item.get("duration") is not None else None,
+                    title=str(item.get("title") or "") or None,
+                    performer=str(item.get("performer") or "") or None,
                     source=str(item.get("source") or "") or None,
                     source_ref=item.get("source_ref") if isinstance(item.get("source_ref"), dict) else None,
                 )
@@ -1315,7 +1526,27 @@ class KiwiService:
             medias=medias,
             raw=payload.get("raw") if isinstance(payload.get("raw"), dict) else {},
             media_group_id=str(payload.get("media_group_id") or "") or None,
+            source_topic_id=int(payload.get("source_topic_id") or 0) or None,
         )
+
+    @staticmethod
+    def _routes_from_scope_hint(routes: list[ChannelRoute], incoming: IncomingChannelMessage) -> list[ChannelRoute]:
+        raw = incoming.raw if isinstance(incoming.raw, dict) else {}
+        hints = raw.get("route_scope_names")
+        if not isinstance(hints, list):
+            return routes
+        allowed = {str(item).strip() for item in hints if str(item).strip()}
+        if not allowed:
+            return routes
+        return [route for route in routes if str(route.name) in allowed]
+
+    @staticmethod
+    def _route_accepts_incoming_topic(route: ChannelRoute, incoming: IncomingChannelMessage) -> bool:
+        topic_id = int(route.source_topic_id or 0)
+        if topic_id <= 0:
+            return True
+        incoming_topic = int(incoming.source_topic_id or 0)
+        return incoming_topic == topic_id
 
     @staticmethod
     def _is_transient_error_text(error_text: str | None) -> bool:
@@ -1339,12 +1570,25 @@ class KiwiService:
         text = str(error_text or "").lower()
         if not text:
             return False
-        return (
+        base_ambiguous = (
             "network error" in text
             or "connecttimeout" in text
             or "readtimeout" in text
             or "timeout" in text
         )
+        if base_ambiguous:
+            return True
+        # sendMediaGroup HTTP 5xx / upload-bytes failures are treated as ambiguous
+        # because upstream may have already accepted the album.
+        if "sendmediagroup" in text and (
+            "http 500" in text
+            or "http 502" in text
+            or "http 503" in text
+            or "http 504" in text
+            or "failed to upload file bytes" in text
+        ):
+            return True
+        return False
 
     @staticmethod
     def _is_permission_error_text(error_text: str | None) -> bool:
@@ -1698,6 +1942,7 @@ class KiwiService:
                 "name": route.name,
                 "status": route.status,
                 "source_channel_username": route.source_channel_username,
+                "source_topic_id": route.source_topic_id,
                 "destination_channel_id": route.destination_channel_id,
                 "destination_channel_username": route.destination_channel_username,
                 "destination_target": route.destination_target(),
@@ -1861,6 +2106,8 @@ class KiwiService:
                         "file_name": media.file_name,
                         "mime_type": media.mime_type,
                         "duration": media.duration,
+                        "title": media.title,
+                        "performer": media.performer,
                         "size_bytes": downloaded,
                         "local_path": str(target_path),
                         "local_name": str(target_rel),
@@ -2162,6 +2409,8 @@ class KiwiService:
                 input_dir=input_dir,
                 extra_input_dirs=[],
             )
+            destination_message_ids = list(getattr(self.dispatcher, "last_dispatch_message_ids", []) or [])
+            destination_metadata = list(getattr(self.dispatcher, "last_dispatch_metadata", []) or [])
             self._record_traffic(route_name=route.name, download_bytes=0, upload_bytes=upload_total_bytes)
             stage_timings_ms["dispatch"] = round((time.monotonic() - dispatch_started) * 1000.0, 2)
             stage_timings_ms["total"] = round((time.monotonic() - started_at) * 1000.0, 2)
@@ -2180,6 +2429,8 @@ class KiwiService:
                 reason=f"Dispatched ({len(final_result.messages)} output messages)",
                 trace_id=trace_id,
                 stage_timings_ms=stage_timings_ms,
+                destination_message_ids=destination_message_ids,
+                destination_metadata=destination_metadata,
             )
             logger.info(
                 "Route processing completed",
@@ -2232,8 +2483,16 @@ class KiwiService:
             error_text = str(exc)
             is_permission = stage_name == "dispatch" and self._is_permission_error_text(error_text)
             is_request_too_large = stage_name == "dispatch" and self._is_request_too_large_error_text(error_text)
+            is_ambiguous_dispatch = (
+                stage_name == "dispatch"
+                and not is_permission
+                and not is_request_too_large
+                and self._is_ambiguous_dispatch_error_text(error_text)
+            )
             if is_permission or is_request_too_large:
                 status = "blocked"
+            elif is_ambiguous_dispatch:
+                status = "ambiguous"
             else:
                 status = "failed"
             await self._audit_log(
@@ -2247,7 +2506,11 @@ class KiwiService:
                     else (
                         "Destination payload too large (request_too_large)"
                         if is_request_too_large
-                        else f"Platform error: {exc}"
+                        else (
+                            f"Dispatch result ambiguous (possible partial delivery): {exc}"
+                            if is_ambiguous_dispatch
+                            else f"Platform error: {exc}"
+                        )
                     )
                 ),
                 trace_id=trace_id,
@@ -2271,7 +2534,11 @@ class KiwiService:
                 stage=stage_name,
                 status=status,
                 progress_pct=86.0 if stage_name == "dispatch" else 60.0,
-                details=f"Platform error: {exc}",
+                details=(
+                    f"Dispatch ambiguous: {exc}"
+                    if is_ambiguous_dispatch
+                    else f"Platform error: {exc}"
+                ),
             )
             return status, str(exc)
         except ScriptExecutionError as exc:
@@ -2568,6 +2835,8 @@ class KiwiService:
             self._pending_media_groups.pop(key, None)
         had_next_due = target in self._sync_next_due_at
         self._sync_next_due_at.pop(target, None)
+        if had_next_due:
+            self._save_sync_next_due_safe()
         monitor = self.message_monitor.clear_route(target)
         return {
             "removed_pending_groups": int(len(pending_keys)),
@@ -2625,14 +2894,116 @@ class KiwiService:
             [item for item in seeded if isinstance(item, IncomingChannelMessage)],
             key=lambda item: int(item.message_id),
         )
+        immediate_limit_raw = str(os.getenv("FORCE_SYNC_IMMEDIATE_PROCESS_LIMIT", "8") or "8").strip()
+        try:
+            immediate_limit = max(0, int(float(immediate_limit_raw)))
+        except Exception:
+            immediate_limit = 8
+        enqueued_messages = 0
+        processed_now = 0
         for incoming in seeded_sorted:
-            await self._enqueue_sync_message(route, incoming)
-        processed_now = await self._tick_sync_drain() if seeded_sorted else 0
+            dedupe_key = await self._enqueue_sync_message(
+                route,
+                incoming,
+                bypass_checkpoint_gate=True,
+                bypass_interval_gate=False,
+            )
+            if not dedupe_key:
+                continue
+            enqueued_messages += 1
+            record = self.sync_ledger.get_record(dedupe_key)
+            if record is None:
+                continue
+            if processed_now < immediate_limit:
+                processed_now += int(
+                    await self._process_queued_item(
+                        QueueItem(
+                            dedupe_key=dedupe_key,
+                            route_name=route.name,
+                            due_at=0.0,
+                            payload_hash=payload_hash_from_json(record.payload),
+                        ),
+                        bypass_interval_gate=False,
+                        bypass_checkpoint_gate=True,
+                        skip_route_lock=True,
+                    )
+                )
+        if enqueued_messages > processed_now:
+            processed_now += int(await self._tick_sync_drain())
         return {
             "seed_supported": True,
             "seeded_messages": int(len(seeded_sorted)),
-            "enqueued_messages": int(len(seeded_sorted)),
+            "enqueued_messages": int(enqueued_messages),
             "processed_now": int(processed_now),
+        }
+
+    async def force_sync_route_send_one_unsynced(self, route_name: str) -> dict[str, Any]:
+        target = str(route_name or "").strip()
+        if not target:
+            return {"processed": 0, "note": "route_name_required"}
+
+        route = self._find_route(target)
+        if route is None:
+            raise ValueError("route_not_found")
+
+        now = time.time()
+        runtime_status = "syncing" if route.is_syncing() else ("deactive" if route.is_deactive() else "synced")
+        next_due_raw = self._sync_next_due_at.get(route.name)
+        if route.is_syncing() and next_due_raw is not None:
+            try:
+                if now < float(next_due_raw):
+                    runtime_status = "sync_waiting"
+            except Exception:
+                pass
+
+        if not (route.is_deactive() or runtime_status == "sync_waiting"):
+            return {
+                "processed": 0,
+                "note": "route_status_not_eligible",
+                "runtime_status_before": runtime_status,
+            }
+
+        keys = self.sync_ledger.list_retryable_keys_for_route(route.name, limit=1)
+        if not keys:
+            return {
+                "processed": 0,
+                "note": "no_unsynced_records",
+                "runtime_status_before": runtime_status,
+            }
+
+        dedupe_key = str(keys[0])
+        record = self.sync_ledger.get_record(dedupe_key)
+        if record is None:
+            return {
+                "processed": 0,
+                "note": "ledger_record_missing",
+                "runtime_status_before": runtime_status,
+                "dedupe_key": dedupe_key,
+            }
+
+        item = QueueItem(
+            dedupe_key=dedupe_key,
+            route_name=route.name,
+            due_at=0.0,
+            payload_hash=payload_hash_from_json(record.payload),
+        )
+        processed = int(
+            await self._process_queued_item(
+                item,
+                allow_deactive=route.is_deactive(),
+                bypass_interval_gate=True,
+            )
+        )
+        post = self.sync_ledger.get_record(dedupe_key)
+        post_status = str(post.status or "") if post is not None else "missing"
+        return {
+            "processed": processed,
+            "dedupe_key": dedupe_key,
+            "message_id": int(record.message_id),
+            "status_after": post_status,
+            "runtime_status_before": runtime_status,
+            "route_status_after": str(route.status or ""),
+            "next_due_at_ts": self._sync_next_due_at.get(route.name),
         }
 
     def message_monitor_snapshot(
@@ -2796,11 +3167,21 @@ class KiwiService:
         trace_id: str | None = None,
         stage_timings_ms: dict[str, float] | None = None,
         stage_output: object | None = None,
+        destination_message_ids: list[int] | None = None,
+        destination_metadata: list[dict] | None = None,
     ) -> None:
         normalized_status = str(status or "").strip().lower()
         if normalized_status == "skipped":
             normalized_status = "blocked"
         stage_output_text = self._format_stage_output(stage_output)
+        destination_ids_clean: list[int] = []
+        for item in destination_message_ids or []:
+            try:
+                value = int(item)
+            except Exception:
+                continue
+            if value > 0:
+                destination_ids_clean.append(value)
         logger.info(
             "audit_event",
             extra={
@@ -2818,6 +3199,8 @@ class KiwiService:
                     "media_count": len(incoming.medias) if incoming else None,
                     "timings_ms": stage_timings_ms or {},
                     "stage_output": stage_output_text,
+                    "destination_message_ids": destination_ids_clean,
+                    "destination_metadata_count": len(destination_metadata or []),
                 }
             },
         )
@@ -2864,6 +3247,22 @@ class KiwiService:
                 lines.append(f"🔗 Message Link: {source_link}")
             if incoming.media_group_id:
                 lines.append(f"🗂 media_group_id: {incoming.media_group_id}")
+        if route and stage == "dispatch" and normalized_status == "ok":
+            destination_links = self._destination_links_from_metadata(route, destination_metadata or [])
+            if len(destination_links) == 1:
+                lines.append(f"📨 Destination Link: {destination_links[0]}")
+            elif destination_links:
+                preview = " | ".join(destination_links[:3])
+                more = len(destination_links) - 3
+                if more > 0:
+                    preview = f"{preview} | +{more} more"
+                lines.append(f"📨 Destination Links: {preview}")
+            elif destination_ids_clean:
+                preview_ids = " | ".join(str(x) for x in destination_ids_clean[:5])
+                more_ids = len(destination_ids_clean) - 5
+                if more_ids > 0:
+                    preview_ids = f"{preview_ids} | +{more_ids} more"
+                lines.append(f"📨 Destination Message IDs: {preview_ids}")
         if reason:
             lines.append(f"📝 Details: {reason}")
         if stage_timings_ms:
@@ -2885,6 +3284,25 @@ class KiwiService:
                         "stage": stage,
                         "status": status,
                         "log_channel_target": self.settings.log_channel_target,
+                    }
+                },
+            )
+            return
+
+        bale_log_target = os.getenv("BALE_LOG_CHANNEL_TARGET", "@kiwi_logs_logs").strip()
+        if not bale_log_target:
+            return
+        try:
+            # Mirror exactly the same message content to Bale log channel.
+            await self.bale_client.send_message(bale_log_target, message)
+        except Exception:
+            logger.exception(
+                "Failed to mirror audit log to Bale channel",
+                extra={
+                    "details": {
+                        "stage": stage,
+                        "status": status,
+                        "bale_log_target": bale_log_target,
                     }
                 },
             )
@@ -2921,6 +3339,50 @@ class KiwiService:
         if channel_id.startswith("-100") and channel_id[4:].isdigit():
             return f"https://t.me/c/{channel_id[4:]}/{message_id}"
         return None
+
+    @staticmethod
+    def _destination_links_from_metadata(route: ChannelRoute, destination_metadata: list[dict]) -> list[str]:
+        username = str(route.destination_channel_username or "").strip()
+        if not username.startswith("@") or len(username) <= 1:
+            return []
+        handle = username[1:]
+        out: list[str] = []
+        seen: set[str] = set()
+        for item in destination_metadata:
+            if not isinstance(item, dict):
+                continue
+
+            for key in ("link", "url", "message_link"):
+                raw_link = str(item.get(key) or "").strip()
+                if raw_link.startswith("http://") or raw_link.startswith("https://"):
+                    if raw_link not in seen:
+                        seen.add(raw_link)
+                        out.append(raw_link)
+                    break
+
+            rid_raw = item.get("rid")
+            if rid_raw is None:
+                rid_raw = item.get("id")
+            if rid_raw is None:
+                rid_raw = item.get("message_rid")
+            date_raw = item.get("date")
+            try:
+                rid = int(str(rid_raw or "").strip())
+            except Exception:
+                continue
+            try:
+                date_num = float(str(date_raw or "").strip())
+            except Exception:
+                continue
+            if rid <= 0 or date_num <= 0:
+                continue
+            date_ms = int(round(date_num * 1000.0)) if date_num < 10_000_000_000 else int(round(date_num))
+            candidate = f"https://ble.ir/{handle}/{rid}/{date_ms}"
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+            out.append(candidate)
+        return out
 
     @staticmethod
     def _build_trace_id(route: ChannelRoute, incoming: IncomingChannelMessage) -> str:
@@ -3027,6 +3489,7 @@ class KiwiService:
                 "group_message_end_id": int(max(msg.message_id for msg in ordered)),
             },
             media_group_id=first.media_group_id,
+            source_topic_id=first.source_topic_id or next((m.source_topic_id for m in ordered if m.source_topic_id), None),
         )
 
     @staticmethod
@@ -3082,6 +3545,7 @@ class KiwiService:
             medias=medias,
             raw=raw,
             media_group_id=existing.media_group_id or incoming.media_group_id,
+            source_topic_id=existing.source_topic_id or incoming.source_topic_id,
         )
 
     @staticmethod
@@ -3096,6 +3560,7 @@ class KiwiService:
         target.medias = list(source.medias)
         target.raw = source.raw if isinstance(source.raw, dict) else {}
         target.media_group_id = source.media_group_id
+        target.source_topic_id = source.source_topic_id
 
     @staticmethod
     def _script_message_to_dict(msg) -> dict:

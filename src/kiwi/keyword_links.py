@@ -80,7 +80,16 @@ class KeywordLinker:
         for msg in messages:
             text = self._linkify_text(msg.text, patterns) if isinstance(msg.text, str) and msg.text.strip() else msg.text
             caption = self._linkify_text(msg.caption, patterns) if isinstance(msg.caption, str) and msg.caption.strip() else msg.caption
-            out.append(ScriptOutputMessage(type=msg.type, text=text, path=msg.path, caption=caption))
+            out.append(
+                ScriptOutputMessage(
+                    type=msg.type,
+                    text=text,
+                    path=msg.path,
+                    caption=caption,
+                    reply_markup=msg.reply_markup,
+                    append_destination_footer=bool(msg.append_destination_footer),
+                )
+            )
         return out
 
     def _load_if_changed(self) -> None:

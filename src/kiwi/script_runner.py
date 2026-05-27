@@ -218,8 +218,11 @@ def _parse_messages(payload: dict) -> list[ScriptOutputMessage]:
         text = item.get("text")
         path = item.get("path")
         caption = item.get("caption")
+        reply_markup = item.get("reply_markup")
         append_footer_raw = item.get("append_destination_footer", True)
         append_destination_footer = bool(append_footer_raw)
+        if reply_markup is not None and not isinstance(reply_markup, dict):
+            raise ScriptExecutionError(f"messages[{idx}] field 'reply_markup' must be an object when provided")
 
         if kind == OutputMessageKind.TEXT:
             if not isinstance(text, str) or not text.strip():
@@ -228,6 +231,7 @@ def _parse_messages(payload: dict) -> list[ScriptOutputMessage]:
                 ScriptOutputMessage(
                     type=kind,
                     text=text,
+                    reply_markup=reply_markup if isinstance(reply_markup, dict) else None,
                     append_destination_footer=append_destination_footer,
                 )
             )
@@ -241,6 +245,7 @@ def _parse_messages(payload: dict) -> list[ScriptOutputMessage]:
                 type=kind,
                 path=path.strip(),
                 caption=caption.strip() if isinstance(caption, str) and caption.strip() else None,
+                reply_markup=reply_markup if isinstance(reply_markup, dict) else None,
                 append_destination_footer=append_destination_footer,
             )
         )

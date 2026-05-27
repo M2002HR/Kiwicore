@@ -66,6 +66,31 @@ def test_parse_channel_sticker_message() -> None:
     assert parsed.medias[0].file_id == "st1"
 
 
+def test_parse_channel_audio_metadata() -> None:
+    update = {
+        "update_id": 15,
+        "channel_post": {
+            "message_id": 10,
+            "chat": {"id": -100123, "type": "channel"},
+            "audio": {
+                "file_id": "aud1",
+                "file_size": 321,
+                "file_name": "track.mp3",
+                "mime_type": "audio/mpeg",
+                "duration": 210,
+                "title": "Song Name",
+                "performer": "Artist Name",
+            },
+        },
+    }
+    parsed = parse_telegram_channel_update(update)
+    assert parsed is not None
+    assert len(parsed.medias) == 1
+    assert parsed.medias[0].kind.value == "audio"
+    assert parsed.medias[0].title == "Song Name"
+    assert parsed.medias[0].performer == "Artist Name"
+
+
 def test_parse_unknown_file_like_kind_falls_back_to_document() -> None:
     update = {
         "update_id": 14,

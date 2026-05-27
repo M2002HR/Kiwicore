@@ -5,7 +5,7 @@ import asyncio
 from pathlib import Path
 from unittest.mock import patch
 
-from kiwi.management_api import ManagementApi
+from kiwi.management_api import ManagementApi, _route_dict_to_channel_route
 from kiwi.sync_ledger import SyncLedger
 from kiwi.sync_queue import InMemorySyncQueue
 
@@ -70,6 +70,35 @@ def test_management_api_crud_and_reload(tmp_path: Path) -> None:
 
     api.delete_route("r1")
     assert api.list_routes() == []
+
+
+def test_route_dict_to_channel_route_normalizes_topic_link_source() -> None:
+    route = _route_dict_to_channel_route(
+        {
+            "name": "topic-route",
+            "status": "syncing",
+            "source_channel_username": "https://t.me/FreeRapHipHop_PlayList/1556041",
+            "destination_channel_username": "@iran_music_fa",
+            "channel_script": "music.py",
+        }
+    )
+    assert route.source_channel_username == "@freeraphiphop_playlist"
+    assert route.source_topic_id == 1556041
+
+
+def test_route_dict_to_channel_route_normalizes_topic_link_in_source_channel_id() -> None:
+    route = _route_dict_to_channel_route(
+        {
+            "name": "topic-route-id-field",
+            "status": "syncing",
+            "source_channel_id": "https://t.me/FreeRapHipHop_PlayList/1556041",
+            "destination_channel_username": "@iran_music_fa",
+            "channel_script": "music.py",
+        }
+    )
+    assert route.source_channel_username == "@freeraphiphop_playlist"
+    assert route.source_topic_id == 1556041
+    assert route.source_channel_id is None
 
 
 def test_sync_stats_includes_route_progress_and_remaining(tmp_path: Path) -> None:

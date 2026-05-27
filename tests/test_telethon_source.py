@@ -40,6 +40,7 @@ class _Msg:
         self.document = None
         self.grouped_id = None
         self.date = None
+        self.reply_to = None
 
 
 class _PhotoMsg(_Msg):
@@ -77,7 +78,7 @@ class _FakeTelethonClient:
             return _ChannelEntity(key, channel_id=cid)
         return _ChannelEntity(key, channel_id=555)
 
-    async def get_messages(self, entity, limit=None, ids=None, min_id=None, max_id=None):
+    async def get_messages(self, entity, limit=None, ids=None, min_id=None, max_id=None, reply_to=None):
         key = str(entity)
         if ids is not None:
             return self.by_id.get((key, int(ids)))
@@ -86,6 +87,17 @@ class _FakeTelethonClient:
             hist = [m for m in hist if int(m.id) > int(min_id)]
         if max_id is not None:
             hist = [m for m in hist if int(m.id) < int(max_id)]
+        if reply_to is not None:
+            rid = int(reply_to)
+            filtered: list[_Msg] = []
+            for m in hist:
+                r = getattr(m, "reply_to", None)
+                top = int(getattr(r, "reply_to_top_id", 0) or 0) if r is not None else 0
+                msg_id = int(getattr(r, "reply_to_msg_id", 0) or 0) if r is not None else 0
+                forum = bool(getattr(r, "forum_topic", False)) if r is not None else False
+                if top == rid or (forum and msg_id == rid):
+                    filtered.append(m)
+            hist = filtered
         if limit is None:
             return list(reversed(hist))
         return list(reversed(hist))[: int(limit)]
@@ -216,6 +228,104 @@ def test_poll_messages_can_resolve_via_source_channel_id() -> None:
     fake.history_by_entity["PeerChannel(channel_id=555)"].append(_Msg(12, "z"))
     second = asyncio.run(source.poll_messages([route]))
     assert [item.message_id for item in second] == [12]
+
+
+def test_route_source_key_parses_public_tme_topic_link() -> None:
+    route = ChannelRoute(
+        name="r-topic-link",
+        enabled=True,
+        source_channel_id=None,
+        source_channel_username="https://t.me/FreeRapHipHop_PlayList/1556041",
+        destination_channel_id="-2001",
+        destination_channel_username=None,
+        channel_script="default_channel_script.py",
+        max_message_mb=50,
+    )
+    assert TelethonSourceClient._route_source_key(route) == "@freeraphiphop_playlist"  # noqa: SLF001
+
+
+def test_route_source_key_parses_public_tme_topic_link_from_channel_id_field() -> None:
+    route = ChannelRoute(
+        name="r-topic-link-id-field",
+        enabled=True,
+        source_channel_id="https://t.me/FreeRapHipHop_PlayList/1556041",
+        source_channel_username=None,
+        destination_channel_id="-2001",
+        destination_channel_username=None,
+        channel_script="default_channel_script.py",
+        max_message_mb=50,
+    )
+    assert TelethonSourceClient._route_source_key(route) == "@freeraphiphop_playlist"  # noqa: SLF001
+    assert TelethonSourceClient._route_topic_id(route) == 1556041  # noqa: SLF001
+
+
+def test_seed_recent_messages_filters_by_route_topic() -> None:
+    source = TelethonSourceClient(api_id=1, api_hash="x", session_path="./tmp.session")
+    fake = _FakeTelethonClient()
+
+    m1 = _Msg(1001, "t1")
+    m1.reply_to = type("R", (), {"reply_to_top_id": 1556041, "reply_to_msg_id": 0, "forum_topic": False})()
+    m2 = _Msg(1002, "other")
+    m2.reply_to = type("R", (), {"reply_to_top_id": 1556000, "reply_to_msg_id": 0, "forum_topic": False})()
+    m3 = _Msg(1003, "t1-2")
+    m3.reply_to = type("R", (), {"reply_to_top_id": 1556041, "reply_to_msg_id": 0, "forum_topic": False})()
+    fake.history_by_entity["@stored_src"] = [m1, m2, m3]
+
+    source._client = fake  # noqa: SLF001
+    source._ensure_connected = lambda: asyncio.sleep(0)  # type: ignore[method-assign]  # noqa: SLF001
+
+    route = ChannelRoute(
+        name="topic-seed",
+        enabled=True,
+        source_channel_username="@stored_src",
+        source_topic_id=1556041,
+        destination_channel_id="-2001",
+        destination_channel_username=None,
+        channel_script="default_channel_script.py",
+        max_message_mb=50,
+    )
+
+    seeded = asyncio.run(source.seed_recent_messages(route, 10))
+    assert [item.message_id for item in seeded] == [1001, 1003]
+
+
+def test_poll_messages_topic_route_reads_only_topic_messages() -> None:
+    source = TelethonSourceClient(api_id=1, api_hash="x", session_path="./tmp.session")
+    fake = _FakeTelethonClient()
+
+    m1 = _Msg(2001, "old-topic")
+    m1.reply_to = type("R", (), {"reply_to_top_id": 1556041, "reply_to_msg_id": 0, "forum_topic": False})()
+    m2 = _Msg(2002, "old-other")
+    m2.reply_to = type("R", (), {"reply_to_top_id": 1556000, "reply_to_msg_id": 0, "forum_topic": False})()
+    fake.history_by_entity["@stored_src"] = [m1, m2]
+
+    source._client = fake  # noqa: SLF001
+    source._ensure_connected = lambda: asyncio.sleep(0)  # type: ignore[method-assign]  # noqa: SLF001
+
+    route = ChannelRoute(
+        name="topic-only",
+        enabled=True,
+        source_channel_username="@stored_src",
+        source_topic_id=1556041,
+        destination_channel_id="-2001",
+        destination_channel_username=None,
+        channel_script="default_channel_script.py",
+        max_message_mb=50,
+    )
+
+    first = asyncio.run(source.poll_messages([route]))
+    assert first == []
+
+    m3 = _Msg(2003, "new-topic")
+    m3.reply_to = type("R", (), {"reply_to_top_id": 1556041, "reply_to_msg_id": 0, "forum_topic": False})()
+    m4 = _Msg(2004, "new-other")
+    m4.reply_to = type("R", (), {"reply_to_top_id": 1556999, "reply_to_msg_id": 0, "forum_topic": False})()
+    fake.history_by_entity["@stored_src"].extend([m3, m4])
+
+    second = asyncio.run(source.poll_messages([route]))
+    assert [item.message_id for item in second] == [2003]
+    assert all(int(item.source_topic_id or 0) == 1556041 for item in second)
+    assert second[0].raw.get("route_scope_names") == ["topic-only"]
 
 
 def test_poll_messages_resolves_channel_id_via_dialog_scan_when_get_entity_fails() -> None:

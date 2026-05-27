@@ -699,6 +699,13 @@ class AdminWebServer:
                     if route_name.endswith("/sync/force") and method == "POST":
                         name = unquote(route_name[: -len("/sync/force")])
                         force_limit = _q_int(query, "limit", 0, min_value=0, max_value=200000)
+                        force_lock_timeout_sec = _q_int(
+                            query,
+                            "lock_timeout_sec",
+                            int(os.getenv("WEB_FORCE_SYNC_LOCK_TIMEOUT_SEC", "60") or 60),
+                            min_value=5,
+                            max_value=900,
+                        )
                         force_backfill_timeout_sec = _q_int(
                             query,
                             "timeout_sec",
@@ -706,7 +713,10 @@ class AdminWebServer:
                             min_value=20,
                             max_value=1800,
                         )
-                        out = parent._run_async(parent.management_api.force_route_sync(name), timeout=20.0)
+                        out = parent._run_async(
+                            parent.management_api.force_route_sync(name, lock_timeout_sec=float(force_lock_timeout_sec)),
+                            timeout=max(20.0, float(force_lock_timeout_sec) + 5.0),
+                        )
                         runtime_reset = parent._run_async(parent.service.force_sync_route_runtime_reset(name), timeout=8.0)
                         backfill = parent._run_async(
                             parent.service.force_sync_route_backfill(
@@ -716,6 +726,11 @@ class AdminWebServer:
                             timeout=float(force_backfill_timeout_sec),
                         )
                         self._send_json({"ok": True, **out, "runtime_reset": runtime_reset, "backfill": backfill})
+                        return
+                    if route_name.endswith("/sync/send-one") and method == "POST":
+                        name = unquote(route_name[: -len("/sync/send-one")])
+                        out = parent._run_async(parent.service.force_sync_route_send_one_unsynced(name), timeout=30.0)
+                        self._send_json({"ok": True, "result": out})
                         return
                     if route_name.endswith("/sync/stop") and method == "POST":
                         name = route_name[: -len("/sync/stop")]
@@ -1047,12 +1062,13 @@ class AdminWebServer:
 
         direct_host = _format_host(host_without_port)
         candidates: list[str] = []
-        public_ws_base = str(self.settings.admin_ws_public_url or "").strip()
-        if public_ws_base:
-            candidates.append(_with_ticket(public_ws_base))
         direct_ws = _with_ticket(f"{ws_scheme_direct}://{direct_host}:{int(self._ws_port)}/ws")
-        same_origin_ws = _with_ticket(f"{ws_scheme_same_origin}://{host_only}/ws")
-        for item in (direct_ws, same_origin_ws):
+        public_ws_base = str(self.settings.admin_ws_public_url or "").strip()
+        public_ws = _with_ticket(public_ws_base) if public_ws_base else ""
+        # Keep backend candidates on the dedicated websocket port only.
+        # Try direct host first so local/admin-host clients avoid bad public routes.
+        # The admin HTTP server itself doesn't terminate websocket upgrades on /ws.
+        for item in (direct_ws, public_ws):
             if item and item not in candidates:
                 candidates.append(item)
 

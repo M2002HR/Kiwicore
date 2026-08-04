@@ -1,219 +1,92 @@
-# Kiwi Bridge
+# Kiwicore
 
-Kiwi Bridge is a channel-to-channel relay service:
+**A resilient Telegram-to-Bale channel relay with configurable content processing, AI moderation, media delivery, deduplication, retries, and review workflows.**
 
-1. Watches selected **Telegram channels**.
-2. Downloads message media with a configurable per-message size limit.
-3. Runs a per-route **guard script** (AI moderation).
-4. Runs a per-channel Python script (only if guard allows).
-5. Publishes channel-script outputs to mapped **Bale channels**.
+Kiwicore watches selected Telegram channels, stores incoming payloads and media, runs route-specific guard and transformation scripts, and publishes approved outputs to mapped Bale channels.
 
-The project is designed for production use with Docker Compose and for local development with auto-reload watch mode.
+## Engineering highlights
 
-## Features
+- Configurable source-to-destination route mapping
+- Text and media relay across Telegram and Bale
+- Route-specific moderation and transformation scripts
+- AI-assisted guard integration through a Gemini proxy service
+- SQLite-backed delivery ledger and review queue
+- Redis-backed due queue and route-level concurrency locks
+- Idempotency and deduplication across retries
+- Exponential backoff for transient platform or network failures
+- Per-route media-size limits
+- Local auto-reload development mode and Docker Compose deployment
+- Optional MySQL ledger backend
 
-- Telegram channel watch via `getUpdates` (`channel_post`, `edited_channel_post`)
-- Route mapping by source/destination username and/or channel ID
-- Username-first matching and routing (with ID fallback)
-- Per-route and global media size limits
-- Local storage of raw updates, payloads, and downloaded media
-- AI guard stage per route (`gaurd_script`) before script execution
-- Single-stage channel script pipeline per route (`channel_script`)
-- Default passthrough script for near 1:1 forwarding behavior
-- Docker Compose integration with `gemini_server` (Gemini proxy submodule)
-- Delivery to Bale as text/photo/video/voice/audio/document/animation/video_note
-- Global sticker-block policy (stickers are never sent)
-- Resilient polling loop with retry/backoff on network/API errors
-- Persistent sync dedupe ledger in SQLite + runtime queue in Redis
-- Route-level sync lock (max 1 in-flight per route) + review queue for ambiguous deliveries
-- Dev watcher mode (`kiwi.dev`) and Dockerized production mode
+## Technology
 
-## Project Structure
+`Python` · `Telegram Bot API` · `Bale Bot API` · `Redis` · `SQLite` · `MySQL` · `Docker Compose` · `Async HTTP` · `AI Moderation`
 
-- `src/kiwi/service.py`: Main polling and orchestration loop
-- `src/kiwi/config.py`: Environment and route loading
-- `src/kiwi/platforms/client.py`: Telegram/Bale Bot API client wrapper
-- `src/kiwi/platforms/parser.py`: Telegram channel update parser
-- `src/kiwi/guard_runner.py`: Guard script execution + boolean parsing
-- `src/kiwi/script_runner.py`: Channel script execution + output parsing
-- `src/kiwi/dispatcher.py`: Bale message dispatching
-- `src/kiwi/storage.py`: Local message/media storage
-- `config/channels.json`: Runtime route configuration (ignored from git)
-- `config/channels.example.json`: Versioned route template
-- `scripts/channel_scripts/`: Channel scripts directory
-- `scripts/gaurd_scrpts/`: Guard scripts directory
-- `gemini_server/`: Git submodule (Gemini API proxy service)
+## Processing pipeline
 
-## Route Configuration
-
-Create your runtime file from the example:
-
-```bash
-cp config/channels.example.json config/channels.json
+```text
+Telegram channel update
+          │
+          ▼
+Parse and persist payload/media
+          │
+          ▼
+Route lookup and deduplication
+          │
+          ▼
+Guard script / AI moderation
+          │
+     blocked ──► audit result
+          │ approved
+          ▼
+Channel transformation script
+          │
+          ▼
+Normalized output messages
+          │
+          ▼
+Bale delivery
+          │
+          ├── success ─► ledger checkpoint
+          └── ambiguous/transient failure ─► retry or review queue
 ```
 
-Route fields (per item):
+## Supported output types
 
-- `name`: Route label
-- `enabled`: Enable/disable route
-- `source_channel_username`: Source Telegram channel username (preferred)
-- `source_channel_id`: Source Telegram channel ID (fallback)
-- `destination_channel_username`: Destination Bale channel username (preferred)
-- `destination_channel_id`: Destination Bale channel ID (fallback)
-- `gaurd_script`: Guard script filename under `scripts/gaurd_scrpts/` (default: `default_guard.py`)
-- `channel_script`: Script filename under `scripts/channel_scripts/`
-- `max_message_mb`: Optional per-route message media limit
+Transformation scripts can produce:
 
-Routing behavior:
+- text
+- photo
+- video
+- voice
+- audio
+- document
+- animation
+- video note
 
-- Source matching priority: `source_channel_username` -> `source_channel_id`
-- Destination target priority: `destination_channel_username` -> `destination_channel_id`
+Stickers are blocked by global policy. Unknown file-like media is safely downgraded to document delivery when appropriate.
 
-## Channel Scripts
+## Repository structure
 
-All scripts must be under:
+```text
+src/kiwi/
+├── service.py              # Polling and orchestration
+├── config.py               # Environment and route configuration
+├── platforms/              # Telegram/Bale clients and parsers
+├── guard_runner.py         # Guard-script execution
+├── script_runner.py        # Transformation-script execution
+├── dispatcher.py           # Bale delivery
+└── storage.py              # Payload and media persistence
 
-- `scripts/channel_scripts/`
-
-Default channel script included:
-
-- `scripts/channel_scripts/default_channel_script.py`
-- `scripts/channel_scripts/football.py` (AI football post generator + passthrough media)
-
-### Script Contract
-
-Each script is executed with:
-
-- `--payload <path>`: Input message payload JSON
-- `--input-dir <path>`: Downloaded input files directory
-- `--output-dir <path>`: Script output directory
-
-A script must return JSON via `stdout` (or `output.json` in `output-dir`) in this shape:
-
-```json
-{
-  "messages": [
-    {"type": "text", "text": "hello"},
-    {"type": "photo", "path": "out.jpg", "caption": "optional"},
-    {"type": "video", "path": "clip.mp4"},
-    {"type": "voice", "path": "voice.ogg"},
-    {"type": "audio", "path": "audio.mp3"},
-    {"type": "document", "path": "file.pdf"},
-    {"type": "animation", "path": "anim.gif"},
-    {"type": "video_note", "path": "video_note.mp4"}
-  ]
-}
+config/channels.example.json
+scripts/channel_scripts/
+scripts/gaurd_scrpts/       # Legacy directory spelling retained by the codebase
+gemini_server/              # Gemini proxy submodule
 ```
 
-`sticker` outputs are ignored by global policy and are never sent.
+The existing `gaurd_*` names contain a historical spelling error and remain documented only for compatibility with the current configuration contract. New code and prose should use the term **guard**.
 
-For file-based outputs, `path` may be relative to `output-dir` or `input-dir`, or absolute.
-
-Football AI script environment knobs (`football.py`):
-
-- `FOOTBALL_AI_ENABLED`
-- `FOOTBALL_AI_ENDPOINT` (fallbacks to `SCRIPT_CLEAN_AI_ENDPOINT` / `GUARD_AI_ENDPOINT`)
-- `FOOTBALL_AI_MODEL`
-- `FOOTBALL_AI_TIMEOUT_SEC`
-- `FOOTBALL_AI_RETRY_COUNT`
-- `FOOTBALL_AI_TOTAL_BUDGET_SEC` (global time budget to avoid script timeout)
-- `FOOTBALL_AI_FAIL_OPEN`
-- `FOOTBALL_AI_MAX_IMAGES`
-
-## Guard Scripts
-
-All guard scripts must be under:
-
-- `scripts/gaurd_scrpts/`
-
-Default guard included:
-
-- `scripts/gaurd_scrpts/default_guard.py`
-
-Guard contract:
-
-- Receives `--payload`, `--input-dir`, `--output-dir`
-- Must print `true`/`false` (or `1`/`0`) to stdout
-- `true` means continue to channel script
-- `false` means block forwarding for that message
-
-## Default Passthrough Script
-
-`default_channel_script.py` forwards incoming content with minimal transformation:
-
-- Pure text -> text output
-- Media -> same media type output when supported
-- Caption -> attached to the first caption-capable output media
-- Unknown file-like media -> safely downgraded to `document`
-- Stickers -> always dropped (never forwarded)
-
-## Environment Variables
-
-Copy example and fill values:
-
-```bash
-cp .env.example .env
-```
-
-Important variables:
-
-- `TELEGRAM_BOT_TOKEN`: Required
-- `BALE_BOT_TOKEN`: Required
-- `CHANNELS_CONFIG_PATH`: Default `./config/channels.json`
-- `CHANNEL_SCRIPTS_DIR`: Default `./scripts/channel_scripts`
-- `GAURD_SCRIPTS_DIR`: Default `./scripts/gaurd_scrpts`
-- `DEFAULT_MAX_MESSAGE_MB`: Global per-message media limit
-- `SCRIPT_TIMEOUT_SEC`: Max channel script runtime
-- `GAURD_SCRIPT_TIMEOUT_SEC`: Max guard script runtime
-- `POLL_IDLE_SLEEP_SEC`: Delay when no updates
-- `POLL_ERROR_SLEEP_SEC`: Base retry delay on polling errors
-- `TELETHON_PROXY_URL`: Optional proxy for MTProto (Telethon), e.g. `socks5://127.0.0.1:1080` or `http://127.0.0.1:2080`
-- `SYNC_QUEUE_BACKEND`: `redis` (default) or `memory`
-- `REDIS_URL`: Redis DSN for sync due-queue
-- `SYNC_WORKER_COUNT`: Global sync worker concurrency (default `4`)
-- `SYNC_ROUTE_MAX_INFLIGHT`: Per-route concurrency lock target (recommended `1`)
-- `SYNC_RETRY_BASE_SEC`: Retry base delay for transient sync failures
-- `SYNC_LOCK_TTL_SEC`: Route lock TTL in seconds
-- `SYNC_REVIEW_ALERT_TARGET`: Optional Telegram chat/channel for ambiguous sync alerts
-- `SYNC_LEDGER_DB_PATH`: SQLite path for sync ledger/checkpoints/review queue
-- `SYNC_LEDGER_DSN`: Optional DSN (e.g. `mysql://kiwi_admin:kiwiKIWI@127.0.0.1:3306/kiwi_sync?charset=utf8mb4`) to replace SQLite ledger
-- `MYSQL_ROOT_PASSWORD`, `MYSQL_DATABASE`, `MYSQL_USER`, `MYSQL_PASSWORD`: Local MySQL container credentials
-
-Guard AI (used by `default_guard.py`):
-
-- `GUARD_AI_ENABLED`
-- `GUARD_AI_ENDPOINT` (inside Compose: `http://gemini_server:8000/proxy/gemini`)
-- `GUARD_AI_MODEL` (optional; if empty, Gemini proxy default model is used)
-- `GUARD_AI_TIMEOUT_SEC`
-
-### Proxy / Nekoray
-
-If your network requires proxy for Telegram/Bale API access:
-
-- Set `HTTP_TRUST_ENV=true`
-- Set proxy envs (`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, `NO_PROXY`)
-
-For local Nekoray HTTP proxy example:
-
-```env
-HTTP_TRUST_ENV=true
-HTTP_PROXY=http://127.0.0.1:2080
-HTTPS_PROXY=http://127.0.0.1:2080
-ALL_PROXY=http://127.0.0.1:2080
-NO_PROXY=127.0.0.1,localhost
-```
-
-In this repository's Docker Compose setup, `kiwi` runs on host network mode.  
-If your proxy is on the host machine, use:
-
-```env
-HTTP_PROXY=http://127.0.0.1:2080
-HTTPS_PROXY=http://127.0.0.1:2080
-ALL_PROXY=http://127.0.0.1:2080
-TELETHON_PROXY_URL=http://127.0.0.1:2080
-```
-
-## Local Development
+## Quick start
 
 ```bash
 python -m venv .venv
@@ -221,74 +94,110 @@ source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env
 cp config/channels.example.json config/channels.json
+```
+
+Start local development with auto-reload:
+
+```bash
 PYTHONPATH=src python -m kiwi.dev
 ```
 
-Watch mode restarts automatically on changes in `src`, `scripts`, `config`, `.env`, `pyproject.toml`, and `requirements.txt`.
-
-## Production (Docker Compose)
-
-Initialize submodules first:
+Run the containerized stack:
 
 ```bash
 git submodule update --init --recursive
-```
-
-```bash
 docker compose up --build -d
-```
-
-Check status/logs:
-
-```bash
 docker compose ps
 docker compose logs -f kiwi
 ```
 
-Stop:
+## Route configuration
 
-```bash
-docker compose down
+Each route can define:
 
-### Local MySQL + phpMyAdmin
+- source Telegram username and/or numeric ID
+- destination Bale username and/or numeric ID
+- enabled state
+- guard-script name
+- transformation-script name
+- media-size limit
 
-Bring up local DB stack:
+Username matching is preferred, with numeric IDs used as fallback.
 
-```bash
-docker-compose up -d mysql phpmyadmin redis
+Runtime route files are ignored from Git. Keep only sanitized examples in version control.
+
+## Script contract
+
+A transformation script receives:
+
+```text
+--payload <message-json>
+--input-dir <downloaded-media>
+--output-dir <generated-files>
 ```
 
-Access:
+It returns a JSON object containing normalized output messages. File paths may be relative to the input or output directory, or absolute when explicitly permitted by deployment policy.
 
-- MySQL: `127.0.0.1:3306`
-- Redis: `127.0.0.1:6380`
-- phpMyAdmin: `http://127.0.0.1:8081`
+Guard scripts receive the same context and emit a boolean decision. Guard execution is timeout-bounded and runs before transformation.
 
-Default admin DB user (created with full privileges by init SQL):
+## Delivery reliability
 
-- user: `kiwi_admin`
-- password: `kiwiKIWI`
+Kiwicore uses several layers to reduce duplicate or lost delivery:
+
+- persistent source-message ledger
+- Redis due queue
+- retry scheduling with backoff
+- route-level in-flight limit
+- lock TTL for abandoned work
+- explicit review state for ambiguous delivery outcomes
+- checkpoint updates after confirmed success
+
+A route-level concurrency of one is recommended when strict source ordering is required.
+
+## Configuration
+
+Runtime settings are supplied through `.env` and include:
+
+- platform tokens
+- route and script paths
+- media-size and script-timeout limits
+- polling and retry timing
+- Redis queue settings
+- SQLite or MySQL ledger DSN
+- proxy configuration
+- AI moderation endpoint and model
+- review-alert destination
+
+Use placeholder credentials in examples, for example:
+
+```env
+SYNC_LEDGER_DSN=mysql://app_user:CHANGE_ME@127.0.0.1:3306/kiwi_sync
 ```
 
-## Testing
+Never publish real database passwords, bot tokens, proxy credentials, or channel identifiers.
+
+## Proxy support
+
+HTTP and SOCKS proxy settings are configurable for restricted network environments. For containers that must reach a proxy running on the host, use the platform-appropriate host address rather than embedding machine-specific values in the repository.
+
+## Verification
 
 ```bash
-source .venv/bin/activate
 pytest -q
+docker compose config --quiet
 ```
 
-## Git Rules in This Repo
+Real platform delivery should be tested with controlled channels and non-sensitive media. A successful API response alone should not be treated as proof of end-to-end delivery; inspect the destination and the ledger state.
 
-- `config/channels.json` is ignored (runtime/local config)
-- `config/channels.example.json` is versioned
-- `scripts/channel_scripts/` and `scripts/gaurd_scrpts/` are versioned
+## Security and privacy
 
-## Troubleshooting
+- Store platform and provider credentials only in untracked environment files.
+- Restrict downloaded media and raw update storage.
+- Validate script names and prevent path traversal.
+- Apply strict timeouts and resource limits to external scripts.
+- Redact message content and tokens from operational logs.
+- Treat source posts, media, channel mappings, and review items as potentially sensitive.
 
-- `409 Conflict: terminated by other getUpdates request`
-  - Only one active bot polling instance should run at a time.
-- Repeated network timeouts
-  - Verify proxy settings and connectivity.
-  - The service retries with backoff automatically.
-- Script not found
-  - Ensure `channel_script` exists under `CHANNEL_SCRIPTS_DIR`.
+## Project status
+
+Kiwicore demonstrates cross-platform integration, event processing, scriptable automation, queue-based retries, idempotency, media handling, AI moderation, and containerized operations.
